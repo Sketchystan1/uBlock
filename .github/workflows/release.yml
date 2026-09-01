@@ -1,0 +1,139 @@
+name: Release MV3
+
+# Builds the Chromium MV3 package for a `<upstream-tag>-mv3` tag and publishes
+# it, together with a signed CRX and the update manifest a policy install needs.
+#
+# Triggered by tag push, or dispatched by sync-upstream.yml (which is how it
+# runs when no PAT is configured -- pushes authenticated with GITHUB_TOKEN
+# deliberately do not fire workflows).
+
+on:
+  push:
+    tags:
+      - '*-mv3'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build, e.g. 1.74.2-mv3'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the release
+    steps:
+      - name: Resolve tag and version
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
+          version="${tag%-mv3}"
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # uBO's own convention: a fourth version component, or a b/rc suffix,
+          # means a pre-release.
+          if echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo 'prerelease=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'prerelease=true'  >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+          persist-credentials: false
+
+      - name: Clone uAssets
+        run: bash tools/pull-assets.sh
+
+      - name: Build MV3 package
+        # Invoked through `bash` rather than relying on the executable bit,
+        # which is not preserved when committing from a filesystem without one.
+        run: bash tools/make-chromium-mv3.sh ${{ steps.meta.outputs.version }}
+
+      - name: Stage signing key
+        id: key
+        env:
+          CRX_PRIVATE_KEY: ${{ secrets.CRX_PRIVATE_KEY }}
+        run: |
+          if [ -z "$CRX_PRIVATE_KEY" ]; then
+            echo 'signed=false' >> "$GITHUB_OUTPUT"
+            echo '::warning::CRX_PRIVATE_KEY is not set, so only the zip is published. A policy install -- required for webRequestBlocking under MV3 -- needs the signed CRX. See docs/mv3-deployment.md'
+            exit 0
+          fi
+          umask 077
+          printf '%s' "$CRX_PRIVATE_KEY" > crx-key.pem
+          echo 'signed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Pack and sign CRX
+        id: crx
+        if: steps.key.outputs.signed == 'true'
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          crx="dist/build/uBlock0_${VERSION}.chromium-mv3.crx"
+          node tools/make-crx.mjs \
+            --dir dist/build/uBlock0.chromium-mv3 \
+            --key crx-key.pem \
+            --out "$crx" \
+            --update-xml dist/build/update.xml \
+            --codebase "${{ github.server_url }}/${{ github.repository }}/releases/download/${TAG}/uBlock0_${VERSION}.chromium-mv3.crx"
+          echo "crx=$crx" >> "$GITHUB_OUTPUT"
+
+      - name: Shred signing key
+        if: always()
+        run: rm -f crx-key.pem
+
+      - name: Assemble release notes
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          EXTENSION_ID: ${{ steps.crx.outputs.extension_id }}
+        run: |
+          {
+            echo "Chromium **Manifest V3** build of uBlock Origin \`${VERSION}\`, from upstream tag \`${VERSION}\`."
+            echo
+            echo '> [!IMPORTANT]'
+            echo '> Under MV3, `webRequestBlocking` is granted only to policy-installed extensions, so network filtering is inert until this is force-installed via enterprise policy. Scriptlet filtering additionally needs the per-extension **Allow user scripts** toggle.'
+            echo '>'
+            echo '> Setup instructions: [docs/mv3-deployment.md](../blob/master/docs/mv3-deployment.md)'
+            echo
+            if [ -n "$EXTENSION_ID" ]; then
+              echo "Extension ID: \`${EXTENSION_ID}\`"
+              echo
+            fi
+            echo '### Upstream changelog'
+            echo
+            grep -m1 -B10000 -- '----------' CHANGELOG.md || true
+          } > release.body.md
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          args=(--title "$TAG" --notes-file release.body.md)
+          if [ '${{ steps.meta.outputs.prerelease }}' = 'true' ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" "${args[@]}" || \
+            gh release edit "$TAG" --notes-file release.body.md
+          assets=("dist/build/uBlock0_${VERSION}.chromium-mv3.zip")
+          if [ '${{ steps.key.outputs.signed }}' = 'true' ]; then
+            assets+=("dist/build/uBlock0_${VERSION}.chromium-mv3.crx" dist/build/update.xml)
+          fi
+          gh release upload "$TAG" "${assets[@]}" --clobber

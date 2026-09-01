@@ -1,0 +1,157 @@
+name: Sync with upstream
+
+# Keeps this fork merged with gorhill/uBlock, and cuts an MV3 release whenever
+# upstream publishes a new tag.
+#
+# The MV3 port is designed so that this can run unattended: it adds files and
+# modifies none, so a merge from upstream cannot conflict. Should one ever
+# happen anyway, this workflow aborts the merge and opens an issue rather than
+# forcing anything.
+
+on:
+  schedule:
+    # Deliberately off the hour: scheduled runs at :00 are heavily contended and
+    # get delayed.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/gorhill/uBlock.git
+
+jobs:
+  sync:
+    name: Merge upstream and tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the merge commit and the release tag
+      issues: write     # report a merge conflict
+      actions: write    # dispatch release.yml when no PAT is configured
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          # A PAT here (secrets.SYNC_TOKEN) makes the tag push trigger
+          # release.yml directly. Without one we fall back to an explicit
+          # workflow dispatch further down, because pushes authenticated with
+          # GITHUB_TOKEN deliberately do not trigger workflows.
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Detect release-token setup
+        id: pat
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -n "$SYNC_TOKEN" ]; then
+            echo 'has=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'has=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM"
+          git fetch --no-tags upstream master
+          # Park upstream tags outside refs/tags so they can never collide with,
+          # or be mistaken for, our own release tags. --no-tags additionally
+          # stops git from auto-following tags into refs/tags.
+          git fetch --no-tags --prune upstream '+refs/tags/*:refs/upstream-tags/*'
+
+      - name: Merge upstream/master
+        id: merge
+        run: |
+          before=$(git rev-parse HEAD)
+          if git merge --no-edit upstream/master; then
+            after=$(git rev-parse HEAD)
+            if [ "$before" = "$after" ]; then
+              echo 'Already up to date.'
+              echo 'changed=false' >> "$GITHUB_OUTPUT"
+            else
+              echo 'changed=true' >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+          echo 'Merge conflict.'
+          git merge --abort || true
+          echo 'conflict=true' >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Report merge conflict
+        if: failure() && steps.merge.outputs.conflict == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title='Upstream sync needs manual attention'
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          body=$(printf '%s\n' \
+            "Merging \`upstream/master\` into \`master\` produced a conflict, so the sync was aborted and nothing was pushed." \
+            '' \
+            "Run: $RUN_URL" \
+            '' \
+            'To resolve locally:' \
+            '```sh' \
+            'git fetch upstream master' \
+            'git merge upstream/master' \
+            '# resolve, then:' \
+            'git push origin master' \
+            '```' \
+            '' \
+            'The MV3 port adds files and modifies none, so a conflict here is unexpected. The likely causes are: upstream moved or renamed a file the port builds on (check `tools/make-chromium-mv3.sh` and `tools/make-chromium-mv3-meta.py` against the current layout), or this fork and upstream have unrelated histories, in which case the merge cannot be automated at all.')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+
+      - name: Push merge
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin HEAD:master
+
+      - name: Find newest upstream tag
+        id: upstream
+        run: |
+          # Only ever the single newest tag, so that the first run of this
+          # workflow cannot fan out into a release per historical tag.
+          tag=$(git for-each-ref --sort=-creatordate --count=1 \
+                  --format='%(refname:strip=2)' refs/upstream-tags/)
+          echo "Newest upstream tag: ${tag:-<none>}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -z "$tag" ]; then
+            echo 'release=false' >> "$GITHUB_OUTPUT"
+          elif git rev-parse -q --verify "refs/tags/$tag-mv3" >/dev/null; then
+            echo "Already released as $tag-mv3."
+            echo 'release=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'release=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag release
+        if: steps.upstream.outputs.release == 'true'
+        run: |
+          git tag "${{ steps.upstream.outputs.tag }}-mv3"
+          git push origin "${{ steps.upstream.outputs.tag }}-mv3"
+
+      - name: Trigger release build
+        # Only needed without a PAT: a GITHUB_TOKEN push does not fire the tag
+        # trigger in release.yml, so dispatch it explicitly instead.
+        if: steps.upstream.outputs.release == 'true' && steps.pat.outputs.has != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run release.yml \
+            -f tag="${{ steps.upstream.outputs.tag }}-mv3"
