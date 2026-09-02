@@ -142,6 +142,21 @@ jobs:
         if: always()
         run: rm -f crx-key.pem
 
+      - name: Verify CRX
+        if: steps.key.outputs.signed == 'true'
+        # Parse the CRX back the way Chrome does -- independently of the code
+        # that wrote it -- and check the signature, the extension id derivation,
+        # that the payload matches the build directory, and that update.xml
+        # agrees with the packaged manifest. A malformed CRX otherwise fails at
+        # policy-install time, long after publication, with an unhelpful error.
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          node tools/verify-crx.mjs \
+            --crx "dist/build/uBlock0_${VERSION}.chromium-mv3.crx" \
+            --dir dist/build/uBlock0.chromium-mv3 \
+            --update-xml dist/build/update.xml
+
       - name: Checksums
         env:
           VERSION: ${{ steps.meta.outputs.version }}
