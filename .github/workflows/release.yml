@@ -6,6 +6,10 @@ name: Release MV3
 # Triggered by tag push, or dispatched by sync-upstream.yml (which is how it
 # runs when no PAT is configured -- pushes authenticated with GITHUB_TOKEN
 # deliberately do not fire workflows).
+#
+# The package is built by tools/make-chromium-mv3.sh, which runs
+# tools/verify-mv3-package.mjs as its last step -- so the build that actually
+# ships gets exactly the same assertions as CI.
 
 on:
   push:
@@ -25,12 +29,19 @@ concurrency:
   group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
+env:
+  # Pin gh to this fork rather than letting it infer from git remotes.
+  GH_REPO: ${{ github.repository }}
+
 jobs:
   release:
     name: Build and publish
     runs-on: ubuntu-latest
     permissions:
       contents: write   # create the release
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      signed: ${{ steps.key.outputs.signed }}
     steps:
       - name: Resolve tag and version
         id: meta
@@ -50,10 +61,15 @@ jobs:
           fi
 
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.meta.outputs.tag }}
           persist-credentials: false
+
+      - name: Set up node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
 
       - name: Clone uAssets
         run: bash tools/pull-assets.sh
@@ -61,7 +77,36 @@ jobs:
       - name: Build MV3 package
         # Invoked through `bash` rather than relying on the executable bit,
         # which is not preserved when committing from a filesystem without one.
+        # This also runs tools/verify-mv3-package.mjs.
         run: bash tools/make-chromium-mv3.sh ${{ steps.meta.outputs.version }}
+
+      - name: Check the advertised version
+        # update.xml's <updatecheck version> is read from the built manifest,
+        # i.e. from dist/version -- never from the tag name. Those legitimately
+        # differ (`1.74.1b1` is not a legal Chrome version; upstream maps it to
+        # `1.74.1.1`), but the tag must still be built from a tree whose
+        # dist/version is upstream's value FOR THAT TAG. sync-upstream.yml
+        # guarantees that by construction; assert it here so a hand-made tag
+        # cannot quietly ship a mismatched version.
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          manifest_version=$(node -p "require('./dist/build/uBlock0.chromium-mv3/manifest.json').version")
+          dist_version=$(cat dist/version)
+          echo "tag version:      $VERSION"
+          echo "dist/version:     $dist_version"
+          echo "manifest version: $manifest_version"
+          if [ "$manifest_version" != "$dist_version" ]; then
+            echo "::error::manifest version ($manifest_version) does not match dist/version ($dist_version)"
+            exit 1
+          fi
+          # Same numeric stem: 1.74.1b1 -> 1.74.1, and 1.74.1.1 -> 1.74.1
+          tag_stem=$(echo "$VERSION" | sed -E 's/(b|rc)[0-9]+$//')
+          man_stem=$(echo "$manifest_version" | cut -d. -f1-3)
+          if [ "$tag_stem" != "$man_stem" ]; then
+            echo "::error::tag $VERSION and manifest version $manifest_version disagree on the release stem ($tag_stem vs $man_stem) -- this tag was probably built from the wrong tree"
+            exit 1
+          fi
 
       - name: Stage signing key
         id: key
@@ -97,12 +142,21 @@ jobs:
         if: always()
         run: rm -f crx-key.pem
 
+      - name: Checksums
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          cd dist/build
+          sha256sum uBlock0_${VERSION}.chromium-mv3.* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Assemble release notes
         env:
           TAG: ${{ steps.meta.outputs.tag }}
           VERSION: ${{ steps.meta.outputs.version }}
           EXTENSION_ID: ${{ steps.crx.outputs.extension_id }}
         run: |
+          pages_url="https://$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]').github.io/$(basename '${{ github.repository }}')"
           {
             echo "Chromium **Manifest V3** build of uBlock Origin \`${VERSION}\`, from upstream tag \`${VERSION}\`."
             echo
@@ -111,10 +165,21 @@ jobs:
             echo '>'
             echo '> Setup instructions: [docs/mv3-deployment.md](../blob/master/docs/mv3-deployment.md)'
             echo
+            echo "Package version (what Chrome compares for updates): \`$(node -p "require('./dist/build/uBlock0.chromium-mv3/manifest.json').version")\`"
+            echo
             if [ -n "$EXTENSION_ID" ]; then
               echo "Extension ID: \`${EXTENSION_ID}\`"
               echo
+              echo "Policy \`update_url\` (stable across releases): \`${pages_url}/update.xml\`"
+              echo
             fi
+            echo '### Build inputs'
+            echo
+            echo 'Filter lists are cloned at build time, so record what went in:'
+            echo '```json'
+            cat dist/build/uBlock0.chromium-mv3/build-info.json
+            echo '```'
+            echo
             echo '### Upstream changelog'
             echo
             grep -m1 -B10000 -- '----------' CHANGELOG.md || true
@@ -126,14 +191,65 @@ jobs:
           TAG: ${{ steps.meta.outputs.tag }}
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          args=(--title "$TAG" --notes-file release.body.md)
-          if [ '${{ steps.meta.outputs.prerelease }}' = 'true' ]; then
-            args+=(--prerelease)
+          # Distinguish "already exists" from any other failure, rather than
+          # masking both behind `create || edit`.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; updating notes."
+            gh release edit "$TAG" --notes-file release.body.md --draft=false
+          else
+            args=(--title "$TAG" --notes-file release.body.md)
+            if [ '${{ steps.meta.outputs.prerelease }}' = 'true' ]; then
+              args+=(--prerelease)
+            fi
+            gh release create "$TAG" "${args[@]}"
           fi
-          gh release create "$TAG" "${args[@]}" || \
-            gh release edit "$TAG" --notes-file release.body.md
-          assets=("dist/build/uBlock0_${VERSION}.chromium-mv3.zip")
+          assets=("dist/build/uBlock0_${VERSION}.chromium-mv3.zip" dist/build/SHA256SUMS.txt)
           if [ '${{ steps.key.outputs.signed }}' = 'true' ]; then
             assets+=("dist/build/uBlock0_${VERSION}.chromium-mv3.crx" dist/build/update.xml)
           fi
           gh release upload "$TAG" "${assets[@]}" --clobber
+          # A draft release would make the codebase URL inside update.xml 404.
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = 'true' ]; then
+            echo '::error::release is still a draft; the CRX URL in update.xml would 404 for Chrome'
+            exit 1
+          fi
+
+      - name: Attest build provenance
+        if: steps.key.outputs.signed == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.crx.outputs.crx }}
+
+      - name: Stage Pages content
+        if: steps.key.outputs.signed == 'true'
+        # The policy `update_url` must be one fixed URL forever, but a release
+        # asset's URL changes every release. Serve update.xml from Pages instead,
+        # alongside the existing docs/ site, and let each release refresh it.
+        run: |
+          mkdir -p _site
+          cp -R docs/. _site/
+          cp dist/build/update.xml _site/update.xml
+          echo "Staged _site:"
+          find _site -maxdepth 1
+
+      - name: Upload Pages artifact
+        if: steps.key.outputs.signed == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  pages:
+    name: Publish update manifest
+    needs: release
+    if: needs.release.outputs.signed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -1,0 +1,43 @@
+# Keep the pinned action SHAs fresh.
+#
+# The workflows in this repository pin every action to a commit SHA rather than a
+# floating major tag, because release.yml has access to CRX_PRIVATE_KEY -- the
+# secret that defines the extension identity for every policy-installed client.
+# A floating tag means a third party can change what runs next to that key.
+#
+# SHA pins only stay safe if something bumps them, which is what this does.
+#
+# Note: .github/workflows/main.yml is upstream's own release workflow and is
+# deliberately left untouched (it is disabled as a repository setting instead),
+# so dependabot may open PRs against it. Close those -- editing it would create a
+# merge conflict with upstream, which is the one thing this fork's design avoids.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      # Off the hour, and clear of the 04:17 sync window.
+      time: '09:23'
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'ci:'
+    groups:
+      actions:
+        patterns:
+          - '*'
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: 'deps:'
+    # Dev-only tooling (eslint and friends); a single grouped PR is enough.
+    groups:
+      dev-dependencies:
+        patterns:
+          - '*'

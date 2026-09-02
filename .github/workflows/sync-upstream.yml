@@ -7,6 +7,10 @@ name: Sync with upstream
 # modifies none, so a merge from upstream cannot conflict. Should one ever
 # happen anyway, this workflow aborts the merge and opens an issue rather than
 # forcing anything.
+#
+# Nothing is pushed until the merged tree has actually been built and verified.
+# "Merges cleanly" and "still builds" are different properties, and only the
+# second one is worth publishing.
 
 on:
   schedule:
@@ -14,6 +18,11 @@ on:
     # get delayed.
     - cron: '17 4 * * *'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to release (default: newest unreleased)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -25,17 +34,37 @@ concurrency:
 env:
   UPSTREAM: https://github.com/gorhill/uBlock.git
 
+  # `gh` infers the target repository from git remotes, and its resolution order
+  # puts a remote named `upstream` AHEAD of `origin`. The "Fetch upstream" step
+  # below adds exactly such a remote, so without this pin every subsequent `gh`
+  # call silently targets gorhill/uBlock instead of this fork.
+  #
+  # That is not hypothetical: run 33610413837 pushed a tag and then died with
+  # `HTTP 404: workflow release.yml not found on the default branch
+  # (.../repos/gorhill/uBlock/actions/workflows/release.yml)`. The conflict
+  # reporter below has the same exposure, and would have tried to file its issue
+  # on gorhill/uBlock.
+  GH_REPO: ${{ github.repository }}
+
+  # Which upstream tags are releases. Excludes `npm_*` (one dead tag from 2021)
+  # and anything else non-version-shaped. Betas and rcs are included on purpose:
+  # upstream ships roughly six betas per stable release, and this fork tracks
+  # them. A four-component dist/version makes those build as "uBlock Origin
+  # development build" against the dev filter-list channel, which is upstream's
+  # own intent for a beta tag.
+  TAG_PATTERN: '^[0-9]+\.[0-9]+\.[0-9]+((b|rc)[0-9]+)?$'
+
 jobs:
   sync:
-    name: Merge upstream and tag
+    name: Merge upstream, verify, tag
     runs-on: ubuntu-latest
     permissions:
       contents: write   # push the merge commit and the release tag
-      issues: write     # report a merge conflict
+      issues: write     # report a merge conflict or a broken merge
       actions: write    # dispatch release.yml when no PAT is configured
     steps:
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: master
           fetch-depth: 0
@@ -44,6 +73,11 @@ jobs:
           # workflow dispatch further down, because pushes authenticated with
           # GITHUB_TOKEN deliberately do not trigger workflows.
           token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
 
       - name: Configure git
         run: |
@@ -61,6 +95,30 @@ jobs:
             echo 'has=false' >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Assert upstream's release workflow stays disabled
+        # main.yml fires on ANY tag creation and would race release.yml for
+        # `gh release create` on the same tag. The nastier outcome is the quiet
+        # one: if main.yml wins, release.yml's `gh release create || gh release
+        # edit` fallback succeeds, the run goes green, and the release stays a
+        # DRAFT -- so the CRX URL baked into update.xml 404s for Chrome.
+        #
+        # It is disabled as a repository setting rather than by editing the file,
+        # to keep the merge-conflict surface at zero. Nothing re-asserts that
+        # after a repo transfer or a settings change, so do it here.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          state=$(gh api "repos/${GH_REPO}/actions/workflows/main.yml" --jq .state 2>/dev/null || echo missing)
+          echo "main.yml state: $state"
+          case "$state" in
+            disabled_manually|missing) ;;
+            *)
+              echo "::warning::upstream's main.yml is '$state'; disabling it to avoid racing release.yml"
+              gh workflow disable main.yml || \
+                echo "::error::could not disable main.yml -- a tag push may produce a draft release whose CRX URL 404s"
+              ;;
+          esac
+
       - name: Fetch upstream
         run: |
           git remote add upstream "$UPSTREAM" 2>/dev/null \
@@ -77,6 +135,7 @@ jobs:
           before=$(git rev-parse HEAD)
           if git merge --no-edit upstream/master; then
             after=$(git rev-parse HEAD)
+            echo "merged=$after" >> "$GITHUB_OUTPUT"
             if [ "$before" = "$after" ]; then
               echo 'Already up to date.'
               echo 'changed=false' >> "$GITHUB_OUTPUT"
@@ -111,7 +170,53 @@ jobs:
             'git push origin master' \
             '```' \
             '' \
-            'The MV3 port adds files and modifies none, so a conflict here is unexpected. The likely causes are: upstream moved or renamed a file the port builds on (check `tools/make-chromium-mv3.sh` and `tools/make-chromium-mv3-meta.py` against the current layout), or this fork and upstream have unrelated histories, in which case the merge cannot be automated at all.')
+            'The MV3 port adds files and modifies none, so a conflict here is unexpected. The likely cause is that upstream moved or renamed a file the port builds on -- check `tools/make-chromium-mv3.sh`, `tools/make-chromium-mv3-meta.py` and `tools/patch-mv3-modules.mjs` against the current layout.')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+
+      - name: Install dev dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Clone uAssets
+        run: bash tools/pull-assets.sh
+
+      # Gate the master push on the merged tree actually building. A merge can
+      # be conflict-free and still break the port -- upstream renaming a file the
+      # shims stand in front of, adding a manifest key the generator does not
+      # know, or adding a dynamic import() the patcher does not reach.
+      - name: Build and verify the merged tree
+        id: verify_master
+        run: bash tools/make-chromium-mv3.sh
+
+      - name: Report broken merge
+        if: failure() && steps.verify_master.outcome == 'failure'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title='Upstream merge builds no longer'
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          body=$(printf '%s\n' \
+            "\`upstream/master\` merged cleanly but the resulting tree does not build, so **nothing was pushed and no tag was created**." \
+            '' \
+            "Run: $RUN_URL" \
+            '' \
+            'The failing step is `tools/verify-mv3-package.mjs`, whose output names the specific assumption that broke and how to fix it. Common causes:' \
+            '' \
+            '- upstream changed the `<title>` of `src/background.html` (breaks `src/js/i18n.js` background detection, and the service worker dies during evaluation)' \
+            '- upstream added a `<script>` to `src/background.html` that `sw.js` does not import' \
+            '- upstream added a manifest key `tools/make-chromium-mv3-meta.py` does not transform' \
+            '- upstream added a dynamic `import()` that `tools/patch-mv3-modules.mjs` did not rewrite' \
+            '' \
+            'Reproduce locally:' \
+            '```sh' \
+            'git fetch upstream master && git merge upstream/master' \
+            'bash tools/pull-assets.sh' \
+            'bash tools/make-chromium-mv3.sh' \
+            '```')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "$body"
           else
@@ -120,31 +225,108 @@ jobs:
 
       - name: Push merge
         if: steps.merge.outputs.changed == 'true'
-        run: git push origin HEAD:master
+        # Explicit source ref: later steps move HEAD to a detached release tree.
+        run: git push origin "${{ steps.merge.outputs.merged }}:refs/heads/master"
 
-      - name: Find newest upstream tag
+      - name: Select upstream tag
         id: upstream
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          # Only ever the single newest tag, so that the first run of this
-          # workflow cannot fan out into a release per historical tag.
-          tag=$(git for-each-ref --sort=-creatordate --count=1 \
-                  --format='%(refname:strip=2)' refs/upstream-tags/)
-          echo "Newest upstream tag: ${tag:-<none>}"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if [ -z "$tag" ]; then
-            echo 'release=false' >> "$GITHUB_OUTPUT"
-          elif git rev-parse -q --verify "refs/tags/$tag-mv3" >/dev/null; then
-            echo "Already released as $tag-mv3."
-            echo 'release=false' >> "$GITHUB_OUTPUT"
-          else
-            echo 'release=true' >> "$GITHUB_OUTPUT"
+          if [ -n "$INPUT_TAG" ]; then
+            # Explicit dispatch: release whatever was asked for, released or not,
+            # so a botched release can be redone.
+            if git rev-parse -q --verify "refs/upstream-tags/$INPUT_TAG" >/dev/null; then
+              echo "Dispatched tag: $INPUT_TAG"
+              echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+              echo 'release=true' >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::no such upstream tag: $INPUT_TAG"
+              exit 1
+            fi
+            exit 0
           fi
+
+          # Only ever the single newest release-shaped tag. Considering the whole
+          # backlog would mean treating all ~1100 historical upstream tags as
+          # pending releases on the first run; this fork exists to track upstream
+          # going forward, not to backfill its history.
+          recent=$(git for-each-ref --sort=-creatordate \
+                     --format='%(refname:strip=2)' refs/upstream-tags/ \
+                   | grep -E "$TAG_PATTERN" | head -n 5)
+          newest=$(echo "$recent" | head -n 1)
+          echo "5 newest release-shaped upstream tags:"
+          echo "$recent" | sed 's/^/  /'
+
+          if [ -z "$newest" ]; then
+            echo '::warning::no upstream tag matches TAG_PATTERN -- has upstream changed its tagging convention?'
+            echo 'release=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git rev-parse -q --verify "refs/tags/$newest-mv3" >/dev/null; then
+            echo "Newest upstream tag $newest is already released as $newest-mv3; nothing to do."
+            echo 'release=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # If tags arrived in a burst, only the newest is picked up. Name the
+          # others rather than letting them vanish silently -- bounded to the
+          # recent window so this stays readable.
+          skipped=''
+          for t in $(echo "$recent" | tail -n +2); do
+            git rev-parse -q --verify "refs/tags/$t-mv3" >/dev/null && continue
+            skipped="$skipped $t"
+          done
+          if [ -n "$skipped" ]; then
+            echo "::warning::releasing $newest only; also unreleased in the recent window:$skipped (dispatch this workflow with tag=<name> to release one)"
+          fi
+
+          echo "Releasing: $newest"
+          echo "tag=$newest" >> "$GITHUB_OUTPUT"
+          echo 'release=true' >> "$GITHUB_OUTPUT"
+
+      # Build the tree we will actually ship: upstream AT THE TAG, plus this
+      # fork's added files. Tagging the merge commit instead (what this workflow
+      # used to do) ships upstream master's tip under a tag name it does not
+      # correspond to, and takes its version from whatever dist/version master
+      # happened to hold -- which also decides "development build" branding and
+      # which asset channel `tools/make-assets.sh` selects.
+      #
+      # Because the port adds files and modifies none, this overlay is
+      # conflict-free by construction and dist/version is upstream's own value
+      # for that tag.
+      - name: Construct the release tree
+        if: steps.upstream.outputs.release == 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          MERGED: ${{ steps.merge.outputs.merged }}
+        run: |
+          mapfile -t added < <(git diff --name-only --diff-filter=A upstream/master "$MERGED")
+          if [ "${#added[@]}" -eq 0 ]; then
+            echo '::error::this fork appears to add no files to upstream; refusing to construct a release tree'
+            exit 1
+          fi
+          printf 'port file: %s\n' "${added[@]}"
+          git checkout --detach "refs/upstream-tags/$TAG"
+          git checkout "$MERGED" -- "${added[@]}"
+          git commit -m "Chromium MV3 build of uBlock Origin $TAG
+
+          Upstream $TAG with this fork's MV3 port applied. Generated by
+          .github/workflows/sync-upstream.yml; do not commit to this ref."
+          echo "dist/version at $TAG: $(cat dist/version)"
+
+      - name: Build and verify the release tree
+        id: verify_release
+        if: steps.upstream.outputs.release == 'true'
+        run: bash tools/make-chromium-mv3.sh
 
       - name: Tag release
         if: steps.upstream.outputs.release == 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
-          git tag "${{ steps.upstream.outputs.tag }}-mv3"
-          git push origin "${{ steps.upstream.outputs.tag }}-mv3"
+          git tag "$TAG-mv3"
+          git push origin "$TAG-mv3"
 
       - name: Trigger release build
         # Only needed without a PAT: a GITHUB_TOKEN push does not fire the tag
@@ -152,6 +334,34 @@ jobs:
         if: steps.upstream.outputs.release == 'true' && steps.pat.outputs.has != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
-          gh workflow run release.yml \
-            -f tag="${{ steps.upstream.outputs.tag }}-mv3"
+          # GH_REPO (workflow env) keeps this on the fork; the `upstream` remote
+          # added above would otherwise win gh's repository resolution.
+          gh workflow run release.yml -f tag="$TAG-mv3"
+
+      - name: Report failed dispatch
+        # A pushed tag with no release build is the worst state to be in: the
+        # tag-exists guard in "Select upstream tag" treats it as already
+        # released, so every future run skips it and reports success while doing
+        # nothing. Say so loudly.
+        if: failure() && steps.verify_release.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          gh issue create \
+            --title "Release $TAG-mv3 was tagged but not built" \
+            --body "$(printf '%s\n' \
+              "The release tree for \`$TAG\` built and verified, but tagging or dispatching \`release.yml\` failed." \
+              '' \
+              "Run: $RUN_URL" \
+              '' \
+              'This state is self-latching: if the tag was pushed, future scheduled runs treat it as already released and skip it.' \
+              '' \
+              'Recover with either:' \
+              '```sh' \
+              "gh workflow run release.yml -R $GH_REPO -f tag=$TAG-mv3   # build the existing tag" \
+              "git push --delete origin $TAG-mv3                          # or drop it and let the next sync redo it" \
+              '```')" || true

@@ -2,6 +2,11 @@ name: Build MV3
 
 # Sanity build of the Chromium MV3 package on every push and pull request, so
 # that an upstream merge which breaks the port is caught before release time.
+#
+# The package assertions and the upstream-drift assertions live in
+# tools/verify-mv3-package.mjs, which tools/make-chromium-mv3.sh runs as its last
+# step. They used to be inlined here, which meant the one build that actually
+# shipped -- release.yml -- was the least checked build in the repository.
 
 on:
   push:
@@ -23,17 +28,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
+          cache: npm
 
       - name: Install dev dependencies
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Lint
         # Informational only. Upstream's own sources do not currently pass this
@@ -47,100 +53,14 @@ jobs:
       - name: Clone uAssets
         run: bash tools/pull-assets.sh
 
-      - name: Build MV3 package
+      - name: Build and verify MV3 package
         # Invoked through `bash` rather than relying on the executable bit,
         # which is not preserved when committing from a filesystem without one.
+        # Runs tools/patch-mv3-modules.mjs and then tools/verify-mv3-package.mjs.
         run: bash tools/make-chromium-mv3.sh
 
-      - name: Verify package
-        run: |
-          des=dist/build/uBlock0.chromium-mv3
-          fail=0
-          for f in manifest.json offscreen.html js/sw.js js/mv3-shims.js \
-                   js/offscreen.js js/start.js js/webext.js \
-                   js/diff-updater.js js/reverselookup-worker.js \
-                   lib/lz4/lz4-block-codec-js.js; do
-            if [ ! -f "$des/$f" ]; then
-              echo "::error::missing from package: $f"
-              fail=1
-            fi
-          done
-          # MV3 has no background page; shipping one would leave a second,
-          # unreferenced copy of uBO's background loadable by URL.
-          if [ -f "$des/background.html" ]; then
-            echo '::error::background.html must not be packaged'
-            fail=1
-          fi
-          # The overlay is build input, not a shipped file.
-          if [ -f "$des/manifest.overlay.json" ]; then
-            echo '::error::manifest.overlay.json must not be packaged'
-            fail=1
-          fi
-          node -e '
-            const m = require("./dist/build/uBlock0.chromium-mv3/manifest.json");
-            const fail = msg => { console.log(`::error::${msg}`); process.exitCode = 1; };
-            if ( m.manifest_version !== 3 ) { fail("manifest_version is not 3"); }
-            if ( m.browser_action !== undefined ) { fail("browser_action survived the transform"); }
-            if ( m.background?.service_worker !== "js/sw.js" ) { fail("service worker not wired up"); }
-            if ( m.background?.type !== "module" ) { fail("service worker is not a module"); }
-            for ( const p of [ "webRequest", "webRequestBlocking", "scripting", "userScripts", "offscreen" ] ) {
-              if ( m.permissions.includes(p) === false ) { fail(`missing permission: ${p}`); }
-            }
-            if ( m.permissions.some(p => p.includes("://") || p === "<all_urls>") ) {
-              fail("host patterns left in permissions");
-            }
-            if ( Array.isArray(m.host_permissions) === false || m.host_permissions.length === 0 ) {
-              fail("host_permissions is empty");
-            }
-            if ( typeof m.content_security_policy?.extension_pages !== "string" ) {
-              fail("content_security_policy is not in MV3 object form");
-            }
-            const war = m.web_accessible_resources;
-            if ( Array.isArray(war) === false || typeof war[0] !== "object" ) {
-              fail("web_accessible_resources is not in MV3 object form");
-            }
-          '
-          exit $fail
-
-      - name: Verify service worker module graph
-        run: |
-          node -e '
-            const fs = require("fs");
-            const path = require("path");
-            const root = "dist/build/uBlock0.chromium-mv3";
-            const seen = new Set();
-            const missing = [];
-            const stack = [ `${root}/js/sw.js` ];
-            const re = /(?:^|\n)[ \t]*(?:import|export)[^;\n]*?from[ \t]+["\x27]([^"\x27]+)["\x27]|(?:^|\n)[ \t]*import[ \t]+["\x27]([^"\x27]+)["\x27]/g;
-            while ( stack.length !== 0 ) {
-              const f = stack.pop();
-              if ( seen.has(f) ) { continue; }
-              seen.add(f);
-              const src = fs.readFileSync(f, "utf8");
-              re.lastIndex = 0;
-              let m;
-              while ( (m = re.exec(src)) !== null ) {
-                const spec = m[1] || m[2];
-                if ( spec.startsWith(".") === false ) { continue; }
-                const r = path.normalize(path.join(path.dirname(f), spec)).split(path.sep).join("/");
-                if ( fs.existsSync(r) ) { stack.push(r); } else { missing.push(`${f} -> ${spec}`); }
-              }
-            }
-            console.log(`${seen.size} modules reachable from js/sw.js`);
-            for ( const s of missing ) { console.log(`::error::unresolved import: ${s}`); }
-            if ( missing.length !== 0 ) { process.exitCode = 1; }
-            // The shims must be the first thing the service worker pulls in.
-            const sw = fs.readFileSync(`${root}/js/sw.js`, "utf8");
-            const shims = sw.indexOf("./mv3-shims.js");
-            const start = sw.indexOf("./start.js");
-            if ( shims === -1 || start === -1 || shims > start ) {
-              console.log("::error::js/sw.js must import ./mv3-shims.js before ./start.js");
-              process.exitCode = 1;
-            }
-          '
-
       - name: Upload package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: uBlock0.chromium-mv3
           path: dist/build/uBlock0.chromium-mv3
