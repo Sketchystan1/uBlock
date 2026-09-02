@@ -38,7 +38,9 @@ jobs:
     name: Build and publish
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # create the release
+      contents: write      # create the release
+      id-token: write      # mint the OIDC token Sigstore signs against
+      attestations: write  # persist the build provenance attestation
     outputs:
       version: ${{ steps.meta.outputs.version }}
       signed: ${{ steps.key.outputs.signed }}
@@ -165,6 +167,19 @@ jobs:
           sha256sum uBlock0_${VERSION}.chromium-mv3.* > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Attest build provenance
+        if: steps.key.outputs.signed == 'true'
+        # Deliberately non-blocking, and deliberately BEFORE publication.
+        # Provenance is a bonus -- the CRX is already signed with the release key
+        # and SHA256SUMS is published -- so it must never be the reason a release
+        # fails. Newer versions of the underlying actions/attest may additionally
+        # want `artifact-metadata: write`; if this step starts warning, add it to
+        # the job's permissions block.
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.crx.outputs.crx }}
+
       - name: Assemble release notes
         env:
           TAG: ${{ steps.meta.outputs.tag }}
@@ -228,12 +243,6 @@ jobs:
             echo '::error::release is still a draft; the CRX URL in update.xml would 404 for Chrome'
             exit 1
           fi
-
-      - name: Attest build provenance
-        if: steps.key.outputs.signed == 'true'
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: ${{ steps.crx.outputs.crx }}
 
       - name: Stage Pages content
         if: steps.key.outputs.signed == 'true'
