@@ -56,6 +56,29 @@ const reUserScriptWorldFiles = /\/scriptlet-loglevel-\d+\.js$/;
 
 /******************************************************************************/
 
+// Relative URLs inside a service worker resolve against the *worker script's*
+// URL -- here `chrome-extension://<id>/js/sw.js`, so the base directory is
+// `/js/`, not the package root. uBO's background code was written for
+// `background.html`, which sits at the root, so every relative path it hands to
+// a web-platform API (`fetch`, and anything built on it) is off by one
+// directory and 404s.
+//
+// Extension APIs are not affected: `chrome.scripting`/`chrome.userScripts`
+// resolve `file:` against the extension root in the browser process. But
+// `chrome.action.setIcon({path})` only *looks* like one of those -- Chromium
+// implements the path->ImageData conversion in the calling context, and its
+// service worker branch calls `fetch(path)` right here in the worker
+// (`extensions/renderer/resources/set_icon.js`). So it follows the worker base
+// URL too, and needs the same treatment.
+
+const rootURL = url => {
+    if ( typeof url !== 'string' ) { return url; }
+    if ( url.includes('://') ) { return url; }
+    return chrome.runtime.getURL(url);
+};
+
+/******************************************************************************/
+
 // `platform/common/vapi.js` is a classic script which pokes at `document` to
 // decide whether it is running in a content script. In a service worker there
 // is nothing to decide: these are the only two things it would do for us.
@@ -74,7 +97,15 @@ self.Element = class Element {};
 
 // `platform/common/vapi-common.js` probes for native `:has()` support. Chromium
 // has shipped it since 105, well below our `minimum_chrome_version`.
-self.CSS = self.CSS || { supports: ( ) => true };
+//
+// Guard on the method, not the namespace: `vapi-common.js` calls
+// `CSS.supports()` at module scope, so were a future Chrome to expose a partial
+// `CSS` in workers (`escape()` but not `supports()`), a namespace-only check
+// would keep that object and the call would throw -- aborting module evaluation
+// and with it the whole service worker.
+if ( typeof self.CSS?.supports !== 'function' ) {
+    self.CSS = Object.assign({}, self.CSS, { supports: ( ) => true });
+}
 
 // `vapi-common.js` dispatches a `webextFlavor` event which `vapi-background.js`
 // listens for, and `vAPI.cloud` reads `window.navigator.platform`.
@@ -153,7 +184,12 @@ self.Image = class Image extends EventTarget {
     }
     async load(url) {
         try {
-            const response = await fetch(url);
+            // `rootURL()`: uBO passes `img/icon_16.png`, which would otherwise
+            // resolve against `/js/`. See the note at the top of this file.
+            const response = await fetch(rootURL(url));
+            if ( response.ok === false ) {
+                throw new Error(`${response.status} ${response.statusText}`);
+            }
             const bitmap = await createImageBitmap(await response.blob());
             this.bitmap = bitmap;
             this.naturalWidth = bitmap.width;
@@ -286,11 +322,71 @@ self.lz4BlockCodec = {
 
 /******************************************************************************/
 
+// Dynamic `import()` is unconditionally forbidden in a ServiceWorkerGlobalScope
+// (Blink: `WorkerModulatorImpl::IsDynamicImportForbidden`). uBO has five call
+// sites reachable from the background, and every one of them swallows the
+// rejection, so the failures are silent:
+// - `src/js/redirect-engine.js` imports `/js/resources/scriptlets.js` from
+//   `loadBuiltinResources()`. Its `.catch()` logs and moves on, leaving the
+//   engine with zero scriptlets -- i.e. every `+js(...)` filter silently does
+//   nothing. Masked whenever the selfie fast path in `src/js/storage.js` hits,
+//   so it only bites on a fresh profile or after selfie invalidation.
+// - `src/js/messaging.js` imports `./static-dnr-filtering.js` for the "export to
+//   DNR" dashboard feature, and `/js/benchmarks.js` for dev-only benchmarks.
+//
+// `tools/patch-mv3-modules.mjs` rewrites those call sites at build time to go
+// through `self.uBO_dynamicImport()` instead. The modules worth supporting are
+// registered by `mv3-post.js`, which runs after `start.js` -- it cannot be done
+// from this file, because statically importing a uBO module here would evaluate
+// it BEFORE these shims are installed, inverting the one ordering guarantee the
+// whole port depends on.
+
+{
+    const staticModules = new Map();
+    let onRegistered;
+    const registered = new Promise(resolve => { onRegistered = resolve; });
+
+    // A specifier is written variously as `/js/foo.js`, `./foo.js` or
+    // `js/foo.js` depending on the call site; reduce all of them to a path
+    // relative to the package's `js/` directory.
+    const normalize = spec =>
+        spec.replace(/^\.\//, '').replace(/^\/?js\//, '');
+
+    self.uBO_registerStaticModules = modules => {
+        for ( const [ spec, module ] of Object.entries(modules) ) {
+            staticModules.set(normalize(spec), module);
+        }
+        onRegistered();
+    };
+
+    self.uBO_dynamicImport = async spec => {
+        await registered;
+        const module = staticModules.get(normalize(spec));
+        if ( module !== undefined ) { return module; }
+        throw new Error(
+            `uBO: dynamic import() is unavailable in a service worker, and ` +
+            `"${spec}" is not statically registered. Add it to ` +
+            `platform/chromium-mv3/mv3-post.js if this code path is needed.`
+        );
+    };
+}
+
+/******************************************************************************/
+
 // The offscreen document does double duty: it hosts real Workers on uBO's
 // behalf (see below), and it pings us every 20s. Per Chrome's service worker
 // lifecycle docs, extension messages reset the 30s idle timer and there is no
-// hard lifetime cap, so those pings keep the filtering engines resident. An
-// alarm re-creates the document should it ever go away.
+// cap on total worker lifetime, so those pings keep the filtering engines
+// resident. (There are still two per-operation caps, which a keepalive cannot
+// help with: 5 minutes for any single event or API call, and 30s for a fetch()
+// response to begin arriving.) An alarm re-creates the document should it ever
+// go away.
+//
+// The pings are load-bearing for correctness, not just for warm-start latency:
+// BroadcastChannel is a web-platform API, so the Worker relay below does NOT
+// reset the idle timer and cannot revive a terminated worker. Without the pings
+// the worker could die mid-round-trip and silently drop a reverselookup or
+// diff-updater reply, with no retry path.
 
 let offscreenPromise;
 
@@ -457,6 +553,32 @@ if ( chrome.browserAction === undefined ) {
     // Fail loudly rather than let platform/chromium/webext.js trip over an
     // undefined namespace with a much less obvious error.
     throw new Error('mv3-shims: unable to alias chrome.browserAction to chrome.action');
+}
+
+// `setIcon({ path })` is resolved by a `fetch()` inside this worker, not by the
+// browser process, so uBO's root-relative `img/icon_*.png` paths would resolve
+// against `/js/` and fail. See the `rootURL()` note at the top of this file.
+// `chrome.browserAction` and `chrome.action` are the same object here, so this
+// one patch covers both. `vapi-background.js` reaches this through
+// `vAPI.setIcon()` on every toolbar update and `vAPI.setDefaultIcon()` at
+// startup.
+{
+    const setIcon = chrome.action.setIcon.bind(chrome.action);
+    chrome.action.setIcon = function(details, ...args) {
+        if ( details instanceof Object && details.path !== undefined ) {
+            details = Object.assign({}, details);
+            if ( typeof details.path === 'string' ) {
+                details.path = rootURL(details.path);
+            } else if ( details.path instanceof Object ) {
+                const path = {};
+                for ( const [ size, url ] of Object.entries(details.path) ) {
+                    path[size] = rootURL(url);
+                }
+                details.path = path;
+            }
+        }
+        return setIcon(details, ...args);
+    };
 }
 
 // Two manifest keys changed shape in MV3, and uBO reads both:
