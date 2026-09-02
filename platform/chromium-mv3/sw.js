@@ -34,7 +34,11 @@
     synchronously at module scope. The listener therefore exists before the
     browser can dispatch the event which woke this worker.
 
+    `mv3-post.js` comes last, and only ever last: it patches things uBO defines
+    during its own evaluation, so it cannot run any earlier.
+
 **/
 
 import './mv3-shims.js';
 import './start.js';
+import './mv3-post.js';
