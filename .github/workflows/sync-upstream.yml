@@ -133,6 +133,7 @@ jobs:
         id: merge
         run: |
           before=$(git rev-parse HEAD)
+          echo "before=$before" >> "$GITHUB_OUTPUT"
           if git merge --no-edit upstream/master; then
             after=$(git rev-parse HEAD)
             echo "merged=$after" >> "$GITHUB_OUTPUT"
@@ -177,8 +178,38 @@ jobs:
             gh issue create --title "$title" --body "$body"
           fi
 
-      - name: Install dev dependencies
-        run: npm ci --no-audit --no-fund
+      - name: Check the merge is pushable
+        id: pushable
+        if: steps.merge.outputs.changed == 'true'
+        # GitHub refuses any push from a GitHub App that creates or updates a
+        # file under .github/workflows/, and GITHUB_TOKEN *is* an App
+        # installation token. `workflows` is not one of the keys a workflow's
+        # `permissions:` block can request, so nothing configured here can grant
+        # it -- only a token carrying the `workflow` scope can push such a
+        # change.
+        #
+        # This is a matter of when, not if: upstream edits
+        # .github/workflows/main.yml regularly (79a59e13 on 2026-08-14, then
+        # 89e149e7 and a2fb47c4 both on 2026-08-21). Detect it before spending
+        # ten minutes on two builds, and say exactly what to do about it.
+        env:
+          HAS_PAT: ${{ steps.pat.outputs.has }}
+          BEFORE: ${{ steps.merge.outputs.before }}
+        run: |
+          touched=$(git diff --name-only "$BEFORE" HEAD -- .github/workflows/)
+          if [ -z "$touched" ]; then
+            echo 'Merge touches no workflow file; GITHUB_TOKEN can push it.'
+            exit 0
+          fi
+          echo "Merge updates workflow file(s):"
+          echo "$touched" | sed 's/^/  /'
+          if [ "$HAS_PAT" = 'true' ]; then
+            echo 'SYNC_TOKEN is configured, so the push can carry these.'
+            exit 0
+          fi
+          echo 'blocked=true' >> "$GITHUB_OUTPUT"
+          echo "::error::this merge updates $(echo "$touched" | wc -l) workflow file(s) and no SYNC_TOKEN is configured, so the push would be rejected. Add a SYNC_TOKEN secret with the \`workflow\` scope -- see docs/mv3-deployment.md"
+          exit 1
 
       - name: Clone uAssets
         run: bash tools/pull-assets.sh
@@ -224,6 +255,7 @@ jobs:
           fi
 
       - name: Push merge
+        id: push
         if: steps.merge.outputs.changed == 'true'
         # Explicit source ref: later steps move HEAD to a detached release tree.
         run: git push origin "${{ steps.merge.outputs.merged }}:refs/heads/master"
@@ -240,6 +272,13 @@ jobs:
               echo "Dispatched tag: $INPUT_TAG"
               echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
               echo 'release=true' >> "$GITHUB_OUTPUT"
+              # actions/checkout with fetch-depth 0 fetches tags too, so an
+              # already-released tag is present locally and a plain `git tag`
+              # would abort. Flag the redo so "Tag release" moves it instead.
+              if git rev-parse -q --verify "refs/tags/$INPUT_TAG-mv3" >/dev/null; then
+                echo "$INPUT_TAG-mv3 already exists; this run will MOVE it."
+                echo 'redo=true' >> "$GITHUB_OUTPUT"
+              fi
             else
               echo "::error::no such upstream tag: $INPUT_TAG"
               exit 1
@@ -324,9 +363,20 @@ jobs:
         if: steps.upstream.outputs.release == 'true'
         env:
           TAG: ${{ steps.upstream.outputs.tag }}
+          REDO: ${{ steps.upstream.outputs.redo }}
         run: |
-          git tag "$TAG-mv3"
-          git push origin "$TAG-mv3"
+          if [ "$REDO" = 'true' ]; then
+            # Only reachable from an explicit workflow_dispatch naming a tag that
+            # is already released -- a deliberate human "redo this release".
+            # A scheduled run can never get here, because it skips any tag that
+            # already has a -mv3 counterpart.
+            echo "::warning::moving the published tag $TAG-mv3 to a rebuilt tree"
+            git tag -f "$TAG-mv3"
+            git push --force origin "refs/tags/$TAG-mv3"
+          else
+            git tag "$TAG-mv3"
+            git push origin "refs/tags/$TAG-mv3"
+          fi
 
       - name: Trigger release build
         # Only needed without a PAT: a GITHUB_TOKEN push does not fire the tag
@@ -340,28 +390,70 @@ jobs:
           # added above would otherwise win gh's repository resolution.
           gh workflow run release.yml -f tag="$TAG-mv3"
 
-      - name: Report failed dispatch
-        # A pushed tag with no release build is the worst state to be in: the
-        # tag-exists guard in "Select upstream tag" treats it as already
-        # released, so every future run skips it and reports success while doing
-        # nothing. Say so loudly.
-        if: failure() && steps.verify_release.outcome == 'success'
+      - name: Report any other failure
+        # Catch-all, so no failure mode is silent. The two specific reporters
+        # above cover a merge conflict and a merge that no longer builds;
+        # everything else -- a rejected push, a tag that would not move, a failed
+        # dispatch -- used to fail with no issue filed at all, and because master
+        # never advanced, every following 04:17 run reproduced it identically.
+        #
+        # The body is assembled from what actually happened rather than assumed,
+        # and in particular asks the REMOTE whether the tag exists: advising
+        # someone to delete a published tag whose assets are the codebase URL in
+        # the live update.xml would be worse than saying nothing.
+        if: |
+          failure()
+          && steps.merge.outputs.conflict != 'true'
+          && steps.verify_master.outcome != 'failure'
+          && steps.verify_release.outcome != 'failure'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TAG: ${{ steps.upstream.outputs.tag }}
+          BLOCKED: ${{ steps.pushable.outputs.blocked }}
+          PUSHED: ${{ steps.push.outcome }}
         run: |
-          gh issue create \
-            --title "Release $TAG-mv3 was tagged but not built" \
-            --body "$(printf '%s\n' \
-              "The release tree for \`$TAG\` built and verified, but tagging or dispatching \`release.yml\` failed." \
-              '' \
-              "Run: $RUN_URL" \
-              '' \
-              'This state is self-latching: if the tag was pushed, future scheduled runs treat it as already released and skip it.' \
-              '' \
-              'Recover with either:' \
-              '```sh' \
-              "gh workflow run release.yml -R $GH_REPO -f tag=$TAG-mv3   # build the existing tag" \
-              "git push --delete origin $TAG-mv3                          # or drop it and let the next sync redo it" \
-              '```')" || true
+          title='Upstream sync failed'
+          {
+            echo "The scheduled sync failed after merging cleanly. **Master may not have advanced, so this will repeat every day until it is fixed.**"
+            echo
+            echo "Run: $RUN_URL"
+            echo
+            if [ "$BLOCKED" = 'true' ]; then
+              echo '### Cause: the merge cannot be pushed'
+              echo
+              echo 'The merge updates a file under `.github/workflows/`, and GitHub rejects any push from a GitHub App -- which is what `GITHUB_TOKEN` is -- that creates or updates a workflow file. `workflows` is not a permission a workflow can request, so this cannot be fixed in the workflow file.'
+              echo
+              echo 'Fix: add a `SYNC_TOKEN` secret whose token carries the `workflow` scope (classic PAT: `repo` + `workflow`; fine-grained PAT or App: Contents write + Workflows write). See `docs/mv3-deployment.md`.'
+              echo
+              echo 'Or land the merge by hand once:'
+              echo '```sh'
+              echo 'git fetch upstream master && git merge upstream/master && git push origin master'
+              echo '```'
+            elif [ "$PUSHED" = 'failure' ]; then
+              echo '### Cause: pushing master failed'
+              echo
+              echo 'The merged tree built and verified, but the push was rejected. If the rejection mentions `.github/workflows/`, see the `SYNC_TOKEN` note in `docs/mv3-deployment.md`.'
+            else
+              echo '### Cause: tagging or dispatching the release failed'
+              echo
+              if [ -n "$TAG" ]; then
+                if git ls-remote --exit-code --tags origin "refs/tags/$TAG-mv3" >/dev/null 2>&1; then
+                  echo "The tag \`$TAG-mv3\` **is** on the remote, but no release build ran for it."
+                  echo
+                  echo 'This is self-latching: scheduled runs treat an existing tag as already released and skip it, so the sync will report success while doing nothing. Build it explicitly:'
+                  echo '```sh'
+                  echo "gh workflow run release.yml -R $GH_REPO -f tag=$TAG-mv3"
+                  echo '```'
+                else
+                  echo "The tag \`$TAG-mv3\` is **not** on the remote, so nothing is stuck -- the next scheduled run will retry this tag on its own."
+                fi
+              fi
+            fi
+          } > body.md
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file body.md
+          else
+            gh issue create --title "$title" --body-file body.md
+          fi

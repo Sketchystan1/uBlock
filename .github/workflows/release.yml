@@ -26,7 +26,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref }}
+  # github.ref_name, not github.ref: a tag push gives `1.74.2-mv3` rather than
+  # `refs/tags/1.74.2-mv3`, so the two ways of building the same tag land in the
+  # SAME group instead of racing each other.
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -41,6 +44,7 @@ jobs:
       contents: write      # create the release
       id-token: write      # mint the OIDC token Sigstore signs against
       attestations: write  # persist the build provenance attestation
+      artifact-metadata: write  # create the artifact storage record
     outputs:
       version: ${{ steps.meta.outputs.version }}
       signed: ${{ steps.key.outputs.signed }}
@@ -102,11 +106,25 @@ jobs:
             echo "::error::manifest version ($manifest_version) does not match dist/version ($dist_version)"
             exit 1
           fi
-          # Same numeric stem: 1.74.1b1 -> 1.74.1, and 1.74.1.1 -> 1.74.1
-          tag_stem=$(echo "$VERSION" | sed -E 's/(b|rc)[0-9]+$//')
-          man_stem=$(echo "$manifest_version" | cut -d. -f1-3)
-          if [ "$tag_stem" != "$man_stem" ]; then
-            echo "::error::tag $VERSION and manifest version $manifest_version disagree on the release stem ($tag_stem vs $man_stem) -- this tag was probably built from the wrong tree"
+          # Upstream's tag -> version mapping is exact, so check it exactly. A
+          # shared X.Y.Z stem is not enough: that is precisely the family this
+          # needs to tell apart, since upstream ships ~6 betas per stable
+          # release and they all share a stem.
+          #   X.Y.Z        -> X.Y.Z
+          #   X.Y.Zb<n>    -> X.Y.Z.<n>
+          #   X.Y.Zrc<n>   -> X.Y.Z.10<n>
+          case "$VERSION" in
+            *b*)  expected=$(echo "$VERSION" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)b([0-9]+)$/\1.\2/') ;;
+            *rc*) expected=$(echo "$VERSION" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)rc([0-9]+)$/\1.10\2/') ;;
+            *)    expected="$VERSION" ;;
+          esac
+          echo "expected version:  $expected"
+          if [ "$expected" = "$VERSION" ] && echo "$VERSION" | grep -qvE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::tag $VERSION is not a shape this release process understands (expected X.Y.Z, X.Y.Zb<n> or X.Y.Zrc<n>)"
+            exit 1
+          fi
+          if [ "$manifest_version" != "$expected" ]; then
+            echo "::error::tag $VERSION maps to package version $expected, but this tree builds $manifest_version -- the tag was built from the wrong tree"
             exit 1
           fi
 
@@ -172,9 +190,7 @@ jobs:
         # Deliberately non-blocking, and deliberately BEFORE publication.
         # Provenance is a bonus -- the CRX is already signed with the release key
         # and SHA256SUMS is published -- so it must never be the reason a release
-        # fails. Newer versions of the underlying actions/attest may additionally
-        # want `artifact-metadata: write`; if this step starts warning, add it to
-        # the job's permissions block.
+        # fails.
         continue-on-error: true
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -267,6 +283,13 @@ jobs:
     needs: release
     if: needs.release.outputs.signed == 'true'
     runs-on: ubuntu-latest
+    # A Pages environment accepts one deployment at a time; two in-flight
+    # releases would otherwise have one cancel the other, failing a job after its
+    # release was already published. Not keyed on the tag on purpose -- the point
+    # is to serialise ALL deployments.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     permissions:
       pages: write
       id-token: write

@@ -299,10 +299,23 @@ One-time repository setup:
      -f name='*-mv3' -f type=tag
    ```
    Skipping the second command makes the deploy fail with an opaque environment-protection error.
-4. Optionally add a `SYNC_TOKEN` secret (a PAT with `contents: write`). Pushes authenticated with
-   the default `GITHUB_TOKEN` do not trigger other workflows, so without a PAT `sync-upstream.yml`
-   dispatches `release.yml` explicitly instead. Both paths work; the PAT just makes the tag push
-   itself the trigger.
+4. **Strongly recommended: add a `SYNC_TOKEN` secret** — a PAT with the `workflow` scope (classic:
+   `repo` + `workflow`; fine-grained PAT or App: Contents **write** + Workflows **write**).
+
+   Two separate things need it:
+
+   - **Pushing a merge that touches a workflow file.** GitHub refuses any push from a GitHub App
+     that creates or updates a file under `.github/workflows/`, and `GITHUB_TOKEN` *is* an App
+     installation token. `workflows` is not among the keys a workflow's `permissions:` block can
+     request, so this cannot be granted from inside the workflow. Upstream edits
+     `.github/workflows/main.yml` regularly — three times in August 2026 alone — so without the
+     token the daily sync will eventually stop being able to push at all. `sync-upstream.yml`
+     detects this case up front and fails with an explanatory error rather than wasting two builds
+     on a push that cannot land.
+   - **Firing `release.yml` from the tag push.** Pushes authenticated with `GITHUB_TOKEN` do not
+     trigger other workflows, so without a PAT the sync dispatches `release.yml` explicitly. That
+     fallback does work; the token just removes a moving part.
+
 
 Releases are cut for every release-shaped upstream tag, betas and rcs included. Upstream ships
 roughly six betas per stable release, and a beta's four-component `dist/version` makes it build as
