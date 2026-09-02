@@ -46,7 +46,7 @@ node tools/make-crx.mjs \
     --key crx-key.pem \
     --out dist/build/uBlock0.chromium-mv3.crx \
     --update-xml dist/build/update.xml \
-    --codebase https://example.org/uBlock0.chromium-mv3.crx
+    --codebase https://example.org/uBlock0.chromium-mv3.crx   # only for a manual build
 ```
 
 `make-crx.mjs` prints the extension ID derived from your key — you need it for the policy below.
@@ -63,14 +63,30 @@ installed through `ExtensionInstallForcelist` or an `ExtensionSettings` entry wi
 dragging the CRX in, does **not** qualify — Chrome will show a manifest warning that
 `webRequestBlocking` requires a policy install, and blocking listeners silently do nothing.
 
-Host `update.xml` and the `.crx` on a server both reachable over HTTPS. Then, replacing
-`EXTENSION_ID` with the value `make-crx.mjs` printed:
+Host the `.crx` and an `update.xml` on servers reachable over HTTPS — or let the release
+automation do it for you, which is the supported path here:
+
+- **`update.xml`** is published to GitHub Pages at a **stable URL** that never changes between
+  releases: `https://<owner>.github.io/<repo>/update.xml`. This matters because
+  `ExtensionInstallForcelist` takes one fixed `EXTENSION_ID;UPDATE_URL` string and Chrome polls it
+  forever. A per-release asset URL would give a client exactly one version and then never update it
+  again.
+- **The `.crx`** is a release asset, and each `update.xml` points at the versioned CRX of the
+  release that produced it.
+
+> [!NOTE]
+> Do not use `https://github.com/<owner>/<repo>/releases/latest/download/update.xml`. GitHub
+> resolves `/releases/latest` to the newest **non-prerelease** release, and this fork marks every
+> non-`X.Y.Z` build as a prerelease — which is most of them, since upstream ships roughly six betas
+> per stable release. Policy clients would silently stop at the last stable build.
+
+Then, replacing `EXTENSION_ID` with the value `make-crx.mjs` printed:
 
 **Windows** (registry):
 
 ```
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist]
-"1"="EXTENSION_ID;https://example.org/update.xml"
+"1"="EXTENSION_ID;https://sketchystan1.github.io/uBlock/update.xml"
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome]
 "ExtensionInstallSources"=...            ; optional, see below
@@ -81,12 +97,12 @@ Host `update.xml` and the `.crx` on a server both reachable over HTTPS. Then, re
 ```json
 {
   "ExtensionInstallForcelist": [
-    "EXTENSION_ID;https://example.org/update.xml"
+    "EXTENSION_ID;https://sketchystan1.github.io/uBlock/update.xml"
   ],
   "ExtensionSettings": {
     "EXTENSION_ID": {
       "installation_mode": "force_installed",
-      "update_url": "https://example.org/update.xml"
+      "update_url": "https://sketchystan1.github.io/uBlock/update.xml"
     }
   }
 }
@@ -115,15 +131,33 @@ Until this is done, the service worker logs a single explanatory error and scrip
 skipped. Everything else keeps working. Revoking the toggle later takes effect on the next service
 worker restart.
 
-## 5. Optional: harden the background lifetime
+## 5. Recommended: close the cold-start filtering gap
 
 uBO keeps its compiled filter lists in memory, so a service worker eviction costs a full reload of
 every list. The port already mitigates this: an offscreen document pings the service worker every
 20 seconds, which resets its 30-second idle timer, and a `chrome.alarms` tick re-creates that
-document if it ever disappears.
+document if it ever disappears. (Offscreen documents are not subject to background-tab timer
+throttling — Chromium creates them as nominally visible — so the 20-second interval holds.)
 
-`ExtensionExtendedBackgroundLifetimeForPortConnectionsToUrls` (Chrome 112+) can reinforce this —
-extensions connecting to a listed origin are kept running for as long as the port is connected:
+**A cold start is nevertheless an unfiltered window, and by default uBO does not close it.**
+`vAPI.Net.canSuspend()` returns `false` on Chromium (`platform/common/vapi-background.js:1378`), and
+`src/js/background.js:123` defaults the `suspendUntilListsAreLoaded` user setting to that same
+`false`. With it off, `onBeforeSuspendableRequest()` falls through to `onUnprocessedRequest()` and
+returns `undefined` — i.e. requests are **allowed** until the engines finish loading.
+
+Under MV2 that mattered once per browser launch, because the background page was persistent. Under
+MV3 it recurs on **every** service worker respawn. So turn the setting on:
+
+> `chrome://extensions` → uBlock Origin → Details → Extension options → _Advanced settings_ →
+> set **`suspendUntilListsAreLoaded`** to `true`
+
+With it on, `src/js/start.js:225` calls `vAPI.net.suspend()`, and requests are queued and
+re-evaluated once the lists are ready (`vAPI.Net.setSuspendableListener`) rather than let through.
+The cost is a short stall on the first requests after a worker start.
+
+`ExtensionExtendedBackgroundLifetimeForPortConnectionsToUrls` (Chrome 112+) can reduce how often
+that happens at all — extensions connecting to a listed origin are kept running for as long as the
+port is connected:
 
 ```json
 {
@@ -133,33 +167,63 @@ extensions connecting to a listed origin are kept running for as long as the por
 }
 ```
 
-This is belt-and-braces, not a requirement. Correctness does not depend on it: uBO already
-suspends and queues network requests until its engines are ready (see
-`vAPI.Net.setSuspendableListener` in `platform/common/vapi-background.js`), so a cold start delays
-filtering rather than letting requests through unfiltered.
+This is belt-and-braces rather than a requirement.
+
 
 ## Behavioural differences from the MV2 build
 
-Everything below is a consequence of MV3's platform, not a shortcut in the port.
+Everything below is a consequence of MV3's platform, not a shortcut in the port — but several are
+genuine regressions rather than neutral differences, and they are marked as such.
 
 1. **`:xpath(...)` filters are not syntax-checked at compile time.** A service worker has no XPath
    engine, so `src/js/static-filtering-parser.js`'s validation probe is stubbed out. The filters
    still compile and still work — they are evaluated in the content script, as before. A malformed
    one now fails silently at match time instead of being rejected when the list loads.
-2. **Closed shadow DOM is out of reach for isolated-world scriptlets.** They run in the
-   `USER_SCRIPT` world, which does not expose the content-script-only
-   `chrome.dom.openOrClosedShadowRoot`. `src/js/resources/utils.js` already guards for this and
-   falls back to `elem.shadowRoot`, so open shadow roots are unaffected.
-3. **`matchAboutBlank` has no equivalent for programmatic injection.** Declarative content scripts
-   still use `match_about_blank`, and frame-targeted injection into `about:blank` frames that
-   inherit a permitted origin still resolves, so the practical impact is small.
-4. **Cold start is slower than a persistent background page.** See step 5.
-5. **WebAssembly stays disabled**, exactly as in the MV2 Chromium build. uBO enables its WASM
-   fast paths only when the manifest CSP contains `'wasm-unsafe-eval'`, and the generated MV3 CSP
-   reproduces the MV2 policy verbatim. To opt in, add it in
-   `tools/make-chromium-mv3-meta.py`; the `.wasm` files are already packaged.
+
+2. **Scriptlets run in a third world, and this costs four things.** ⚠️ *Regression.*
+   `chrome.userScripts` is the only MV3 API that can inject a code string, and its only non-`MAIN`
+   world is `USER_SCRIPT` — there is no `ISOLATED` option. Under MV2, `tabs.executeScript({code})`
+   landed in the *same* isolated world as `contentscript.js`; it no longer does, and the two worlds
+   provably share no globals (Chromium keys world lookup on host + execution world + world id). So:
+
+   - `self.uBO_scriptletsInjected` is written in `USER_SCRIPT` but read from `ISOLATED` by
+     `src/js/contentscript.js:1323`, so `needScriptlets` is permanently true and the background
+     recomputes and re-ships the whole scriptlet payload for every frame on every navigation.
+   - `src/js/scriptlets/cosmetic-report.js:128` reads the same marker, so the popup panel's
+     "extended" section silently loses the scriptlet filters that fired.
+   - The scriptlet→logger bridge (`src/js/scriptlet-filtering.js:160`) tests
+     `self.vAPI && self.vAPI.messaging`, which is absent in `USER_SCRIPT`, so scriptlet log lines go
+     to the page console instead of uBO's logger. `configureWorld({messaging:true})` would *not*
+     fix this: user-script messages arrive on `runtime.onUserScriptMessage`, not the `onMessage`
+     uBO listens on.
+   - **Closed shadow DOM piercing stops working.** `src/js/resources/utils.js:375` needs
+     `self.chrome.dom.openOrClosedShadowRoot`, and `chrome.dom` is declared for `content_script` but
+     not `user_script`. It falls through to `elem.shadowRoot`, which is `null` for a closed root.
+     This worked on MV2 Chromium, so it is a loss, not a constant.
+
+3. **`matchAboutBlank` is silently dropped.** ⚠️ *Regression.* uBO passes it at eight
+   `executeScript` call sites, but MV3's `scripting`/`userScripts` have no equivalent — the nearest
+   relation, `matchOriginAsFallback`, exists only on `registerContentScripts`. Declarative content
+   scripts still use `match_about_blank`, so the loss is limited to programmatic injection into
+   `about:blank` / `srcdoc` frames.
+
+4. **A cold start is an unfiltered window unless you opt in.** ⚠️ See step 5 — this is the most
+   consequential item on this list, and it is one setting away from being fixed.
+
+5. **WebAssembly stays disabled, and the documented opt-in does not currently work.** uBO enables
+   its WASM fast paths only when the manifest CSP contains `'wasm-unsafe-eval'`, and the generated
+   MV3 CSP reproduces the MV2 policy verbatim, so `vAPI.canWASM` is false and none of this runs.
+   Note for anyone tempted to add it in `tools/make-chromium-mv3-meta.py`: both loaders fetch with a
+   *relative* path (`src/js/start.js:313` with `'./js/wasm/'`, `src/js/storage.js:1252` with
+   `'./lib/publicsuffixlist/wasm/'`), which in a service worker resolves against `/js/` — giving
+   `/js/js/wasm/…` and `/js/lib/…`. Both 404, and both errors are swallowed by `ubolog`. Enabling
+   the CSP alone would therefore silently disable both engines rather than enable them; the paths
+   need absolutising first.
+
 6. **The MV2 `chromium` target still exists** and still builds via `tools/make-chromium.sh`. Its
    output no longer installs in Chrome 139+, but it is left untouched on purpose — see below.
+   Releases from this fork contain the MV3 package only.
+
 
 ## How the port is structured
 
@@ -173,30 +237,76 @@ Everything MV3-specific is additive:
 |---|---|
 | `platform/chromium-mv3/sw.js` | Service worker entry, replacing `src/background.html` |
 | `platform/chromium-mv3/mv3-shims.js` | Re-creates the MV2 `chrome.*` surface and the DOM globals uBO's background expects, before any uBO module evaluates |
+| `platform/chromium-mv3/mv3-post.js` | The other half: fix-ups that can only be applied *after* uBO's modules have evaluated. Imported by `sw.js` last |
 | `platform/chromium-mv3/offscreen.{html,js}` | Hosts web workers (a service worker cannot construct one) and keeps the worker resident |
 | `platform/chromium-mv3/manifest.overlay.json` | MV3-only manifest values |
 | `tools/make-chromium-mv3.sh` | Build, mirroring `tools/make-chromium.sh` |
 | `tools/make-chromium-mv3-meta.py` | Derives the MV3 manifest from the MV2 one |
+| `tools/patch-mv3-modules.mjs` | Rewrites uBO's dynamic `import()` calls in the build output (forbidden in a service worker) |
+| `tools/verify-mv3-package.mjs` | Asserts the package shape and every upstream assumption the port hard-codes |
 | `tools/make-crx.mjs` | CRX3 packer and update-manifest generator |
 
 `platform/chromium/webext.js` and `platform/chromium/vapi-background-ext.js` are reused **as-is** —
 the shims patch `chrome.*` underneath them — so upstream fixes to those files apply automatically.
 
+Note the division of labour between the two patch modules: `mv3-shims.js` runs *before* uBO and may
+therefore not import anything of uBO's, since that would evaluate a uBO module before its shims
+exist and invert the one ordering guarantee the port rests on. Anything needing uBO's own modules
+goes in `mv3-post.js` instead. Prefer `mv3-shims.js` where possible — a shim installed before uBO
+loads cannot be defeated by load-order surprises.
+
+`tools/patch-mv3-modules.mjs` transforms the **build output**, never the source tree, which is what
+keeps the zero-conflict property intact. `tools/verify-mv3-package.mjs` then asserts the transform
+actually landed, so an upstream change that moves past it fails the build instead of regressing
+silently.
+
 ## Automation
 
 | Workflow | Trigger | Does |
 |---|---|---|
-| `.github/workflows/sync-upstream.yml` | daily + manual | Merges `gorhill/uBlock` `master`; tags `<upstream-tag>-mv3` for the newest upstream tag not yet released. On conflict it aborts the merge and opens an issue rather than forcing anything. |
-| `.github/workflows/release.yml` | `*-mv3` tag push, or dispatch | Builds, signs the CRX, generates `update.xml`, publishes the release |
-| `.github/workflows/build.yml` | push / PR | Builds and asserts the package shape and service worker module graph |
+| `.github/workflows/sync-upstream.yml` | daily + manual | Merges `gorhill/uBlock` `master`, **builds and verifies before pushing anything**, then constructs the release tree (upstream at the tag + this fork's files) and tags it `<upstream-tag>-mv3`. On a conflict, or a merge that no longer builds, it opens an issue and pushes nothing. |
+| `.github/workflows/release.yml` | `*-mv3` tag push, or dispatch | Builds and verifies, signs the CRX, publishes the release with checksums and provenance, and deploys `update.xml` to GitHub Pages |
+| `.github/workflows/build.yml` | push / PR | Builds and verifies |
+
+Two details worth knowing, both learned the hard way:
+
+- **The release tree is not master.** Tagging the merge commit would ship upstream master's *tip*
+  under a tag name it does not correspond to, and take the package version from whatever
+  `dist/version` master happened to hold. That one value decides three things at once: the version
+  `update.xml` advertises (which is what Chrome compares), whether uBO appends
+  `" development build"` to its name, and which filter-list channel `tools/make-assets.sh` selects.
+  So the release tree is built as *upstream at the tag* plus this fork's added files — conflict-free
+  by construction, because the port adds files and modifies none.
+- **`gh` needs `GH_REPO` pinned.** `gh` infers its target repository from git remotes and prefers a
+  remote named `upstream` over `origin`. `sync-upstream.yml` adds exactly such a remote, so without
+  the pin every `gh` call in that job silently targets `gorhill/uBlock`.
 
 One-time repository setup:
 
 1. **Disable upstream's release workflow**: `gh workflow disable main.yml`. It fires on any tag
-   creation and would race with `release.yml`. This is done as a repository setting rather than by
-   editing the file, to keep the merge-conflict surface at zero.
-2. Add the `CRX_PRIVATE_KEY` secret (step 2 above).
-3. Optionally add a `SYNC_TOKEN` secret (a PAT with `contents: write`). Pushes authenticated with
+   creation and would race with `release.yml`; releases from this fork are MV3-only. This is done as
+   a repository setting rather than by editing the file, to keep the merge-conflict surface at zero
+   — and `sync-upstream.yml` re-asserts it on every run, since nothing else would.
+2. Add the `CRX_PRIVATE_KEY` secret (step 2 above). **Without it there is no CRX, no `update.xml`,
+   and therefore no policy install — which means no network filtering at all.** `release.yml` warns
+   and publishes the zip alone.
+3. **Enable GitHub Pages with Actions as the source**, so `update.xml` gets a stable URL:
+   ```sh
+   gh api -X POST repos/OWNER/REPO/pages -f build_type=workflow
+   # release.yml deploys from a *-mv3 tag, but the github-pages environment
+   # permits only the default branch by default -- allow the tags too:
+   gh api -X POST repos/OWNER/REPO/environments/github-pages/deployment-branch-policies \
+     -f name='*-mv3' -f type=tag
+   ```
+   Skipping the second command makes the deploy fail with an opaque environment-protection error.
+4. Optionally add a `SYNC_TOKEN` secret (a PAT with `contents: write`). Pushes authenticated with
    the default `GITHUB_TOKEN` do not trigger other workflows, so without a PAT `sync-upstream.yml`
    dispatches `release.yml` explicitly instead. Both paths work; the PAT just makes the tag push
    itself the trigger.
+
+Releases are cut for every release-shaped upstream tag, betas and rcs included. Upstream ships
+roughly six betas per stable release, and a beta's four-component `dist/version` makes it build as
+"uBlock Origin development build" against the dev filter-list channel — which is upstream's own
+intent for a beta tag, not a defect. Narrow `TAG_PATTERN` in `sync-upstream.yml` to
+`^[0-9]+\.[0-9]+\.[0-9]+$` to track stable releases only.
+
