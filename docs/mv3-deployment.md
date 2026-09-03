@@ -9,7 +9,10 @@ automatic, and **network filtering does nothing until you complete step 3**.
 | Capability | Gate | Consequence if not set up |
 |---|---|---|
 | Blocking `webRequest` (all network filtering) | Extension must be **policy-installed** | No network requests are blocked at all |
-| `chrome.userScripts` (scriptlet / `+js(...)` filters) | Per-extension **Allow user scripts** toggle | Scriptlet filters do not inject |
+| `chrome.userScripts` (scriptlet / `+js(...)` filters) | Per-extension **Allow user scripts** toggle | Scriptlet filters do not inject; the toolbar button shows a `!` badge |
+
+A policy install additionally lets the port hold requests during a cold start rather than cancelling
+them — see [step 5](#5-optional-reduce-how-often-a-cold-start-happens).
 
 Cosmetic filtering, the element picker and zapper, the logger, and the dashboard all work without
 either gate.
@@ -117,6 +120,48 @@ Then restart Chrome and check `chrome://policy` (the policy should be listed and
 `ExtensionInstallSources` is only needed if you also want users to be able to install the CRX
 manually from that origin; force-installation does not require it.
 
+### If `chrome://policy` shows the entry as `[BLOCKED]`
+
+On **Windows and macOS**, writing the policy is not sufficient on its own. Chrome refuses to
+force-install an extension from a non-Web-Store update URL unless it considers the device to be
+under a management authority it trusts, and a locally-written registry key or plist does not
+establish that by itself. Linux has no such requirement — the JSON file in
+`/etc/opt/chrome/policies/managed/` is enough.
+
+Either give the device a management authority Chrome recognises:
+
+- **Windows Pro or higher** — join it to Microsoft Entra ID (*Settings → Accounts → Access work or
+  school → Join this device to Microsoft Entra ID*), join an Active Directory domain, or enrol it
+  in an MDM.
+- **macOS** — enrol the Mac in an MDM, or bind it to a directory server (an Open Directory node
+  under `/LDAPv3`, or `/Active Directory`).
+- **Either** — enrol the browser in Chrome Enterprise Core and set the forcelist entry in the
+  Google Admin console, in which case no local registry or plist entry is needed at all.
+
+Once the device is recognised as managed, the local policy above applies and `[BLOCKED]`
+disappears. If the device is managed through a domain or MDM, prefer deploying the policy through
+that system rather than writing it locally.
+
+### Fallback for an unmanaged machine
+
+If none of that is available, the extension can be installed by hand and given the permission via
+a launch flag instead:
+
+1. Remove any `ExtensionInstallForcelist` entry for this extension.
+2. On branded Google Chrome — not Chromium — add the extension ID to the machine-level
+   `ExtensionInstallAllowlist` policy, or Chrome disables the extension shortly after installation.
+   Quit Chrome completely, restart, and confirm the allowlist in `chrome://policy`.
+3. Launch Chrome with `--allowlisted-extension-id=EXTENSION_ID`, on **every** launch. Chrome shows
+   an unsupported-flag warning; do not silence it with `--test-type`, which changes unrelated
+   browser behaviour.
+4. In `chrome://extensions`, enable **Developer mode** and drag the CRX onto the page.
+
+This grants `webRequestBlocking`, so network filtering works. It is **not** a policy install,
+though, so the async suspension described under [Behavioural
+differences](#behavioural-differences-from-the-mv2-build) is unavailable: during the seconds before
+the filter lists finish loading, subresource requests are cancelled rather than held, and the
+affected tabs are reloaded once uBO is ready.
+
 ## 4. Enable user scripts (for scriptlet filters)
 
 `chrome.userScripts` is the only MV3 API that can inject arbitrary code strings, which is what
@@ -127,9 +172,11 @@ takes one manual step per profile:
   scripts**.
 - **Chrome 135–137**: enable **Developer mode** at the top right of `chrome://extensions`.
 
-Until this is done, the service worker logs a single explanatory error and scriptlet filters are
-skipped. Everything else keeps working. Revoking the toggle later takes effect on the next service
-worker restart.
+Until this is done, scriptlet filters are skipped and everything else keeps working. The service
+worker logs one explanatory error, and the toolbar button shows a `!` badge — the same warning uBO
+uses for requests it could not process — so the state is visible without opening the console. The
+toggle is re-checked every 30 seconds, so enabling or revoking it takes effect without restarting
+anything.
 
 ## 5. Optional: reduce how often a cold start happens
 
@@ -139,27 +186,44 @@ every list. The port already mitigates this: an offscreen document pings the ser
 document if it ever disappears. (Offscreen documents are not subject to background-tab timer
 throttling — Chromium creates them as nominally visible — so the 20-second interval holds.)
 
-**A cold start is still an unfiltered window in principle, but this port closes it by default.**
-On Chromium, `vAPI.Net.canSuspend()` returns `false` (`platform/common/vapi-background.js`), and
-`src/js/background.js` defaults the `suspendUntilListsAreLoaded` user setting to that same `false` —
-which means requests are **allowed** until the engines finish loading. Under MV2 that mattered once
-per browser launch, because the background page was persistent; under MV3 it recurs on every service
-worker respawn. So `platform/chromium-mv3/mv3-post.js` flips that one default to `true`, and requests
-are held back until the lists are ready.
+**A cold start is still an unfiltered window in principle, and on a policy install this port closes
+it completely.** uBO handles the window by suspending network activity until the engines are ready,
+but what "suspend" means has always been per-platform: Firefox returns a promise from its blocking
+listener and resolves it once the lists are loaded, while Chromium MV2 cannot defer a blocking
+decision at all and so *cancels* non-main-frame requests instead, reloading the affected tabs
+afterwards. That is why `vAPI.Net.canSuspend()` returns `false` on Chromium
+(`platform/common/vapi-background.js`), and why `src/js/background.js` in turn defaults the
+`suspendUntilListsAreLoaded` user setting to `false` — requests are simply **allowed** through.
+Under MV2 that mattered once per browser launch; under MV3 it would recur on every service worker
+respawn.
 
-If you would rather have the MV2 behaviour, untick it:
+MV3 supplies the missing capability. Chromium honours a promise returned from a blocking
+`webRequest` listener when the extension is policy-installed — the same installs that are the only
+ones granted `webRequestBlocking` in the first place. `platform/chromium-mv3/mv3-shims.js` detects
+that (`chrome.management.getSelf()` reporting an `admin` install type) and patches `vAPI.Net` with
+upstream's own Firefox implementation of `suspendOneRequest()` / `unsuspendAllRequests()`. So on a
+policy install, requests arriving during a cold start are **held** until the lists are ready and
+then decided normally: nothing is let through unfiltered, nothing is cancelled, and no tab is
+reloaded.
 
-> _Settings_ → **Filter lists** → **Suspend network activity until all filter lists are loaded**
+Making `canSuspend()` true also means uBO suspends from the moment `src/js/traffic.js` evaluates —
+the earliest point available — rather than only once user settings have been read from storage, and
+that `suspendUntilListsAreLoaded` now defaults on, computed by upstream's own code.
 
-Unticking it restores exactly the upstream Chromium behaviour — `canSuspend()` is deliberately left
-alone, so with the setting off uBO never suspends and never pays the cost described next.
+Two qualifications:
 
-The cost of leaving it on: Chromium cannot defer a blocking `webRequest` decision the way Firefox
-can, so uBO's Chromium implementation of suspension *cancels* non-main-frame requests while it waits
-and reloads the affected tabs once the lists are ready
-(`platform/chromium/vapi-background-ext.js`). In practice that means a page loading during a cold
-start may reload once. That is the trade: a reload, versus a page rendered with ads and trackers
-allowed through.
+- On a **non-policy install** — the launch-flag fallback described above — the promise cannot be
+  honoured, so the port falls back to upstream's cancelling behaviour and a page loading during a
+  cold start may reload once. `chrome.management.getSelf()` is asynchronous while `canSuspend()` is
+  read synchronously, so the handful of requests that may arrive before the answer lands are parked
+  optimistically; if the bet turns out wrong they are recorded as unprocessed, which is what
+  produces uBO's `!` badge and the tab reload.
+- Either way, you can restore the plain upstream Chromium behaviour by unticking:
+
+  > _Settings_ → **Filter lists** → **Suspend network activity until all filter lists are loaded**
+
+  With the setting off, uBO never suspends and requests are allowed through until the engines are
+  ready.
 
 `ExtensionExtendedBackgroundLifetimeForPortConnectionsToUrls` (Chrome 112+) can reduce how often a
 cold start happens at all — extensions connecting to a listed origin are kept running for as long as
@@ -288,7 +352,8 @@ Everything MV3-specific is additive:
 | `tools/make-crx.mjs` | CRX3 packer and update-manifest generator |
 
 `platform/chromium/webext.js` and `platform/chromium/vapi-background-ext.js` are reused **as-is** —
-the shims patch `chrome.*` underneath them — so upstream fixes to those files apply automatically.
+the shims patch `chrome.*` underneath them, and patch the two `vAPI.Net` suspension methods on
+assignment rather than forking the class — so upstream fixes to those files apply automatically.
 
 Note the division of labour between the two patch modules: `mv3-shims.js` runs *before* uBO and may
 therefore not import anything of uBO's, since that would evaluate a uBO module before its shims

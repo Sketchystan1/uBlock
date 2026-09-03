@@ -58,6 +58,7 @@
 import * as resourcesScriptlets from './resources/scriptlets.js';
 import * as staticDnrFiltering from './static-dnr-filtering.js';
 import { encodeScriptletMarker } from './mv3-scriptlet-marker.js';
+import { userScripts } from './mv3-shims.js';
 import µb from './background.js';
 
 self.uBO_registerStaticModules({
@@ -143,32 +144,22 @@ if ( chrome.runtime.onUserScriptMessage !== undefined ) {
 
 /******************************************************************************/
 
-// Close the cold-start filtering gap by default.
+// Verify that the cold-start filtering gap is closed by default.
 //
 // uBO keeps its compiled lists in memory, so until they are loaded it cannot
 // decide anything. `src/js/traffic.js` handles that by suspending network
-// activity, but `vAPI.Net.canSuspend()` is false on Chromium, which makes
-// `src/js/background.js` default the `suspendUntilListsAreLoaded` user setting to
-// false as well -- so requests are *allowed* through until the engines are ready.
+// activity, and `src/js/background.js` derives the `suspendUntilListsAreLoaded`
+// user setting default from `vAPI.Net.canSuspend()`. `mv3-shims.js` makes that
+// true, so upstream computes the default we want on its own -- but only if it
+// evaluates after the shim's `vAPI.Net` setter has fired, which is an ordering
+// no assertion in the build can prove holds at runtime. Check it here rather
+// than let a reordering upstream silently reopen a window that now recurs on
+// every service worker respawn.
 //
-// Under MV2 that window opened once per browser launch, because the background
-// page was persistent. Under MV3 it opens on every service worker respawn, which
-// turns "briefly unfiltered at startup" into "intermittently unfiltered".
-// Preserving the MV2 build's actual behaviour therefore means changing the
-// default, not keeping it.
-//
-// `canSuspend()` is deliberately left alone. Flipping it would make
-// `src/js/traffic.js` suspend at module scope, closing the window completely --
-// but Chromium cannot defer a blocking `webRequest` decision, so its
-// `suspendOneRequest()` (`platform/chromium/vapi-background-ext.js`) *cancels*
-// non-main-frame requests instead. With `canSuspend()` false, a user who unticks
-// the setting gets exactly the MV2 behaviour and never pays that cost; with it
-// true, they would pay it during every boot regardless. So: same mechanism uBO
-// already ships on Chromium, opt-out rather than opt-in.
-//
-// This runs before `loadUserSettings()` reads storage -- `src/js/start.js` kicks
-// off its boot as an async IIFE which hits its first `await` well before that --
-// so a value the user has actually chosen still wins.
+// Repairing it is still worth doing when the check fails: this runs before
+// `loadUserSettings()` reads storage -- `src/js/start.js` kicks off its boot as
+// an async IIFE which hits its first `await` well before that -- so a value the
+// user has actually chosen still wins.
 
 {
     const settingName = 'suspendUntilListsAreLoaded';
@@ -177,10 +168,73 @@ if ( chrome.runtime.onUserScriptMessage !== undefined ) {
             `uBO: no "${settingName}" user setting; the MV3 cold-start window ` +
             `is no longer being closed. See platform/chromium-mv3/mv3-post.js.`
         );
-    } else {
+    } else if ( µb.userSettingsDefault[settingName] !== true ) {
+        console.error(
+            `uBO: "${settingName}" did not default on, so vAPI.Net.canSuspend() ` +
+            `was false when src/js/background.js evaluated. Check the vAPI.Net ` +
+            `setter in platform/chromium-mv3/mv3-shims.js against the import ` +
+            `order in src/js/start.js.`
+        );
         µb.userSettingsDefault[settingName] = true;
         µb.userSettings[settingName] = true;
     }
+}
+
+/******************************************************************************/
+
+// Say so on the toolbar when scriptlet filters are not being injected.
+//
+// `chrome.userScripts` is the only MV3 API which can inject a code string, and
+// it is gated behind a per-extension toggle the user has to find and enable by
+// hand (see docs/mv3-deployment.md). Until they do, every `+js(...)` filter
+// silently does nothing while the rest of uBO works normally -- which reads, to
+// the user, as uBO being broken on the sites those filters exist to fix.
+//
+// `mv3-shims.js` logs one line to the service worker console, and nobody reads
+// that. So borrow the vocabulary uBO already uses for "this is not filtering
+// what you think it is": the `!` badge in `#FC0` which
+// `platform/common/vapi-background.js` shows for unprocessed requests. Both the
+// per-tab badge and the default one are needed, since uBO sets a per-tab badge
+// on every tab it tracks and that masks the default.
+
+{
+    const setDefaultBadge = ( ) => {
+        const text = userScripts.available === false ? '!' : '';
+        chrome.action.setBadgeText({ text }).catch(( ) => {});
+        chrome.action.setBadgeBackgroundColor({
+            color: text === '!' ? '#FC0' : '#666',
+        }).catch(( ) => {});
+    };
+
+    const setIcon = vAPI.setIcon;
+    if ( typeof setIcon !== 'function' ) {
+        console.error(
+            'uBO: vAPI.setIcon is not a function, so a missing "Allow user ' +
+            'scripts" toggle will not be flagged on the toolbar. ' +
+            'See platform/chromium-mv3/mv3-post.js.'
+        );
+    } else {
+        vAPI.setIcon = function(tabId, details) {
+            if ( userScripts.available === false && details instanceof Object ) {
+                // `parts` bit 1 selects the badge text and bit 2 its colour;
+                // without them an icon-only update would leave the warning
+                // unpainted. Bit 3 (hide the badge) is deliberately left alone:
+                // uBO respects it for its own `!`, and a user who has turned
+                // badges off has said what they want.
+                details = Object.assign({}, details, {
+                    badge: '!',
+                    color: '#FC0',
+                    parts: (details.parts ?? 0b0001) | 0b0110,
+                });
+            }
+            return setIcon.call(this, tabId, details);
+        };
+    }
+
+    // uBO's `vAPI.Net` constructor calls `vAPI.setDefaultIcon()`, which resets
+    // the default badge -- so paint ours only now, once that has happened.
+    userScripts.onChange = setDefaultBadge;
+    setDefaultBadge();
 }
 
 /******************************************************************************/

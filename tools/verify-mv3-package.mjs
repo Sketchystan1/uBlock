@@ -529,22 +529,45 @@ section('upstream drift');
     }
 }
 
-// mv3-post.js defaults `suspendUntilListsAreLoaded` on, because under MV3 the
-// cold-start window recurs on every service worker respawn. That reasoning has
-// two upstream preconditions.
+// mv3-shims.js patches `vAPI.Net` on assignment so that `canSuspend()` is true
+// and suspended requests are parked as promises rather than cancelled. Four
+// upstream shapes have to hold for that to land where it is aimed.
 {
     const background = readRepo('src/js/background.js');
     const vapi = readRepo('platform/common/vapi-background.js');
+    const ext = readRepo('platform/chromium/vapi-background-ext.js');
+    const start = readRepo('src/js/start.js');
+
+    // The setter has to see both assignments: the base class and the Chromium
+    // subclass which is the one actually instantiated.
+    const assigns = /^\s*vAPI\.Net\s*=\s*class/m;
+
+    // `traffic.js` reads canSuspend() to decide whether to suspend at module
+    // scope, and `background.js` derives the user setting default from it. Both
+    // happen after vapi-background-ext.js evaluates only because start.js
+    // imports it first.
+    const extImport = start.indexOf(`'./vapi-background-ext.js'`);
+    const trafficImport = start.indexOf(`'./traffic.js'`);
+
     if ( /suspendUntilListsAreLoaded:\s*vAPI\.Net\.canSuspend\(\)/.test(background) === false ) {
         fail('suspend-default',
             'src/js/background.js no longer defaults suspendUntilListsAreLoaded from vAPI.Net.canSuspend()',
-            'check that platform/chromium-mv3/mv3-post.js still overrides the right thing');
-    } else if ( /static canSuspend\(\)\s*\{\s*return false;/.test(vapi) === false ) {
+            'the MV3 cold-start window is closed by making canSuspend() true; check platform/chromium-mv3/mv3-shims.js');
+    } else if ( assigns.test(vapi) === false || assigns.test(ext) === false ) {
         fail('suspend-default',
-            'vAPI.Net.canSuspend() no longer returns false in platform/common/vapi-background.js',
-            'if upstream now suspends on Chromium by default, drop the override in platform/chromium-mv3/mv3-post.js');
+            'vAPI.Net is no longer assigned as `vAPI.Net = class` in vapi-background.js and/or chromium/vapi-background-ext.js',
+            'the setter in platform/chromium-mv3/mv3-shims.js patches on assignment and would never fire');
+    } else if ( extImport === -1 || trafficImport === -1 || extImport > trafficImport ) {
+        fail('suspend-default',
+            'src/js/start.js no longer imports ./vapi-background-ext.js before ./traffic.js',
+            'canSuspend() would be read before mv3-shims.js has patched it, reopening the cold-start window');
+    } else if ( /suspendOneRequest\(details\)/.test(ext) === false ||
+                /unsuspendAllRequests\(discard/.test(ext) === false ) {
+        fail('suspend-default',
+            'platform/chromium/vapi-background-ext.js no longer defines suspendOneRequest()/unsuspendAllRequests()',
+            'mv3-shims.js captures both as the fallback used when the extension is not policy-installed');
     } else {
-        pass('suspendUntilListsAreLoaded default is still ours to flip');
+        pass('vAPI.Net async-suspension patch still lands where it is aimed');
     }
 }
 

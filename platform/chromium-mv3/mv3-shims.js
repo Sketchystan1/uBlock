@@ -457,6 +457,7 @@ chrome.alarms.create(KEEPALIVE_ALARM, {
 chrome.alarms.onAlarm.addListener(alarm => {
     if ( alarm.name !== KEEPALIVE_ALARM ) { return; }
     ensureOffscreenDocument();
+    recheckUserScripts();
 });
 
 chrome.runtime.onMessage.addListener((message, sender, callback) => {
@@ -642,6 +643,180 @@ if ( chrome.browserAction === undefined ) {
 
 /******************************************************************************/
 
+// Hold requests while the filtering engines load, instead of cancelling them.
+//
+// uBO cannot decide anything until its filter lists are in memory, so
+// `src/js/traffic.js` suspends network activity until they are. What "suspend"
+// means is per-platform. Firefox returns a promise from the blocking listener
+// and resolves it once the engines are ready
+// (`platform/firefox/vapi-background-ext.js`). Chromium MV2 cannot defer a
+// blocking decision at all, so `platform/chromium/vapi-background-ext.js`
+// *cancels* every non-main-frame request instead and reloads the affected tabs
+// afterwards -- which is why `vAPI.Net.canSuspend()` is false there, and why
+// `suspendUntilListsAreLoaded` consequently defaults off on Chromium.
+//
+// MV3 changes that calculation twice over. The startup window now recurs on
+// every service worker respawn rather than once per browser launch, so the
+// cancel-and-reload cost is paid over and over instead of once. But MV3 also
+// supplies the missing capability: Chromium honours a promise returned from a
+// blocking `webRequest` listener when the extension is policy-installed -- the
+// same installs which are the only ones granted `webRequestBlocking` in the
+// first place. See docs/mv3-deployment.md.
+//
+// So on the install type this port targets, it can do exactly what Firefox
+// does, and the two methods below are upstream's Firefox implementations.
+// Everywhere else it falls back to the Chromium ones it replaced.
+
+// Chromium gates async blocking on the extension being policy-installed, which
+// `chrome.management.getSelf()` reports as an `admin` install type. It needs no
+// `management` permission, but it is asynchronous -- and `canSuspend()` is
+// consulted synchronously while `traffic.js` evaluates, so there is no way to
+// have the answer before the first request can arrive. Requests in that window
+// are parked optimistically and reconciled below if the bet was wrong.
+let asyncBlockingAvailable;
+
+// One entry per suspended request: the promise handed to Chromium, and the
+// `resolve` which decides it. Keyed by `vAPI.Net` instance rather than held in
+// a module-level array, so that the bookkeeping cannot outlive the object it
+// belongs to. uBO only ever constructs one.
+const pendingByNet = new WeakMap();
+
+const pendingRequests = net => {
+    let pending = pendingByNet.get(net);
+    if ( pending === undefined ) {
+        pendingByNet.set(net, (pending = []));
+    }
+    return pending;
+};
+
+// Feed requests we parked on a bet that turned out wrong back into uBO's
+// bookkeeping. Chromium ignored the promises, so the requests themselves are
+// already gone; what this recovers is the *accounting*. Filing them as
+// unprocessed is what makes uBO show its `!` badge and reload the affected tabs
+// once the engines are up -- exactly what the cancelling fallback would have
+// produced, minus the cancellation.
+//
+// `onUnprocessedRequest()` rather than `onBeforeSuspendableRequest()`: the
+// latter would run the real filtering listener if one had been installed in the
+// meantime, double-counting a request which has already completed. Recording is
+// all that is wanted here, and it is moot once uBO is up anyway.
+const discardPendingRequests = net => {
+    const pending = pendingByNet.get(net);
+    if ( pending === undefined || pending.length === 0 ) { return; }
+    pendingByNet.set(net, []);
+    for ( const entry of pending ) {
+        entry.resolve();
+        net.onUnprocessedRequest(entry.details);
+    }
+};
+
+const setAsyncBlockingAvailable = available => {
+    asyncBlockingAvailable = available;
+    if ( available ) { return; }
+    console.info(
+        'uBO: async blocking is unavailable, which normally means this is not ' +
+        'a policy install. Network requests cannot be held while the filtering ' +
+        'engines load; they will be cancelled and the affected tabs reloaded ' +
+        'instead. See docs/mv3-deployment.md.'
+    );
+    if ( self.vAPI.net ) { discardPendingRequests(self.vAPI.net); }
+};
+
+try {
+    chrome.management.getSelf()
+        .then(info => setAsyncBlockingAvailable(info?.installType === 'admin'))
+        .catch(( ) => setAsyncBlockingAvailable(false));
+} catch {
+    setAsyncBlockingAvailable(false);
+}
+
+// Maps each patched method back to the one it replaced, so that patching a
+// subclass finds the *original* implementation rather than the patch installed
+// on its base. Without this, a future `vAPI.Net` subclass which does not define
+// its own `suspendOneRequest()` would inherit the patched one, capture it as its
+// own fallback, and recurse forever.
+const netOriginals = new WeakMap();
+const netUnpatch = fn => netOriginals.get(fn) || fn;
+
+const patchedNetClasses = new WeakSet();
+
+const patchNetClass = ctor => {
+    if ( typeof ctor !== 'function' ) { return ctor; }
+    if ( patchedNetClasses.has(ctor) ) { return ctor; }
+    patchedNetClasses.add(ctor);
+
+    const proto = ctor.prototype;
+    const baseSuspendOne = netUnpatch(proto.suspendOneRequest);
+    const baseUnsuspendAll = netUnpatch(proto.unsuspendAllRequests);
+
+    proto.suspendOneRequest = function(details) {
+        if ( asyncBlockingAvailable === false ) {
+            return baseSuspendOne.call(this, details);
+        }
+        const entry = {
+            details: Object.assign({}, details),
+            resolve: undefined,
+            promise: undefined,
+        };
+        entry.promise = new Promise(resolve => { entry.resolve = resolve; });
+        pendingRequests(this).push(entry);
+        return entry.promise;
+    };
+
+    proto.unsuspendAllRequests = function(discard = false) {
+        const pending = pendingByNet.get(this);
+        if ( pending !== undefined && pending.length !== 0 ) {
+            pendingByNet.set(this, []);
+            for ( const entry of pending ) {
+                entry.resolve(discard !== true
+                    ? this.onBeforeSuspendableRequest(entry.details)
+                    : undefined
+                );
+            }
+        }
+        // Still upstream's job: reload the tabs whose requests went unprocessed.
+        // Nothing was recorded as unprocessed on the path above, so this is a
+        // no-op whenever the parking worked.
+        return baseUnsuspendAll.call(this, discard);
+    };
+
+    netOriginals.set(proto.suspendOneRequest, baseSuspendOne);
+    netOriginals.set(proto.unsuspendAllRequests, baseUnsuspendAll);
+
+    // Own static, shadowing the inherited one. `src/js/traffic.js` reads this
+    // synchronously to decide whether to suspend at module scope, which is the
+    // earliest point at which the window can be closed, and `src/js/background.js`
+    // derives the `suspendUntilListsAreLoaded` user setting default from it.
+    //
+    // Unconditionally true, even though async blocking may turn out to be
+    // unavailable: the alternative is the status quo, where nothing is suspended
+    // until user settings have been read from storage and requests up to that
+    // point are simply let through. Suspending from the earliest moment and
+    // falling back to cancelling is the safer of the two, and it is what a user
+    // who leaves the setting alone would get on Firefox.
+    ctor.canSuspend = ( ) => true;
+
+    return ctor;
+};
+
+// `vAPI.Net` is assigned twice -- the base class in
+// `platform/common/vapi-background.js`, then a subclass of it in
+// `platform/chromium/vapi-background-ext.js` -- and only the second one is ever
+// instantiated. Patch on assignment rather than at some later fixed point, so
+// that whichever class ends up in place is the patched one, and so that the
+// patch is visible to `src/js/background.js` when it evaluates in between.
+{
+    let NetClass;
+    Object.defineProperty(self.vAPI, 'Net', {
+        configurable: true,
+        enumerable: true,
+        get: ( ) => NetClass,
+        set: ctor => { NetClass = patchNetClass(ctor); },
+    });
+}
+
+/******************************************************************************/
+
 // `chrome.tabs.executeScript()`, `insertCSS()` and `removeCSS()` were replaced
 // by `chrome.scripting`. `platform/chromium/webext.js` promisifies the old
 // callback-style entry points, so provide them in that shape: a trailing
@@ -659,7 +834,18 @@ const targetFromDetails = details => {
     return target;
 };
 
+// Read by `mv3-post.js`, which owns everything user-visible about this state.
+// Enabling the toggle takes effect immediately, so availability is deliberately
+// not a one-shot latch: it is re-probed on every keepalive tick, and `onChange`
+// fires whenever the answer flips.
+export const userScripts = { available: undefined, onChange: undefined };
+
 let userScriptsAvailable;
+
+// The probe below runs every 30s for as long as the toggle stays off. Say so
+// once per outage rather than once per probe, and re-arm when it clears so that
+// a later revocation is reported again.
+let userScriptsWarned = false;
 
 const canUserScripts = ( ) => {
     if ( userScriptsAvailable !== undefined ) { return userScriptsAvailable; }
@@ -671,12 +857,40 @@ const canUserScripts = ( ) => {
         userScriptsAvailable = true;
     } catch {
         userScriptsAvailable = false;
+    }
+    userScripts.available = userScriptsAvailable;
+    if ( userScriptsAvailable ) {
+        userScriptsWarned = false;
+    } else if ( userScriptsWarned === false ) {
+        userScriptsWarned = true;
         console.error(
             'uBO: chrome.userScripts is unavailable, so scriptlet filters will not be injected. ' +
             'Enable "Allow user scripts" on this extension\'s details page in chrome://extensions.'
         );
     }
     return userScriptsAvailable;
+};
+
+// The toggle is per-extension and can be flipped at any time, but nothing tells
+// us when. Re-probe on the keepalive tick we already pay for rather than adding
+// a timer of its own: 30s is a long time to leave a stale badge up, but it is
+// the difference between "the user enabled it and the badge cleared" and "the
+// user enabled it and nothing visibly happened", which is the failure this is
+// here to avoid. A newly-granted toggle also needs its world configured before
+// the next injection, hence the middle clause.
+const recheckUserScripts = ( ) => {
+    const was = userScriptsAvailable;
+    userScriptsAvailable = undefined;
+    if ( canUserScripts() === was ) { return; }
+    if ( userScriptsAvailable ) {
+        userScriptWorldConfigured = undefined;
+        configureUserScriptWorld();
+    }
+    try {
+        userScripts.onChange?.();
+    } catch (reason) {
+        console.error(`uBO: userScripts.onChange: ${reason}`);
+    }
 };
 
 /******************************************************************************/
