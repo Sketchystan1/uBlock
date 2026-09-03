@@ -131,7 +131,7 @@ Until this is done, the service worker logs a single explanatory error and scrip
 skipped. Everything else keeps working. Revoking the toggle later takes effect on the next service
 worker restart.
 
-## 5. Recommended: close the cold-start filtering gap
+## 5. Optional: reduce how often a cold start happens
 
 uBO keeps its compiled filter lists in memory, so a service worker eviction costs a full reload of
 every list. The port already mitigates this: an offscreen document pings the service worker every
@@ -139,25 +139,31 @@ every list. The port already mitigates this: an offscreen document pings the ser
 document if it ever disappears. (Offscreen documents are not subject to background-tab timer
 throttling — Chromium creates them as nominally visible — so the 20-second interval holds.)
 
-**A cold start is nevertheless an unfiltered window, and by default uBO does not close it.**
-`vAPI.Net.canSuspend()` returns `false` on Chromium (`platform/common/vapi-background.js:1378`), and
-`src/js/background.js:123` defaults the `suspendUntilListsAreLoaded` user setting to that same
-`false`. With it off, `onBeforeSuspendableRequest()` falls through to `onUnprocessedRequest()` and
-returns `undefined` — i.e. requests are **allowed** until the engines finish loading.
+**A cold start is still an unfiltered window in principle, but this port closes it by default.**
+On Chromium, `vAPI.Net.canSuspend()` returns `false` (`platform/common/vapi-background.js`), and
+`src/js/background.js` defaults the `suspendUntilListsAreLoaded` user setting to that same `false` —
+which means requests are **allowed** until the engines finish loading. Under MV2 that mattered once
+per browser launch, because the background page was persistent; under MV3 it recurs on every service
+worker respawn. So `platform/chromium-mv3/mv3-post.js` flips that one default to `true`, and requests
+are held back until the lists are ready.
 
-Under MV2 that mattered once per browser launch, because the background page was persistent. Under
-MV3 it recurs on **every** service worker respawn. So turn the setting on:
+If you would rather have the MV2 behaviour, untick it:
 
-> `chrome://extensions` → uBlock Origin → Details → Extension options → _Advanced settings_ →
-> set **`suspendUntilListsAreLoaded`** to `true`
+> _Settings_ → **Filter lists** → **Suspend network activity until all filter lists are loaded**
 
-With it on, `src/js/start.js:225` calls `vAPI.net.suspend()`, and requests are queued and
-re-evaluated once the lists are ready (`vAPI.Net.setSuspendableListener`) rather than let through.
-The cost is a short stall on the first requests after a worker start.
+Unticking it restores exactly the upstream Chromium behaviour — `canSuspend()` is deliberately left
+alone, so with the setting off uBO never suspends and never pays the cost described next.
 
-`ExtensionExtendedBackgroundLifetimeForPortConnectionsToUrls` (Chrome 112+) can reduce how often
-that happens at all — extensions connecting to a listed origin are kept running for as long as the
-port is connected:
+The cost of leaving it on: Chromium cannot defer a blocking `webRequest` decision the way Firefox
+can, so uBO's Chromium implementation of suspension *cancels* non-main-frame requests while it waits
+and reloads the affected tabs once the lists are ready
+(`platform/chromium/vapi-background-ext.js`). In practice that means a page loading during a cold
+start may reload once. That is the trade: a reload, versus a page rendered with ads and trackers
+allowed through.
+
+`ExtensionExtendedBackgroundLifetimeForPortConnectionsToUrls` (Chrome 112+) can reduce how often a
+cold start happens at all — extensions connecting to a listed origin are kept running for as long as
+the port is connected:
 
 ```json
 {
@@ -172,55 +178,89 @@ This is belt-and-braces rather than a requirement.
 
 ## Behavioural differences from the MV2 build
 
-Everything below is a consequence of MV3's platform, not a shortcut in the port — but several are
-genuine regressions rather than neutral differences, and they are marked as such.
+Everything below is a consequence of MV3's platform, not a shortcut in the port. The list is
+deliberately short: where a difference could be closed, it has been, and what remains is what
+Chromium does not expose.
 
 1. **`:xpath(...)` filters are not syntax-checked at compile time.** A service worker has no XPath
    engine, so `src/js/static-filtering-parser.js`'s validation probe is stubbed out. The filters
    still compile and still work — they are evaluated in the content script, as before. A malformed
    one now fails silently at match time instead of being rejected when the list loads.
 
-2. **Scriptlets run in a third world, and this costs four things.** ⚠️ *Regression.*
-   `chrome.userScripts` is the only MV3 API that can inject a code string, and its only non-`MAIN`
-   world is `USER_SCRIPT` — there is no `ISOLATED` option. Under MV2, `tabs.executeScript({code})`
-   landed in the *same* isolated world as `contentscript.js`; it no longer does, and the two worlds
-   provably share no globals (Chromium keys world lookup on host + execution world + world id). So:
+2. **Scriptlets run in a third world.** `chrome.userScripts` is the only MV3 API that can inject a
+   code string, and its only non-`MAIN` world is `USER_SCRIPT` — there is no `ISOLATED` option. So
+   the wrapper uBO injects lands in `USER_SCRIPT` rather than in the same isolated world as
+   `contentscript.js`. This is also how upstream's own MV3 build routes them
+   (`platform/mv3/extension/js/compiled-filters.js` maps `ISOLATED` → `world: 'USER_SCRIPT'`), so it
+   is the platform's answer, not a workaround.
 
-   - `self.uBO_scriptletsInjected` is written in `USER_SCRIPT` but read from `ISOLATED` by
-     `src/js/contentscript.js:1323`, so `needScriptlets` is permanently true and the background
-     recomputes and re-ships the whole scriptlet payload for every frame on every navigation.
-   - `src/js/scriptlets/cosmetic-report.js:128` reads the same marker, so the popup panel's
-     "extended" section silently loses the scriptlet filters that fired.
-   - The scriptlet→logger bridge (`src/js/scriptlet-filtering.js:160`) tests
-     `self.vAPI && self.vAPI.messaging`, which is absent in `USER_SCRIPT`, so scriptlet log lines go
-     to the page console instead of uBO's logger. `configureWorld({messaging:true})` would *not*
-     fix this: user-script messages arrive on `runtime.onUserScriptMessage`, not the `onMessage`
-     uBO listens on.
-   - **Closed shadow DOM piercing stops working.** `src/js/resources/utils.js:375` needs
-     `self.chrome.dom.openOrClosedShadowRoot`, and `chrome.dom` is declared for `content_script` but
-     not `user_script`. It falls through to `elem.shadowRoot`, which is `null` for a closed root.
-     This worked on MV2 Chromium, so it is a loss, not a constant.
+   Note what this does **not** cost. Main-world scriptlets — the large majority — are unaffected:
+   the wrapper inserts them as a `<script>` element, and any world with DOM access can do that.
+   Three consequences that did bite have been closed:
 
-3. **`matchAboutBlank` is silently dropped.** ⚠️ *Regression.* uBO passes it at eight
-   `executeScript` call sites, but MV3's `scripting`/`userScripts` have no equivalent — the nearest
-   relation, `matchOriginAsFallback`, exists only on `registerContentScripts`. Declarative content
-   scripts still use `match_about_blank`, so the loss is limited to programmatic injection into
-   `about:blank` / `srcdoc` frames.
+   - `self.uBO_scriptletsInjected` is written in `USER_SCRIPT`, but `src/js/contentscript.js` and
+     `src/js/scriptlets/cosmetic-report.js` read it from `ISOLATED`.
+     `platform/chromium-mv3/mv3-post.js` prefixes the wrapper's output with the filters that fired
+     and `mv3-shims.js` replays the marker into `ISOLATED` via
+     `chrome.scripting.executeScript({ func, args })` — which needs no code string, and so no
+     `userScripts`. So the popup panel's "extended" section lists scriptlet filters again, and the
+     background no longer recomputes and re-ships the whole payload for every frame on every
+     navigation.
+   - The scriptlet→logger bridge tests `self.vAPI && self.vAPI.messaging`
+     (`src/js/scriptlet-filtering.js`), which does not exist in `USER_SCRIPT`, so scriptlet log lines
+     went to the page console. `mv3-shims.js` now calls
+     `chrome.userScripts.configureWorld({ messaging: true })` and prepends a minimal
+     `vAPI.messaging.send` to every injection; `mv3-post.js` forwards the resulting
+     `chrome.runtime.onUserScriptMessage` into `vAPI.messaging` on the same unprivileged footing a
+     content-script port would have had. Scriptlet log lines reach uBO's logger again.
 
-4. **A cold start is an unfiltered window unless you opt in.** ⚠️ See step 5 — this is the most
-   consequential item on this list, and it is one setting away from being fixed.
+   What remains is one genuine loss: ⚠️ **closed shadow DOM piercing stops working for
+   `trusted-click-element`.** `src/js/resources/utils.js`'s `lookupElementsFn` needs
+   `self.chrome.dom.openOrClosedShadowRoot` to follow the `>>>` combinator, and `chrome.dom` is
+   declared for `content_script` but not `user_script`; it falls through to `elem.shadowRoot`, which
+   is `null` for a closed root. There is no way for an extension to grant that API to a
+   `USER_SCRIPT` world, so this cannot be shimmed.
 
-5. **WebAssembly stays disabled, and the documented opt-in does not currently work.** uBO enables
-   its WASM fast paths only when the manifest CSP contains `'wasm-unsafe-eval'`, and the generated
-   MV3 CSP reproduces the MV2 policy verbatim, so `vAPI.canWASM` is false and none of this runs.
-   Note for anyone tempted to add it in `tools/make-chromium-mv3-meta.py`: both loaders fetch with a
-   *relative* path (`src/js/start.js:313` with `'./js/wasm/'`, `src/js/storage.js:1252` with
-   `'./lib/publicsuffixlist/wasm/'`), which in a service worker resolves against `/js/` — giving
-   `/js/js/wasm/…` and `/js/lib/…`. Both 404, and both errors are swallowed by `ubolog`. Enabling
-   the CSP alone would therefore silently disable both engines rather than enable them; the paths
-   need absolutising first.
+   The blast radius is narrow, and worth stating precisely. `lookup-elements.fn` has exactly two
+   consumers: `trusted-click-element` (declared `world: 'ISOLATED'`, so affected) and `json-edit`
+   (main-world, where `chrome.dom` was never available under MV2 either, so unchanged). The other six
+   built-in `world: 'ISOLATED'` scriptlets — `trusted-replace-node-text`, `remove-node-text`,
+   `remove-class`, `prevent-refresh`, `close-window`, `multiup` — do not use it. Procedural cosmetic
+   filters are also unaffected: `:shadow()` is evaluated by `src/js/contentscript-extra.js`, which is
+   a declarative content script and still has `chrome.dom`. So the loss is `+js(trusted-click-element,
+   … >>> …)` against a *closed* shadow root, and nothing else.
 
-6. **The MV2 `chromium` target still exists** and still builds via `tools/make-chromium.sh`. Its
+3. **`matchAboutBlank` is silently dropped.** ⚠️ *Regression.* uBO passes it at ten call sites —
+   six `executeScript` (`src/js/messaging.js`, `src/js/scriptlet-filtering.js`) and four
+   `insertCSS`/`removeCSS` (`src/js/cosmetic-filtering.js`, `platform/common/vapi-background.js`) —
+   but MV3's `scripting`/`userScripts` have no equivalent. The nearest relation,
+   `matchOriginAsFallback`, exists only on `registerContentScripts`.
+
+   The declarative content script keeps `match_about_blank: true`, which the manifest generator
+   preserves, so `contentscript.js` still runs in `about:blank` frames. What can fail there is the
+   *programmatic* follow-up: the stylesheet it asks the background to insert, and scriptlet
+   injection. Note this is a limit on what MV3 exposes, not something the port chose — the option
+   simply does not exist on those APIs.
+
+4. **WebAssembly stays disabled, matching the MV2 Chromium build.** uBO enables its WASM fast paths
+   only when the manifest CSP contains `'wasm-unsafe-eval'`. `platform/chromium/manifest.json` does
+   not, so `vAPI.canWASM` is false on MV2 Chromium too, and the generated MV3 CSP reproduces that
+   policy verbatim — this is parity, not a gap.
+
+   The opt-in now works, though, which it previously did not: both loaders fetch with a *relative*
+   path (`src/js/start.js` with `'./js/wasm/'`, `src/js/storage.js` with
+   `'./lib/publicsuffixlist/wasm/'`), which in a service worker used to resolve against `/js/` and
+   404 with the error swallowed by `ubolog`. `mv3-shims.js` now resolves relative `fetch()` URLs
+   against the package root, as `background.html` did. To enable it, add to
+   `platform/chromium-mv3/manifest.overlay.json`:
+
+   ```json
+   "content_security_policy": {
+     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+   }
+   ```
+
+5. **The MV2 `chromium` target still exists** and still builds via `tools/make-chromium.sh`. Its
    output no longer installs in Chrome 139+, but it is left untouched on purpose — see below.
    Releases from this fork contain the MV3 package only.
 
@@ -238,12 +278,13 @@ Everything MV3-specific is additive:
 | `platform/chromium-mv3/sw.js` | Service worker entry, replacing `src/background.html` |
 | `platform/chromium-mv3/mv3-shims.js` | Re-creates the MV2 `chrome.*` surface and the DOM globals uBO's background expects, before any uBO module evaluates |
 | `platform/chromium-mv3/mv3-post.js` | The other half: fix-ups that can only be applied *after* uBO's modules have evaluated. Imported by `sw.js` last |
+| `platform/chromium-mv3/mv3-scriptlet-marker.js` | The wire format the two above share to carry the scriptlet filters that fired across execution worlds. Pure, so `verify-mv3-package.mjs` can round-trip it |
 | `platform/chromium-mv3/offscreen.{html,js}` | Hosts web workers (a service worker cannot construct one) and keeps the worker resident |
 | `platform/chromium-mv3/manifest.overlay.json` | MV3-only manifest values |
 | `tools/make-chromium-mv3.sh` | Build, mirroring `tools/make-chromium.sh` |
 | `tools/make-chromium-mv3-meta.py` | Derives the MV3 manifest from the MV2 one |
 | `tools/patch-mv3-modules.mjs` | Rewrites uBO's dynamic `import()` calls in the build output (forbidden in a service worker) |
-| `tools/verify-mv3-package.mjs` | Asserts the package shape and every upstream assumption the port hard-codes |
+| `tools/verify-mv3-package.mjs` | Asserts the package shape, every upstream assumption the port hard-codes, and that the port's own modules parse |
 | `tools/make-crx.mjs` | CRX3 packer and update-manifest generator |
 
 `platform/chromium/webext.js` and `platform/chromium/vapi-background-ext.js` are reused **as-is** —
@@ -264,7 +305,7 @@ silently.
 
 | Workflow | Trigger | Does |
 |---|---|---|
-| `.github/workflows/sync-upstream.yml` | daily + manual | Merges `gorhill/uBlock` `master`, **builds and verifies before pushing anything**, then constructs the release tree (upstream at the tag + this fork's files) and tags it `<upstream-tag>-mv3`. On a conflict, or a merge that no longer builds, it opens an issue and pushes nothing. |
+| `.github/workflows/sync-upstream.yml` | daily + manual | Merges `gorhill/uBlock` `master`, **builds and verifies before pushing anything**, then constructs the release tree (upstream at the tag + this fork's files) and tags it `<upstream-tag>-mv3`. On a conflict, a merge that no longer builds, or a release tree that does not build, it opens an issue and pushes nothing. |
 | `.github/workflows/release.yml` | `*-mv3` tag push, or dispatch | Builds and verifies, signs the CRX, publishes the release with checksums and provenance, and deploys `update.xml` to GitHub Pages |
 | `.github/workflows/build.yml` | push / PR | Builds and verifies |
 
@@ -277,6 +318,11 @@ Two details worth knowing, both learned the hard way:
   `" development build"` to its name, and which filter-list channel `tools/make-assets.sh` selects.
   So the release tree is built as *upstream at the tag* plus this fork's added files — conflict-free
   by construction, because the port adds files and modifies none.
+
+  That last clause is load-bearing rather than descriptive: the release tree is assembled from
+  `git diff --diff-filter=A`, so a modification to an upstream file would be silently dropped from
+  every release while master still looked correct. `sync-upstream.yml` therefore asserts that the
+  fork modifies, deletes and renames nothing, and fails the run if it ever does.
 - **`gh` needs `GH_REPO` pinned.** `gh` infers its target repository from git remotes and prefers a
   remote named `upstream` over `origin`. `sync-upstream.yml` adds exactly such a remote, so without
   the pin every `gh` call in that job silently targets `gorhill/uBlock`.

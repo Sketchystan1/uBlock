@@ -222,16 +222,46 @@ jobs:
         id: verify_master
         run: bash tools/make-chromium-mv3.sh
 
-      - name: Report broken merge
-        if: failure() && steps.verify_master.outcome == 'failure'
+      - name: Report broken build
+        # Covers both build gates: the merged master tree, and the release tree
+        # (upstream at the tag + the port's files). The second can fail on its
+        # own -- the tag is a different upstream commit than master's tip, so a
+        # drift assumption can hold for one and not the other -- and until this
+        # step covered it, that failure filed no issue at all and the catch-all
+        # below deliberately skipped it.
+        if: |
+          failure()
+          && ( steps.verify_master.outcome == 'failure'
+            || steps.verify_release.outcome == 'failure' )
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WHICH: ${{ steps.verify_master.outcome == 'failure' && 'master' || 'release' }}
+          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
-          title='Upstream merge builds no longer'
-          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          if [ "$WHICH" = 'master' ]; then
+            title='Upstream merge builds no longer'
+            what="\`upstream/master\` merged cleanly but the resulting tree does not build, so **nothing was pushed and no tag was created**."
+            repro=$(printf '%s\n' \
+              '```sh' \
+              'git fetch upstream master && git merge upstream/master' \
+              'bash tools/pull-assets.sh' \
+              'bash tools/make-chromium-mv3.sh' \
+              '```')
+          else
+            title="Release tree for $TAG does not build"
+            what="Master was merged and pushed, but the release tree for upstream tag \`$TAG\` -- upstream at that tag plus this fork's files -- does not build, so **no tag was created**. Master is fine; this tag is not."
+            repro=$(printf '%s\n' \
+              '```sh' \
+              'git fetch upstream master '"'"'+refs/tags/*:refs/upstream-tags/*'"'"'' \
+              "git checkout --detach refs/upstream-tags/$TAG" \
+              'git checkout master -- $(git diff --name-only --diff-filter=A upstream/master master)' \
+              'bash tools/pull-assets.sh' \
+              'bash tools/make-chromium-mv3.sh' \
+              '```')
+          fi
           body=$(printf '%s\n' \
-            "\`upstream/master\` merged cleanly but the resulting tree does not build, so **nothing was pushed and no tag was created**." \
+            "$what" \
             '' \
             "Run: $RUN_URL" \
             '' \
@@ -241,13 +271,11 @@ jobs:
             '- upstream added a `<script>` to `src/background.html` that `sw.js` does not import' \
             '- upstream added a manifest key `tools/make-chromium-mv3-meta.py` does not transform' \
             '- upstream added a dynamic `import()` that `tools/patch-mv3-modules.mjs` did not rewrite' \
+            '- upstream reshaped something the scriptlet marker depends on (`vAPI.scriptletsInjector`, `self.uBO_scriptletsInjected`, the `contentscript` message channel)' \
             '' \
             'Reproduce locally:' \
-            '```sh' \
-            'git fetch upstream master && git merge upstream/master' \
-            'bash tools/pull-assets.sh' \
-            'bash tools/make-chromium-mv3.sh' \
-            '```')
+            "$repro")
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "$body"
           else
@@ -343,6 +371,18 @@ jobs:
           mapfile -t added < <(git diff --name-only --diff-filter=A upstream/master "$MERGED")
           if [ "${#added[@]}" -eq 0 ]; then
             echo '::error::this fork appears to add no files to upstream; refusing to construct a release tree'
+            exit 1
+          fi
+          # Only ADDED files are carried over, so the "adds files, modifies none"
+          # invariant is not a description of this port -- it is a precondition of
+          # this step. If it ever stops holding, the release tree would quietly
+          # ship upstream's version of the changed file and the modification would
+          # be absent from every release, while master looked correct. Assert it
+          # instead of trusting it.
+          mapfile -t altered < <(git diff --name-only --diff-filter=MDRT upstream/master "$MERGED")
+          if [ "${#altered[@]}" -ne 0 ]; then
+            printf 'altered upstream file: %s\n' "${altered[@]}"
+            echo "::error::this fork modifies, deletes or renames ${#altered[@]} upstream file(s) (listed above), which the release tree would silently discard. Either revert the change and reimplement it additively, or teach this step to carry it."
             exit 1
           fi
           printf 'port file: %s\n' "${added[@]}"

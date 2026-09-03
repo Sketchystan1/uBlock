@@ -50,7 +50,10 @@
 **/
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
 /******************************************************************************/
 
@@ -140,6 +143,8 @@ const REQUIRED_FILES = [
     'offscreen.html',
     'js/sw.js',
     'js/mv3-shims.js',
+    'js/mv3-post.js',
+    'js/mv3-scriptlet-marker.js',
     'js/offscreen.js',
     'js/start.js',
     'js/webext.js',
@@ -473,9 +478,10 @@ section('upstream drift');
             readers.push({ name, routed: re.test(`/js/scriptlets/${name}`) });
         }
         const unrouted = readers.filter(r => r.routed === false).map(r => r.name);
-        // cosmetic-report.js is a known exception: it needs vAPI.domFilterer, so
-        // it must stay in the ISOLATED world even though it reads a marker set
-        // in USER_SCRIPT. Tracked separately; see docs/mv3-deployment.md.
+        // cosmetic-report.js belongs in ISOLATED even though it reads a marker
+        // the injector sets in USER_SCRIPT: it needs vAPI.domFilterer, which
+        // exists only there. mv3-post.js + mv3-shims.js replay the marker into
+        // ISOLATED for exactly this reason, so this is correct, not a gap.
         const KNOWN_ISOLATED_READERS = [ 'cosmetic-report.js' ];
         const surprises = unrouted.filter(n => KNOWN_ISOLATED_READERS.includes(n) === false);
         if ( surprises.length !== 0 ) {
@@ -485,6 +491,224 @@ section('upstream drift');
         } else {
             pass(`${readers.length} cross-world scriptlet reader(s) routed as expected`);
         }
+    }
+}
+
+// The scriptlet marker (mv3-post.js -> mv3-shims.js -> ISOLATED world) rests on
+// a handful of upstream shapes. Each is cheap to assert and expensive to debug:
+// break one and the popup panel quietly stops listing scriptlet filters, or the
+// background re-ships the whole payload for every frame on every navigation.
+{
+    const checks = [
+        [ 'platform/common/vapi-background.js', /vAPI\.scriptletsInjector\s*=/,
+          'vAPI.scriptletsInjector is no longer the platform hook mv3-post.js wraps' ],
+        [ 'platform/chromium/vapi-background-ext.js', /self\.uBO_scriptletsInjected\s*=\s*details\.filters/,
+          'the Chromium injector no longer records details.filters in self.uBO_scriptletsInjected' ],
+        [ 'src/js/scriptlet-filtering.js', /vAPI\.scriptletsInjector\(\s*hostname\s*,\s*scriptletDetails\s*\)/,
+          'scriptlet-filtering.js no longer calls vAPI.scriptletsInjector(hostname, scriptletDetails)' ],
+        [ 'src/js/scriptlet-filtering.js', /self\.vAPI\s*&&\s*self\.vAPI\.messaging/,
+          'the scriptlet->logger relay no longer probes self.vAPI.messaging, which the USER_SCRIPT world preamble exists to satisfy' ],
+        [ 'src/js/scriptlet-filtering.js', /vAPI\.messaging\.send\(\s*'contentscript'/,
+          'the relay no longer sends on the "contentscript" channel, which mv3-post.js forwards onUserScriptMessage to' ],
+        [ 'src/js/contentscript.js', /needScriptlets:\s*self\.uBO_scriptletsInjected\s*===\s*undefined/,
+          'contentscript.js no longer derives needScriptlets from self.uBO_scriptletsInjected' ],
+        [ 'src/js/scriptlets/cosmetic-report.js', /self\.uBO_scriptletsInjected/,
+          'cosmetic-report.js no longer reads self.uBO_scriptletsInjected' ],
+        [ 'src/js/messaging.js', /name:\s*'contentscript',\s*listener:/,
+          'the "contentscript" message channel is gone or renamed' ],
+    ];
+    let broken = 0;
+    for ( const [ rel, re, message ] of checks ) {
+        if ( re.test(readRepo(rel)) ) { continue; }
+        broken += 1;
+        fail('scriptlet-marker', `${rel}: ${message}`,
+            'reconcile platform/chromium-mv3/mv3-post.js and mv3-shims.js with the new upstream shape');
+    }
+    if ( broken === 0 ) {
+        pass(`${checks.length} scriptlet-marker upstream assumptions hold`);
+    }
+}
+
+// mv3-post.js defaults `suspendUntilListsAreLoaded` on, because under MV3 the
+// cold-start window recurs on every service worker respawn. That reasoning has
+// two upstream preconditions.
+{
+    const background = readRepo('src/js/background.js');
+    const vapi = readRepo('platform/common/vapi-background.js');
+    if ( /suspendUntilListsAreLoaded:\s*vAPI\.Net\.canSuspend\(\)/.test(background) === false ) {
+        fail('suspend-default',
+            'src/js/background.js no longer defaults suspendUntilListsAreLoaded from vAPI.Net.canSuspend()',
+            'check that platform/chromium-mv3/mv3-post.js still overrides the right thing');
+    } else if ( /static canSuspend\(\)\s*\{\s*return false;/.test(vapi) === false ) {
+        fail('suspend-default',
+            'vAPI.Net.canSuspend() no longer returns false in platform/common/vapi-background.js',
+            'if upstream now suspends on Chromium by default, drop the override in platform/chromium-mv3/mv3-post.js');
+    } else {
+        pass('suspendUntilListsAreLoaded default is still ours to flip');
+    }
+}
+
+/******************************************************************************/
+
+section('port self-checks');
+
+// Parse every module the port owns.
+//
+// A service worker whose entry module fails to parse is not a degraded
+// extension, it is an absent one -- and nothing else in this build pipeline
+// parses these files. `npm run lint` would, but it is not a gate here and does
+// not run as part of the build. The bug that motivated this: a `*` followed by a
+// `/` inside a prose comment, which closed the comment block early and turned the
+// rest of the file into garbage. Invisible on inspection, fatal at load.
+//
+// Each file is copied to a temp file whose extension declares its module kind,
+// rather than piped to `node --check --input-type=...`. `.js` in the package
+// would otherwise be parsed as CommonJS and rejected for using `import`, and
+// the extension is understood identically by every Node version we might run on.
+{
+    const PORT_MODULES = [
+        [ 'js/sw.js', 'mjs' ],
+        [ 'js/mv3-shims.js', 'mjs' ],
+        [ 'js/mv3-post.js', 'mjs' ],
+        [ 'js/mv3-scriptlet-marker.js', 'mjs' ],
+        // Loaded as a classic script by offscreen.html.
+        [ 'js/offscreen.js', 'cjs' ],
+    ];
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ubo-mv3-parse-'));
+    const broken = [];
+    try {
+        for ( const [ rel, ext ] of PORT_MODULES ) {
+            if ( existsPkg(rel) === false ) {
+                broken.push(`${rel}: missing from package`);
+                continue;
+            }
+            const tmpFile = path.join(
+                tmpDir,
+                `${path.basename(rel, '.js')}.${ext}`
+            );
+            fs.writeFileSync(tmpFile, readPkg(rel));
+            const r = spawnSync(
+                process.execPath,
+                [ '--check', tmpFile ],
+                { encoding: 'utf8' }
+            );
+            if ( r.status === 0 ) { continue; }
+            const detail = (r.stderr || `exit ${r.status}`).split('\n')
+                .filter(line => line.trim() !== '')
+                .slice(0, 4)
+                .join('\n');
+            broken.push(`${rel}:\n${detail}`);
+        }
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+    if ( broken.length !== 0 ) {
+        fail('port-modules-parse', broken.join('\n'),
+            'a parse error here means the service worker never starts');
+    } else {
+        pass(`${PORT_MODULES.length} port-owned modules parse`);
+    }
+}
+
+// Round-trip the scriptlet marker codec out of the built package. It is a pure
+// module for this reason: the encode and decode ends live in different execution
+// contexts at runtime and cannot test each other there.
+{
+    const rel = 'js/mv3-scriptlet-marker.js';
+    let codec;
+    if ( existsPkg(rel) === false ) {
+        fail('marker-codec', `${rel} missing from package`,
+            'tools/make-chromium-mv3.sh copies platform/chromium-mv3/*.js into js/');
+    } else {
+        // Guarded: the parse check above already reports a broken module, and an
+        // uncaught rejection here would abort the run and lose every check after
+        // it, including the summary.
+        try {
+            codec = await import(pathToFileURL(path.join(pkgDir, rel)).href);
+        } catch ( ex ) {
+            fail('marker-codec', `cannot import ${rel}: ${ex.message}`,
+                'see the port-modules-parse check above');
+        }
+    }
+    if ( codec !== undefined ) {
+        const { encodeScriptletMarker, decodeScriptletMarker } = codec;
+        // Hostile-but-real filter text: `*/` would close a block comment, a bare
+        // newline would truncate a line comment, and non-Latin-1 is everywhere in
+        // filter lists (btoa() throws on it).
+        const details = {
+            hostname: 'пример.рф',
+            filters: [
+                'example.com##+js(trusted-replace-regex, /a*/g, b)',
+                'x.com##+js(set, y, */)',
+                '例え.jp##+js(aopr, 日本語 100%)',
+                'a.com##+js(x, "line1\nline2")',
+            ],
+        };
+        const marker = encodeScriptletMarker(details);
+        const problems = [];
+        if ( marker.includes('\n') === false || marker.endsWith('\n') === false ) {
+            problems.push('the marker is not a single newline-terminated line');
+        }
+        if ( marker.slice(0, -1).includes('\n') ) {
+            problems.push('the marker payload contains a newline, which truncates the line comment');
+        }
+        if ( marker.slice(2).includes('/') ) {
+            problems.push('the marker payload contains "/", which can close a block comment early');
+        }
+        // Exactly how src/js/scriptlet-filtering.js assembles injectNow()'s code:
+        // the relay and an optional `debugger` are prepended, so the marker is
+        // not first, and the isolated-world payload follows it.
+        const assembled = [
+            'debugger',
+            `RELAY(${JSON.stringify('abc')});`,
+            `${marker}MAINWORLD(${JSON.stringify(details.filters)});\n\nISOLATED();`,
+        ].join('\n\n');
+        const decoded = decodeScriptletMarker(assembled);
+        if ( JSON.stringify(decoded.details) !== JSON.stringify(details) ) {
+            problems.push(`round trip lost data: ${JSON.stringify(decoded.details)}`);
+        }
+        if ( decoded.code.includes('uBO-mv3-filters') ) {
+            problems.push('the marker survived decoding and would be injected');
+        }
+        for ( const token of [ 'RELAY', 'MAINWORLD', 'ISOLATED', 'debugger' ] ) {
+            if ( decoded.code.includes(token) ) { continue; }
+            problems.push(`decoding removed real code: ${token} is gone`);
+        }
+        // Absent marker is the normal case when only isolated-world scriptlets
+        // fired; it must be a clean pass-through, not a throw.
+        const untouched = decodeScriptletMarker('ISOLATED();');
+        if ( untouched.details !== undefined || untouched.code !== 'ISOLATED();' ) {
+            problems.push('a marker-less program is not passed through unchanged');
+        }
+        if ( problems.length !== 0 ) {
+            fail('marker-codec', problems.join('\n'),
+                'see platform/chromium-mv3/mv3-scriptlet-marker.js');
+        } else {
+            pass('scriptlet marker codec round-trips hostile filter text');
+        }
+    }
+}
+
+// The USER_SCRIPT world gets `chrome.runtime.sendMessage` only if the world is
+// configured for it, and the messages only go anywhere if something listens.
+// Both halves are easy to lose independently.
+{
+    const shims = readPkg('js/mv3-shims.js');
+    const post = readPkg('js/mv3-post.js');
+    if ( shims.includes('configureWorld') === false ) {
+        fail('user-script-messaging',
+            'js/mv3-shims.js does not call userScripts.configureWorld()',
+            'without messaging: true, the USER_SCRIPT world has no chrome.runtime and scriptlet log lines go to the page console');
+    } else if ( shims.includes('vAPI.messaging') === false ) {
+        fail('user-script-messaging',
+            'js/mv3-shims.js no longer provides a vAPI.messaging shim to the USER_SCRIPT world',
+            'the injected relay probes self.vAPI.messaging before using it');
+    } else if ( post.includes('onUserScriptMessage') === false ) {
+        fail('user-script-messaging',
+            'js/mv3-post.js does not listen on runtime.onUserScriptMessage',
+            'messages from the USER_SCRIPT world would be sent and dropped');
+    } else {
+        pass('USER_SCRIPT world messaging is configured, shimmed and listened for');
     }
 }
 

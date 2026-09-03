@@ -43,6 +43,10 @@
 // only assigns `self.LZ4BlockJS`, it has no DOM dependency.
 import '../lib/lz4/lz4-block-codec-js.js';
 
+// A pure module, safe to import here: it touches neither `chrome.*` nor the DOM,
+// so it cannot depend on a shim this file has not installed yet.
+import { decodeScriptletMarker } from './mv3-scriptlet-marker.js';
+
 /******************************************************************************/
 
 const OFFSCREEN_PAGE = 'offscreen.html';
@@ -73,9 +77,40 @@ const reUserScriptWorldFiles = /\/scriptlet-loglevel-\d+\.js$/;
 
 const rootURL = url => {
     if ( typeof url !== 'string' ) { return url; }
-    if ( url.includes('://') ) { return url; }
+    // Anything already carrying a scheme is absolute -- leave it alone. Tested
+    // on the scheme rather than on '://' so that `data:`, `blob:` and
+    // `filesystem:` are also passed through untouched; uBO does not currently
+    // hand any of those to these two call paths, but silently prefixing one with
+    // the extension origin would be a bewildering failure.
+    if ( /^[a-z][a-z0-9+.-]*:/i.test(url) ) { return url; }
+    // Protocol-relative and root-relative URLs do not depend on the base
+    // *directory*, only on the base origin, which is the same either way. Leave
+    // them alone so that this function has no effect where it would have none.
+    if ( url.startsWith('/') ) { return url; }
     return chrome.runtime.getURL(url);
 };
+
+// With `rootURL()` in hand, close the general case: make relative URLs resolve
+// against the package root for `fetch()` itself, exactly as they did when the
+// background was `background.html`. Two upstream call sites need this, both of
+// them WebAssembly module loaders which pass a directory-relative path:
+// `src/js/start.js` (`'./js/wasm/'`, for the static network filtering engine)
+// and `src/js/storage.js` (`'./lib/publicsuffixlist/wasm/'`). Both are gated on
+// `vAPI.canWASM`, which is false unless the manifest CSP opts in -- so without
+// this the documented opt-in would silently 404 and disable both engines rather
+// than enable them. See docs/mv3-deployment.md.
+//
+// Everything else uBO fetches is already absolute: `src/js/assets.js` runs its
+// asset keys through `vAPI.getURL()` before use, and filter list URLs are
+// remote. So this is a safety net for the general case more than a fix for a
+// specific caller -- which is the point, since the next relative fetch upstream
+// adds to the background would otherwise fail silently too.
+
+{
+    const nativeFetch = self.fetch.bind(self);
+    self.fetch = (resource, ...args) =>
+        nativeFetch(rootURL(resource), ...args);
+}
 
 /******************************************************************************/
 
@@ -644,15 +679,183 @@ const canUserScripts = ( ) => {
     return userScriptsAvailable;
 };
 
+/******************************************************************************/
+
+// The `USER_SCRIPT` world has no `chrome.*` at all by default, which breaks
+// uBO's scriptlet->logger bridge: the relay that `src/js/scriptlet-filtering.js`
+// injects tests `self.vAPI && self.vAPI.messaging` and falls back to
+// `console.log` when it is absent, so scriptlet log lines end up in the page
+// console instead of uBO's logger.
+//
+// `configureWorld({ messaging: true })` exposes `chrome.runtime.sendMessage` in
+// that world, which is enough to rebuild the one thing the relay asks for. This
+// is the same mechanism upstream's own MV3 build uses -- see
+// `platform/mv3/extension/js/background.js` -- and messages so sent arrive on
+// `chrome.runtime.onUserScriptMessage`, which `mv3-post.js` forwards into
+// `vAPI.messaging`.
+//
+// A `USER_SCRIPT` world is never privileged: it runs on the page's origin, and
+// the code in it came from a filter list. `mv3-post.js` reflects that when it
+// forwards, so this grants scriptlets no more authority than the MV2 content
+// script relay had.
+
+let userScriptWorldConfigured;
+
+const configureUserScriptWorld = ( ) => {
+    if ( userScriptWorldConfigured !== undefined ) {
+        return userScriptWorldConfigured;
+    }
+    userScriptWorldConfigured = (async ( ) => {
+        try {
+            await chrome.userScripts.configureWorld({ messaging: true });
+        } catch (reason) {
+            // Not fatal: scriptlets still inject, they just cannot reach the
+            // logger. Say so once rather than per injection.
+            console.error(`uBO: userScripts.configureWorld: ${reason}`);
+        }
+    })();
+    return userScriptWorldConfigured;
+};
+
+// Warm it during service worker startup rather than on the first injection.
+// Scriptlets inject at `document_start`, racing the page's own scripts, and only
+// the first injection of each worker lifetime would otherwise pay for this round
+// trip -- which under MV3 means once per respawn, not once per browser launch.
+// It also surfaces the "Allow user scripts" warning in the worker's console
+// immediately, instead of only after the first page with scriptlet filters.
+if ( canUserScripts() ) {
+    configureUserScriptWorld();
+}
+
+// Prepended to every code injection into the `USER_SCRIPT` world. Idempotent,
+// because a frame can be injected into more than once (uBO re-injects when the
+// logger's level changes, for one). Deliberately minimal: `send()` is the only
+// member of `vAPI.messaging` the injected relay touches, and the relay ignores
+// the return value -- hence the `catch`, since `sendMessage()` rejects when the
+// service worker is momentarily gone and an ignored rejection would surface as
+// noise in the page's console.
+const USER_SCRIPT_WORLD_PREAMBLE = [
+    'if ( self.vAPI instanceof Object === false ) { self.vAPI = {}; }',
+    'if ( self.vAPI.messaging instanceof Object === false ) {',
+    '    self.vAPI.messaging = {',
+    '        send: function(channel, msg) {',
+    '            try {',
+    '                return self.chrome.runtime.sendMessage({ channel, msg })',
+    '                    .catch(( ) => {});',
+    '            } catch {',
+    '                return Promise.resolve();',
+    '            }',
+    '        },',
+    '    };',
+    '}',
+].join('\n');
+
+/******************************************************************************/
+
+// Scriptlet injection has to straddle two worlds under MV3, and one bit of
+// state has to straddle with it.
+//
+// `platform/common/vapi-background.js` leaves `vAPI.scriptletsInjector` for
+// platform code to define, and its Chromium implementation returns a wrapper
+// which does two things: it inserts the main-world scriptlet payload as a
+// `<script>` element, and it records the filters that fired in
+// `self.uBO_scriptletsInjected`. Under MV2 that wrapper ran in the same isolated
+// world as `contentscript.js`, so two readers could see the marker:
+// `src/js/contentscript.js` (to tell the background it already has scriptlets)
+// and `src/js/scriptlets/cosmetic-report.js` (to list scriptlet filters in the
+// popup's "extended" section).
+//
+// Under MV3 the wrapper is a code string, so only `chrome.userScripts` can
+// inject it, and its only non-`MAIN` world is `USER_SCRIPT`. The `<script>`
+// insertion is unaffected -- any world with DOM access can do it -- but the
+// marker now lands somewhere neither reader can see.
+//
+// So `mv3-post.js` wraps `vAPI.scriptletsInjector` to prefix its output with the
+// filters, and `executeCode()` below peels that off and replays the marker into
+// the `ISOLATED` world through `chrome.scripting.executeScript({ func, args })` --
+// which needs no code string, and therefore no `userScripts`. Both worlds then
+// see what MV2's single world saw. `./mv3-scriptlet-marker.js` holds the wire
+// format both ends share.
+
+// Mirrors the guards in the Chromium `vAPI.scriptletsInjector` wrapper, so that
+// the marker appears in the `ISOLATED` world under the same conditions it
+// appears in the `USER_SCRIPT` one: once per document, and only if the document
+// still is where the payload was computed for.
+//
+// Passed to `chrome.scripting.executeScript({ func })`, which stringifies it --
+// so it must stay free of references to anything in this module's scope.
+const markScriptletsInjected = (hostname, filters) => {
+    if ( self.uBO_scriptletsInjected !== undefined ) { return; }
+    const loc = document.location;
+    if ( loc === null ) { return; }
+    if ( loc.hostname !== '' && loc.hostname !== hostname ) { return; }
+    self.uBO_scriptletsInjected = filters;
+};
+
+/******************************************************************************/
+
 // Scriptlet code is assembled as a string, which only `userScripts` can inject.
 const executeCode = async details => {
+    const target = targetFromDetails(details);
+    const injectImmediately = details.runAt === 'document_start';
+
+    let code = details.code;
+    let marker;
+    try {
+        const decoded = decodeScriptletMarker(code);
+        code = decoded.code;
+        marker = decoded.details;
+    } catch (reason) {
+        console.error(`uBO: scriptlet filters marker: ${reason}`);
+    }
+
     if ( canUserScripts() === false ) { return []; }
-    return chrome.userScripts.execute({
-        js: [ { code: details.code } ],
-        target: targetFromDetails(details),
-        injectImmediately: details.runAt === 'document_start',
+    await configureUserScriptWorld();
+    const results = await chrome.userScripts.execute({
+        js: [ { code: `${USER_SCRIPT_WORLD_PREAMBLE}\n${code}` } ],
+        target,
+        injectImmediately,
         world: 'USER_SCRIPT',
     });
+
+    // Replay the `self.uBO_scriptletsInjected` marker into the ISOLATED world --
+    // but only now, having got this far, so that the marker means the same thing
+    // it meant under MV2: the wrapper ran.
+    //
+    // Ordering matters more than it looks. `src/js/messaging.js` treats
+    // `needScriptlets` (which is derived from this marker) as "nothing has been
+    // injected here yet", and for non-network URIs -- `about:blank`, `data:`,
+    // extension pages -- that message is the *only* path which injects at all.
+    // Setting the marker on a failed injection, or before one, would therefore
+    // not merely mislead the popup panel: it would silently drop scriptlets in
+    // those frames. Hence after the await, and hence not at all when
+    // `userScripts` is unavailable.
+    //
+    // Fire-and-forget from here: its two readers run later, and making the
+    // scriptlets wait on bookkeeping would be the wrong trade.
+    //
+    // The `Array.isArray` guard is not paranoia about a value uBO always
+    // supplies -- it is about what happens if it ever does not. `executeScript`
+    // serializes args as JSON, so an absent `filters` would arrive as `null`,
+    // which is `!== undefined` and so counts as a set marker; then
+    // `cosmetic-report.js` does `matchedSelectors.push(...null)` and throws,
+    // taking the popup's cosmetic report with it. Skipping the marker instead
+    // degrades to the pre-fix behaviour, which is merely wasteful.
+    if ( Array.isArray(marker?.filters) ) {
+        chrome.scripting.executeScript({
+            target,
+            injectImmediately,
+            world: 'ISOLATED',
+            func: markScriptletsInjected,
+            args: [ marker.hostname, marker.filters ],
+        }).catch(( ) => {});
+    } else if ( marker !== undefined ) {
+        console.error(
+            `uBO: scriptlet filters marker carried no filter array: ${JSON.stringify(marker)}`
+        );
+    }
+
+    return results;
 };
 
 const executeFile = async details => {
@@ -662,6 +865,7 @@ const executeFile = async details => {
     const file = details.file.replace(/^\/+/, '');
     if ( reUserScriptWorldFiles.test(`/${file}`) ) {
         if ( canUserScripts() === false ) { return []; }
+        await configureUserScriptWorld();
         return chrome.userScripts.execute({
             js: [ { file } ],
             target: targetFromDetails(details),
