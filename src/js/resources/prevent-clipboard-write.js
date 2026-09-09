@@ -21,6 +21,7 @@
 
 import { proxyApplyFn } from './proxy-apply.js';
 import { registerScriptlet } from './base.js';
+import { runAt } from './run-at.js';
 import { safeSelf } from './safe-self.js';
 
 /******************************************************************************/
@@ -129,16 +130,19 @@ function preventClipboardWrite(matches = '', ...varargs) {
             return context.reflect();
         }, { skipToString: true });
     };
-    self.addEventListener('mousedown', installTraps, {
-        once: true,
-        capture: true,
-    });
+    runAt(( ) => {
+        self.document.addEventListener('mousemove', installTraps, {
+            once: true,
+            capture: true,
+        });
+    }, 'interactive')
 }
 registerScriptlet(preventClipboardWrite, {
     name: 'prevent-clipboard-write.js',
     requiresTrust: true,
     dependencies: [
         proxyApplyFn,
+        runAt,
         safeSelf,
     ],
 });
