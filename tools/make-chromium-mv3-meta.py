@@ -98,11 +98,13 @@ for key, value in overlay.items():
 manifest['version'] = version
 
 # Development build? If so, modify name accordingly. Mirrors
-# tools/make-chromium-meta.py.
+# tools/make-chromium-meta.py, and sets version_name so that
+# vapi-common.js's devbuild check (/^\d+\.\d+\.\d+\D/) recognizes it.
 if re.search(r'^\d+\.\d+\.\d+\.\d+$', version):
     manifest['name'] += ' development build'
     manifest['short_name'] += ' dev build'
     manifest['action']['default_title'] += ' dev build'
+    manifest['version_name'] = re.sub(r'\.(\d+)$', r'b\1', version)
 
 with open(os.path.join(build_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
     json.dump(manifest, f, indent=2, separators=(',', ': '), sort_keys=True)

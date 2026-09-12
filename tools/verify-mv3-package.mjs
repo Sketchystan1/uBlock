@@ -220,6 +220,15 @@ const manifestChecks = [
              manifest.web_accessible_resources[0] instanceof Object &&
              Array.isArray(manifest.web_accessible_resources[0].resources),
       'web_accessible_resources is not in MV3 object form' ],
+    [ 'devbuild-version-name',
+      ( ) => {
+          if ( /^\d+\.\d+\.\d+\.\d+$/.test(manifest.version) ) {
+              return typeof manifest.version_name === 'string' &&
+                     /^\d+\.\d+\.\d+\D/.test(manifest.version_name);
+          }
+          return true;
+      },
+      'dev builds (4-part version) require version_name matching /^\\d+\\.\\d+\\.\\d+\\D/ so vapi-common.js devbuild check succeeds' ],
 ];
 
 for ( const [ name, test, message ] of manifestChecks ) {

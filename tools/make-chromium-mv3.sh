@@ -21,6 +21,14 @@ mkdir -p $DES
 echo "*** uBlock0.chromium-mv3: Copying common files"
 bash ./tools/copy-common-files.sh $DES
 
+# Ensure both assets.json and assets.dev.json are present so that neither
+# devbuild nor release asset path assumptions can fail.
+if [ -f "$DES/assets/assets.dev.json" ] && [ ! -f "$DES/assets/assets.json" ]; then
+    cp "$DES/assets/assets.dev.json" "$DES/assets/assets.json"
+elif [ -f "$DES/assets/assets.json" ] && [ ! -f "$DES/assets/assets.dev.json" ]; then
+    cp "$DES/assets/assets.json" "$DES/assets/assets.dev.json"
+fi
+
 # Chromium-specific. webext.js and vapi-background-ext.js are reused as-is --
 # platform/chromium-mv3/mv3-shims.js patches the chrome.* APIs underneath them.
 echo "*** uBlock0.chromium-mv3: Copying chromium-specific files"
