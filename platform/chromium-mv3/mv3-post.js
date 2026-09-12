@@ -38,6 +38,8 @@
 
 **/
 
+/* global chrome */
+
 /******************************************************************************/
 
 // Substitutes for the dynamic `import()` calls that `tools/patch-mv3-modules.mjs`

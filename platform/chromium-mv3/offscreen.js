@@ -40,6 +40,8 @@
 
 **/
 
+/* global chrome */
+
 const WORKER_CHANNEL = 'uBO-worker-proxy';
 const KEEPALIVE_PERIOD = 20000;
 

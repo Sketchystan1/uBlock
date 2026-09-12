@@ -39,6 +39,8 @@
 
 **/
 
+/* global chrome */
+
 // Must come before anything which may touch `self.lz4BlockCodec`. This file
 // only assigns `self.LZ4BlockJS`, it has no DOM dependency.
 import '../lib/lz4/lz4-block-codec-js.js';
