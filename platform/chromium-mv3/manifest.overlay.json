@@ -1,0 +1,12 @@
+{
+  "background": {
+    "service_worker": "js/sw.js",
+    "type": "module"
+  },
+  "minimum_chrome_version": "138.0",
+  "permissions": [
+    "offscreen",
+    "scripting",
+    "userScripts"
+  ]
+}

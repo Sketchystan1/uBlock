@@ -1,0 +1,41 @@
+# Keep the pinned action SHAs fresh.
+#
+# The workflows in this repository pin every action to a commit SHA rather than a
+# floating major tag, because release.yml has access to CRX_PRIVATE_KEY -- the
+# secret that defines the extension identity for every policy-installed client.
+# A floating tag means a third party can change what runs next to that key.
+#
+# SHA pins only stay safe if something bumps them, which is what this does.
+#
+# DELIBERATELY NOT HERE: `package-ecosystem: npm`. The root package.json and
+# package-lock.json are upstream's files, and this fork must never modify an
+# upstream file -- that is the whole reason the daily merge in sync-upstream.yml
+# cannot conflict. A merged npm bump would rewrite the lockfile, and upstream
+# regenerating its own (as in its "Update npm" commits) would then collide and
+# stall the sync until someone resolved it by hand. There would be nothing to
+# show for the risk: those devDependencies feed only `npm run lint`, which
+# build.yml already runs with continue-on-error because upstream's own sources do
+# not pass the config, and no part of the MV3 build touches node_modules -- every
+# tool under tools/ imports node: builtins only.
+#
+# ONE PR PER ACTION, NOT GROUPED. Upstream's own .github/workflows/main.yml pins
+# actions/checkout@v4, so any PR touching checkout necessarily edits an upstream
+# file. Grouping would put that hunk in the same PR as every other bump, and a
+# grouped PR cannot be partially merged -- so closing it (which is the only
+# option) would also discard the pins for the actions that appear solely in this
+# fork's workflows. Ungrouped, only the actions/checkout PR needs handling:
+# drop its main.yml hunk before merging, or close it and bump the fork's own
+# checkout pins by hand.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      # Off the hour, and clear of the 04:17 sync window.
+      time: '09:23'
+    open-pull-requests-limit: 6
+    commit-message:
+      prefix: 'ci:'

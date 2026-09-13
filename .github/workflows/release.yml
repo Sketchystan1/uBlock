@@ -1,0 +1,368 @@
+name: Release MV3
+
+# Builds the Chromium MV3 package for a `<upstream-tag>-mv3` tag and publishes
+# it, together with a signed CRX and the update manifest a policy install needs.
+#
+# Triggered by tag push, or dispatched by sync-upstream.yml (which is how it
+# runs when no PAT is configured -- pushes authenticated with GITHUB_TOKEN
+# deliberately do not fire workflows).
+#
+# The package is built by tools/make-chromium-mv3.sh, which runs
+# tools/verify-mv3-package.mjs as its last step -- so the build that actually
+# ships gets exactly the same assertions as CI.
+
+on:
+  push:
+    tags:
+      - '*-mv3'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build, e.g. 1.74.2-mv3'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # github.ref_name, not github.ref: a tag push gives `1.74.2-mv3` rather than
+  # `refs/tags/1.74.2-mv3`, so the two ways of building the same tag land in the
+  # SAME group instead of racing each other.
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # Pin gh to this fork rather than letting it infer from git remotes.
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the release
+      id-token: write      # mint the OIDC token Sigstore signs against
+      attestations: write  # persist the build provenance attestation
+      artifact-metadata: write  # create the artifact storage record
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      signed: ${{ steps.key.outputs.signed }}
+    steps:
+      - name: Resolve tag and version
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
+          version="${tag%-mv3}"
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # uBO's own convention: a fourth version component, or a b/rc suffix,
+          # means a pre-release.
+          if echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo 'prerelease=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'prerelease=true'  >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+          persist-credentials: false
+
+      - name: Set up node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Clone uAssets
+        run: bash tools/pull-assets.sh
+
+      - name: Build MV3 package
+        # Invoked through `bash` rather than relying on the executable bit,
+        # which is not preserved when committing from a filesystem without one.
+        # This also runs tools/verify-mv3-package.mjs.
+        run: bash tools/make-chromium-mv3.sh ${{ steps.meta.outputs.version }}
+
+      - name: Check the advertised version
+        # update.xml's <updatecheck version> is read from the built manifest,
+        # i.e. from dist/version -- never from the tag name. Those legitimately
+        # differ (`1.74.1b1` is not a legal Chrome version; upstream maps it to
+        # `1.74.1.1`), but the tag must still be built from a tree whose
+        # dist/version is upstream's value FOR THAT TAG. sync-upstream.yml
+        # guarantees that by construction; assert it here so a hand-made tag
+        # cannot quietly ship a mismatched version.
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          manifest_version=$(node -p "require('./dist/build/uBlock0.chromium-mv3/manifest.json').version")
+          dist_version=$(cat dist/version)
+          echo "tag version:      $VERSION"
+          echo "dist/version:     $dist_version"
+          echo "manifest version: $manifest_version"
+          if [ "$manifest_version" != "$dist_version" ]; then
+            echo "::error::manifest version ($manifest_version) does not match dist/version ($dist_version)"
+            exit 1
+          fi
+          # Upstream's tag -> version mapping is exact, so check it exactly. A
+          # shared X.Y.Z stem is not enough: that is precisely the family this
+          # needs to tell apart, since upstream ships ~6 betas per stable
+          # release and they all share a stem.
+          #   X.Y.Z        -> X.Y.Z
+          #   X.Y.Zb<n>    -> X.Y.Z.<n>
+          #   X.Y.Zrc<n>   -> X.Y.Z.10<n>
+          case "$VERSION" in
+            *b*)  expected=$(echo "$VERSION" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)b([0-9]+)$/\1.\2/') ;;
+            *rc*) expected=$(echo "$VERSION" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)rc([0-9]+)$/\1.10\2/') ;;
+            *)    expected="$VERSION" ;;
+          esac
+          echo "expected version:  $expected"
+          if [ "$expected" = "$VERSION" ] && echo "$VERSION" | grep -qvE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::tag $VERSION is not a shape this release process understands (expected X.Y.Z, X.Y.Zb<n> or X.Y.Zrc<n>)"
+            exit 1
+          fi
+          if [ "$manifest_version" != "$expected" ]; then
+            echo "::error::tag $VERSION maps to package version $expected, but this tree builds $manifest_version -- the tag was built from the wrong tree"
+            exit 1
+          fi
+
+      - name: Stage signing key
+        id: key
+        env:
+          CRX_PRIVATE_KEY: ${{ secrets.CRX_PRIVATE_KEY }}
+        run: |
+          if [ -z "$CRX_PRIVATE_KEY" ]; then
+            echo 'signed=false' >> "$GITHUB_OUTPUT"
+            echo '::warning::CRX_PRIVATE_KEY is not set, so only the zip is published. A policy install -- required for webRequestBlocking under MV3 -- needs the signed CRX. See docs/mv3-deployment.md'
+            exit 0
+          fi
+          umask 077
+          printf '%s' "$CRX_PRIVATE_KEY" > crx-key.pem
+          echo 'signed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Pack and sign CRX
+        id: crx
+        if: steps.key.outputs.signed == 'true'
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          crx="dist/build/uBlock0_${VERSION}.chromium-mv3.crx"
+          node tools/make-crx.mjs \
+            --dir dist/build/uBlock0.chromium-mv3 \
+            --key crx-key.pem \
+            --out "$crx" \
+            --update-xml dist/build/update.xml \
+            --codebase "${{ github.server_url }}/${{ github.repository }}/releases/download/${TAG}/uBlock0_${VERSION}.chromium-mv3.crx"
+          echo "crx=$crx" >> "$GITHUB_OUTPUT"
+
+      - name: Shred signing key
+        if: always()
+        run: rm -f crx-key.pem
+
+      - name: Verify CRX
+        if: steps.key.outputs.signed == 'true'
+        # Parse the CRX back the way Chrome does -- independently of the code
+        # that wrote it -- and check the signature, the extension id derivation,
+        # that the payload matches the build directory, and that update.xml
+        # agrees with the packaged manifest. A malformed CRX otherwise fails at
+        # policy-install time, long after publication, with an unhelpful error.
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          node tools/verify-crx.mjs \
+            --crx "dist/build/uBlock0_${VERSION}.chromium-mv3.crx" \
+            --dir dist/build/uBlock0.chromium-mv3 \
+            --update-xml dist/build/update.xml
+
+      - name: Guard extension-id stability
+        if: steps.key.outputs.signed == 'true'
+        # The signing key uniquely determines the extension id, and every policy
+        # deployment pins EXTENSION_ID;update_url forever. If the key ever
+        # changes, the id changes and every existing deployment silently stops
+        # updating -- while this run stays green. Catch it: the id derived from
+        # THIS run's key must match the appid already advertised on Pages. This
+        # runs before "Stage Pages content" overwrites those manifests, so it
+        # compares against the PREVIOUS release. The first signed release
+        # (nothing published yet) is allowed through.
+        env:
+          EXT_ID: ${{ steps.crx.outputs.extension_id }}
+        run: |
+          pages_base="https://$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]').github.io/$(basename '${{ github.repository }}')"
+          published=''
+          for ch in update.xml update-dev.xml; do
+            xml=$(curl -fsSL "$pages_base/$ch" 2>/dev/null) || continue
+            published=$(printf '%s' "$xml" | sed -n 's/.*appid="\([a-p]\{32\}\)".*/\1/p' | head -n1)
+            [ -n "$published" ] && break
+          done
+          echo "this run's extension id: $EXT_ID"
+          if [ -z "$published" ]; then
+            echo 'No extension id published on Pages yet (first signed release); nothing to compare against.'
+            exit 0
+          fi
+          echo "published extension id:  $published"
+          if [ "$published" != "$EXT_ID" ]; then
+            echo "::error::extension id changed from $published to $EXT_ID -- CRX_PRIVATE_KEY is not the key previous releases used. Every policy deployment pins the old id and would stop updating. If this key rotation is intentional, delete the published update manifest(s) from Pages and re-run."
+            exit 1
+          fi
+          echo 'Extension id is stable across releases.'
+
+      - name: Checksums
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          cd dist/build
+          sha256sum uBlock0_${VERSION}.chromium-mv3.* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Attest build provenance
+        if: steps.key.outputs.signed == 'true'
+        # Deliberately non-blocking, and deliberately BEFORE publication.
+        # Provenance is a bonus -- the CRX is already signed with the release key
+        # and SHA256SUMS is published -- so it must never be the reason a release
+        # fails.
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.crx.outputs.crx }}
+
+      - name: Assemble release notes
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          EXTENSION_ID: ${{ steps.crx.outputs.extension_id }}
+        run: |
+          pages_url="https://$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]').github.io/$(basename '${{ github.repository }}')"
+          {
+            echo "Chromium **Manifest V3** build of uBlock Origin \`${VERSION}\`, from upstream tag \`${VERSION}\`."
+            echo
+            echo '> [!IMPORTANT]'
+            echo '> Under MV3, `webRequestBlocking` is granted only to policy-installed extensions, so network filtering is inert until this is force-installed via enterprise policy. Scriptlet filtering additionally needs the per-extension **Allow user scripts** toggle.'
+            echo '>'
+            echo '> Setup instructions: [docs/mv3-deployment.md](../blob/master/docs/mv3-deployment.md)'
+            echo
+            echo "Package version (what Chrome compares for updates): \`$(node -p "require('./dist/build/uBlock0.chromium-mv3/manifest.json').version")\`"
+            echo
+            if [ -n "$EXTENSION_ID" ]; then
+              echo "Extension ID: \`${EXTENSION_ID}\`"
+              echo
+              echo "Policy \`update_url\` (stable across releases): \`${pages_url}/update.xml\`"
+              echo
+            fi
+            echo '### Build inputs'
+            echo
+            echo 'Filter lists are cloned at build time, so record what went in:'
+            echo '```json'
+            cat dist/build/uBlock0.chromium-mv3/build-info.json
+            echo '```'
+            echo
+            echo '### Upstream changelog'
+            echo
+            grep -m1 -B10000 -- '----------' CHANGELOG.md || true
+          } > release.body.md
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          # Distinguish "already exists" from any other failure, rather than
+          # masking both behind `create || edit`.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; updating notes."
+            gh release edit "$TAG" --notes-file release.body.md --draft=false
+          else
+            args=(--title "$TAG" --notes-file release.body.md)
+            if [ '${{ steps.meta.outputs.prerelease }}' = 'true' ]; then
+              args+=(--prerelease)
+            fi
+            gh release create "$TAG" "${args[@]}"
+          fi
+          assets=("dist/build/uBlock0_${VERSION}.chromium-mv3.zip" dist/build/SHA256SUMS.txt)
+          if [ '${{ steps.key.outputs.signed }}' = 'true' ]; then
+            assets+=("dist/build/uBlock0_${VERSION}.chromium-mv3.crx" dist/build/update.xml)
+          fi
+          gh release upload "$TAG" "${assets[@]}" --clobber
+          # A draft release would make the codebase URL inside update.xml 404.
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = 'true' ]; then
+            echo '::error::release is still a draft; the CRX URL in update.xml would 404 for Chrome'
+            exit 1
+          fi
+
+      - name: Stage Pages content
+        if: steps.key.outputs.signed == 'true'
+        # The policy `update_url` must be one fixed URL forever, but a release
+        # asset's URL changes every release. Serve the update manifests from
+        # Pages instead, alongside the existing docs/ site.
+        #
+        # Two channels share one signing key (hence one extension id):
+        # update.xml advertises the latest STABLE (X.Y.Z) release, update-dev.xml
+        # the latest release of ANY kind (betas/rcs included). A Pages deploy
+        # replaces the whole site, so BOTH must be written every run or the
+        # channel this release does not own would be wiped. Both are derived from
+        # the authoritative release list rather than from prior Pages content, so
+        # a re-dispatched OLD tag cannot regress either manifest: `gh release
+        # edit` leaves createdAt untouched, so sort_by(createdAt)|last still picks
+        # the genuinely newest release. The current release was created and
+        # de-drafted in the step above, so it is already in this listing.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXT_ID: ${{ steps.crx.outputs.extension_id }}
+          ASSET_BASE: ${{ github.server_url }}/${{ github.repository }}/releases/download
+        run: |
+          mkdir -p _site
+          cp -R docs/. _site/
+          dev_tag=$(gh release list --limit 100 --json tagName,isDraft,createdAt \
+            -q '[.[]|select(.isDraft==false and (.tagName|test("-mv3$")))]|sort_by(.createdAt)|last|.tagName')
+          stable_tag=$(gh release list --limit 100 --json tagName,isDraft,isPrerelease,createdAt \
+            -q '[.[]|select(.isDraft==false and .isPrerelease==false and (.tagName|test("-mv3$")))]|sort_by(.createdAt)|last|.tagName')
+          echo "dev channel    -> ${dev_tag:-<none>}"
+          echo "stable channel -> ${stable_tag:-<none>}"
+          if [ -z "$dev_tag" ]; then
+            echo '::error::no non-draft *-mv3 release found; cannot build update-dev.xml'
+            exit 1
+          fi
+          node tools/make-update-xml.mjs --appid "$EXT_ID" --tag "$dev_tag" \
+            --asset-base "$ASSET_BASE" --out _site/update-dev.xml
+          if [ -n "$stable_tag" ]; then
+            node tools/make-update-xml.mjs --appid "$EXT_ID" --tag "$stable_tag" \
+              --asset-base "$ASSET_BASE" --out _site/update.xml
+          else
+            echo '::warning::no stable (X.Y.Z) *-mv3 release yet; update.xml (stable channel) is not published until the first stable release'
+          fi
+          echo "Staged _site:"
+          find _site -maxdepth 1
+          echo "--- update-dev.xml ---"; cat _site/update-dev.xml
+          [ -f _site/update.xml ] && { echo "--- update.xml ---"; cat _site/update.xml; } || true
+
+      - name: Upload Pages artifact
+        if: steps.key.outputs.signed == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  pages:
+    name: Publish update manifest
+    needs: release
+    if: needs.release.outputs.signed == 'true'
+    runs-on: ubuntu-latest
+    # A Pages environment accepts one deployment at a time; two in-flight
+    # releases would otherwise have one cancel the other, failing a job after its
+    # release was already published. Not keyed on the tag on purpose -- the point
+    # is to serialise ALL deployments.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
