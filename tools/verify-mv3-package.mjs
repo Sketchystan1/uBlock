@@ -271,6 +271,77 @@ if ( /^\d+(\.\d+){0,3}$/.test(manifest.version || '') === false ) {
 
 /******************************************************************************/
 
+section('manifest-referenced assets');
+
+// Chrome refuses to LOAD the extension when a file named by certain manifest
+// keys is missing (managed_schema, the default-locale messages), and silently
+// drops a feature when others are (a missing content script disables all
+// injection). REQUIRED_FILES above is a hand-curated floor; this instead
+// follows the manifest itself, so a key that begins pointing somewhere new is
+// covered without editing a list.
+const referenced = new Map(); // package-relative path -> manifest key that named it
+
+function refer(rel, whence) {
+    if ( typeof rel !== 'string' || rel === '' ) { return; }
+    // Manifest paths may be root-absolute ("/js/x.js") or relative ("js/x.js");
+    // both resolve against the package root.
+    referenced.set(rel.replace(/^\//, ''), whence);
+}
+
+refer(manifest.storage?.managed_schema, 'storage.managed_schema');
+if ( typeof manifest.default_locale === 'string' ) {
+    refer(`_locales/${manifest.default_locale}/messages.json`, 'default_locale');
+}
+for ( const cs of manifest.content_scripts || [] ) {
+    for ( const js of cs.js || [] ) { refer(js, 'content_scripts[].js'); }
+    for ( const css of cs.css || [] ) { refer(css, 'content_scripts[].css'); }
+}
+refer(manifest.action?.default_popup, 'action.default_popup');
+refer(manifest.options_ui?.page, 'options_ui.page');
+for ( const p of Object.values(manifest.action?.default_icon || {}) ) { refer(p, 'action.default_icon'); }
+for ( const p of Object.values(manifest.icons || {}) ) { refer(p, 'icons'); }
+refer(manifest.background?.service_worker, 'background.service_worker');
+
+const missingRefs = [];
+for ( const [ rel, whence ] of referenced ) {
+    if ( existsPkg(rel) === false ) { missingRefs.push(`${rel} (${whence})`); }
+}
+if ( missingRefs.length !== 0 ) {
+    fail('manifest-referenced-files',
+        `manifest names ${missingRefs.length} file(s) absent from the package:\n  ${missingRefs.join('\n  ')}`,
+        'Chrome refuses to load when managed_schema or the default-locale messages are missing, and silently drops injection when a content script is; check tools/copy-common-files.sh and tools/make-assets.sh');
+} else {
+    pass(`${referenced.size} manifest-referenced file(s) present`);
+}
+
+// web_accessible_resources are globs ("/web_accessible_resources/*"); assert the
+// directory each glob roots at exists rather than trying to expand the glob.
+for ( const entry of manifest.web_accessible_resources || [] ) {
+    for ( const res of entry.resources || [] ) {
+        const dir = res.replace(/^\//, '').replace(/\/?\*+.*$/, '');
+        if ( dir === '' || existsPkg(dir) ) { continue; }
+        warn('war-dir', `web_accessible_resources glob "${res}" roots at "${dir}", which is absent from the package`);
+    }
+}
+
+// minimum_chrome_version gates features the port relies on: userScripts world
+// messaging (chrome.userScripts.configureWorld({messaging:true})) and the
+// "Allow user scripts" toggle are Chrome 138+. Installing on an older Chrome
+// would let userScripts messaging fail silently.
+const MIN_CHROME = 138;
+const mcv = parseInt((manifest.minimum_chrome_version || '').split('.')[0], 10);
+if ( Number.isNaN(mcv) ) {
+    fail('minimum-chrome-version', 'minimum_chrome_version is missing or unparseable',
+        `set it to at least ${MIN_CHROME} in platform/chromium-mv3/manifest.overlay.json`);
+} else if ( mcv < MIN_CHROME ) {
+    fail('minimum-chrome-version', `minimum_chrome_version ${manifest.minimum_chrome_version} is below ${MIN_CHROME}`,
+        `userScripts world messaging and the "Allow user scripts" toggle need Chrome ${MIN_CHROME}; raise it in platform/chromium-mv3/manifest.overlay.json`);
+} else {
+    pass(`minimum_chrome_version ${manifest.minimum_chrome_version}`);
+}
+
+/******************************************************************************/
+
 section('service worker module graph');
 
 // Walk every static import reachable from js/sw.js. Anything unresolved would

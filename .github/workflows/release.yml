@@ -177,6 +177,38 @@ jobs:
             --dir dist/build/uBlock0.chromium-mv3 \
             --update-xml dist/build/update.xml
 
+      - name: Guard extension-id stability
+        if: steps.key.outputs.signed == 'true'
+        # The signing key uniquely determines the extension id, and every policy
+        # deployment pins EXTENSION_ID;update_url forever. If the key ever
+        # changes, the id changes and every existing deployment silently stops
+        # updating -- while this run stays green. Catch it: the id derived from
+        # THIS run's key must match the appid already advertised on Pages. This
+        # runs before "Stage Pages content" overwrites those manifests, so it
+        # compares against the PREVIOUS release. The first signed release
+        # (nothing published yet) is allowed through.
+        env:
+          EXT_ID: ${{ steps.crx.outputs.extension_id }}
+        run: |
+          pages_base="https://$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]').github.io/$(basename '${{ github.repository }}')"
+          published=''
+          for ch in update.xml update-dev.xml; do
+            xml=$(curl -fsSL "$pages_base/$ch" 2>/dev/null) || continue
+            published=$(printf '%s' "$xml" | sed -n 's/.*appid="\([a-p]\{32\}\)".*/\1/p' | head -n1)
+            [ -n "$published" ] && break
+          done
+          echo "this run's extension id: $EXT_ID"
+          if [ -z "$published" ]; then
+            echo 'No extension id published on Pages yet (first signed release); nothing to compare against.'
+            exit 0
+          fi
+          echo "published extension id:  $published"
+          if [ "$published" != "$EXT_ID" ]; then
+            echo "::error::extension id changed from $published to $EXT_ID -- CRX_PRIVATE_KEY is not the key previous releases used. Every policy deployment pins the old id and would stop updating. If this key rotation is intentional, delete the published update manifest(s) from Pages and re-run."
+            exit 1
+          fi
+          echo 'Extension id is stable across releases.'
+
       - name: Checksums
         env:
           VERSION: ${{ steps.meta.outputs.version }}
@@ -263,14 +295,48 @@ jobs:
       - name: Stage Pages content
         if: steps.key.outputs.signed == 'true'
         # The policy `update_url` must be one fixed URL forever, but a release
-        # asset's URL changes every release. Serve update.xml from Pages instead,
-        # alongside the existing docs/ site, and let each release refresh it.
+        # asset's URL changes every release. Serve the update manifests from
+        # Pages instead, alongside the existing docs/ site.
+        #
+        # Two channels share one signing key (hence one extension id):
+        # update.xml advertises the latest STABLE (X.Y.Z) release, update-dev.xml
+        # the latest release of ANY kind (betas/rcs included). A Pages deploy
+        # replaces the whole site, so BOTH must be written every run or the
+        # channel this release does not own would be wiped. Both are derived from
+        # the authoritative release list rather than from prior Pages content, so
+        # a re-dispatched OLD tag cannot regress either manifest: `gh release
+        # edit` leaves createdAt untouched, so sort_by(createdAt)|last still picks
+        # the genuinely newest release. The current release was created and
+        # de-drafted in the step above, so it is already in this listing.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXT_ID: ${{ steps.crx.outputs.extension_id }}
+          ASSET_BASE: ${{ github.server_url }}/${{ github.repository }}/releases/download
         run: |
           mkdir -p _site
           cp -R docs/. _site/
-          cp dist/build/update.xml _site/update.xml
+          dev_tag=$(gh release list --limit 100 --json tagName,isDraft,createdAt \
+            -q '[.[]|select(.isDraft==false and (.tagName|test("-mv3$")))]|sort_by(.createdAt)|last|.tagName')
+          stable_tag=$(gh release list --limit 100 --json tagName,isDraft,isPrerelease,createdAt \
+            -q '[.[]|select(.isDraft==false and .isPrerelease==false and (.tagName|test("-mv3$")))]|sort_by(.createdAt)|last|.tagName')
+          echo "dev channel    -> ${dev_tag:-<none>}"
+          echo "stable channel -> ${stable_tag:-<none>}"
+          if [ -z "$dev_tag" ]; then
+            echo '::error::no non-draft *-mv3 release found; cannot build update-dev.xml'
+            exit 1
+          fi
+          node tools/make-update-xml.mjs --appid "$EXT_ID" --tag "$dev_tag" \
+            --asset-base "$ASSET_BASE" --out _site/update-dev.xml
+          if [ -n "$stable_tag" ]; then
+            node tools/make-update-xml.mjs --appid "$EXT_ID" --tag "$stable_tag" \
+              --asset-base "$ASSET_BASE" --out _site/update.xml
+          else
+            echo '::warning::no stable (X.Y.Z) *-mv3 release yet; update.xml (stable channel) is not published until the first stable release'
+          fi
           echo "Staged _site:"
           find _site -maxdepth 1
+          echo "--- update-dev.xml ---"; cat _site/update-dev.xml
+          [ -f _site/update.xml ] && { echo "--- update.xml ---"; cat _site/update.xml; } || true
 
       - name: Upload Pages artifact
         if: steps.key.outputs.signed == 'true'

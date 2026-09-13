@@ -69,21 +69,31 @@ dragging the CRX in, does **not** qualify — Chrome will show a manifest warnin
 Host the `.crx` and an `update.xml` on servers reachable over HTTPS — or let the release
 automation do it for you, which is the supported path here:
 
-- **`update.xml`** is published to GitHub Pages at a **stable URL** that never changes between
-  releases: `https://<owner>.github.io/<repo>/update.xml`. This matters because
-  `ExtensionInstallForcelist` takes one fixed `EXTENSION_ID;UPDATE_URL` string and Chrome polls it
-  forever. A per-release asset URL would give a client exactly one version and then never update it
-  again.
-- **The `.crx`** is a release asset, and each `update.xml` points at the versioned CRX of the
-  release that produced it.
+- **Two update manifests** are published to GitHub Pages, each at a **stable URL** that never
+  changes between releases. They are signed with **one key**, so both advertise the **same
+  extension id** — choose the channel you want and put its URL in the policy:
+  - **Stable** — `https://<owner>.github.io/<repo>/update.xml` — only ever advances to a stable
+    `X.Y.Z` release.
+  - **Dev** — `https://<owner>.github.io/<repo>/update-dev.xml` — tracks the newest build of any
+    kind, betas and rcs included (upstream ships roughly six betas per stable release).
+
+  A fixed URL matters because `ExtensionInstallForcelist` takes one `EXTENSION_ID;UPDATE_URL`
+  string and Chrome polls it forever; a per-release asset URL would pin a client to a single
+  version and never update it again. Because the two channels share an extension id, a device
+  follows whichever one URL its policy names — it cannot run both side by side.
+- **The `.crx`** is a release asset, and each manifest points at the versioned CRX of the release
+  it advertises.
 
 > [!NOTE]
 > Do not use `https://github.com/<owner>/<repo>/releases/latest/download/update.xml`. GitHub
 > resolves `/releases/latest` to the newest **non-prerelease** release, and this fork marks every
 > non-`X.Y.Z` build as a prerelease — which is most of them, since upstream ships roughly six betas
-> per stable release. Policy clients would silently stop at the last stable build.
+> per stable release. Policy clients would silently stop at the last stable build. The **stable
+> channel** URL above already gives you "newest stable", through a URL that is genuinely fixed —
+> use it instead.
 
-Then, replacing `EXTENSION_ID` with the value `make-crx.mjs` printed:
+Then, replacing `EXTENSION_ID` with the value `make-crx.mjs` printed (the examples below use the
+stable channel; substitute `update-dev.xml` to follow the dev channel):
 
 **Windows** (registry):
 
@@ -168,9 +178,9 @@ affected tabs are reloaded once uBO is ready.
 uBO's scriptlet filters are. There is currently **no enterprise policy** that pre-grants it, so it
 takes one manual step per profile:
 
-- **Chrome 138+**: `chrome://extensions` → uBlock Origin → **Details** → enable **Allow user
-  scripts**.
-- **Chrome 135–137**: enable **Developer mode** at the top right of `chrome://extensions`.
+The extension requires **Chrome 138+** (`minimum_chrome_version` in the manifest, enforced by
+`tools/verify-mv3-package.mjs`), so there is one path: `chrome://extensions` → uBlock Origin →
+**Details** → enable **Allow user scripts**.
 
 Until this is done, scriptlet filters are skipped and everything else keeps working. The service
 worker logs one explanatory error, and the toolbar button shows a `!` badge — the same warning uBO
@@ -371,7 +381,7 @@ silently.
 | Workflow | Trigger | Does |
 |---|---|---|
 | `.github/workflows/sync-upstream.yml` | daily + manual | Merges `gorhill/uBlock` `master`, **builds and verifies before pushing anything**, then constructs the release tree (upstream at the tag + this fork's files) and tags it `<upstream-tag>-mv3`. On a conflict, a merge that no longer builds, or a release tree that does not build, it opens an issue and pushes nothing. |
-| `.github/workflows/release.yml` | `*-mv3` tag push, or dispatch | Builds and verifies, signs the CRX, publishes the release with checksums and provenance, and deploys `update.xml` to GitHub Pages |
+| `.github/workflows/release.yml` | `*-mv3` tag push, or dispatch | Builds and verifies, signs the CRX, publishes the release with checksums and provenance, and deploys both update manifests (`update.xml` = stable channel, `update-dev.xml` = dev channel) to GitHub Pages |
 | `.github/workflows/build.yml` | push / PR | Builds and verifies |
 
 Two details worth knowing, both learned the hard way:
@@ -431,6 +441,9 @@ One-time repository setup:
 Releases are cut for every release-shaped upstream tag, betas and rcs included. Upstream ships
 roughly six betas per stable release, and a beta's four-component `dist/version` makes it build as
 "uBlock Origin development build" against the dev filter-list channel — which is upstream's own
-intent for a beta tag, not a defect. Narrow `TAG_PATTERN` in `sync-upstream.yml` to
-`^[0-9]+\.[0-9]+\.[0-9]+$` to track stable releases only.
+intent for a beta tag, not a defect. To keep a deployment on stable releases only, point its
+policy `update_url` at the **stable channel** (`update.xml`), which never advances past an `X.Y.Z`
+release — this is the intended mechanism and needs no workflow change. (You *can* still narrow
+`TAG_PATTERN` in `sync-upstream.yml` to `^[0-9]+\.[0-9]+\.[0-9]+$` if you would rather the fork not
+build betas at all, but then the dev channel has nothing to advertise.)
 
