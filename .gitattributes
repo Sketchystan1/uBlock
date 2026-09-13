@@ -1,0 +1,6 @@
+# Hide the dist/ tree on GitHub without untracking it.
+#   linguist-vendored  -> excluded from the repo's language statistics bar
+#   linguist-generated -> collapsed in diffs and suppressed in pull requests
+# The files stay tracked, so the build (which reads dist/version) and upstream
+# merges are unaffected.
+dist/** linguist-vendored linguist-generated
