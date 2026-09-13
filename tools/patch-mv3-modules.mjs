@@ -22,18 +22,20 @@
 
 /*******************************************************************************
 
-    Rewrite dynamic `import()` in the built package's service worker modules.
+    Apply MV3 fix-ups to the built package that can only be made to the output.
+
+    Two transforms, both against the BUILD OUTPUT and never the source tree: the
+    port must not modify a single upstream file, so that the unattended merge from
+    upstream can never conflict. Transforming the copy is the same approach the
+    port already takes for the manifest.
+
+    1. Rewrite dynamic `import()` in the service worker's module graph.
 
     Dynamic import is unconditionally forbidden in a ServiceWorkerGlobalScope
     (Blink: `WorkerModulatorImpl::IsDynamicImportForbidden`), and uBO's five
     reachable call sites all swallow the resulting rejection -- so the failures
     are silent. The worst of them leaves uBO with an empty scriptlet resource
     table, which makes every `+js(...)` filter quietly do nothing.
-
-    This runs against the BUILD OUTPUT, never the source tree: the port must not
-    modify a single upstream file, so that the unattended merge from upstream can
-    never conflict. Transforming the copy is the same approach the port already
-    takes for the manifest.
 
     Each `import(...)` becomes `self.uBO_dynamicImport(...)`, which
     `platform/chromium-mv3/mv3-shims.js` defines and
@@ -43,6 +45,14 @@
     `tools/verify-mv3-package.mjs` asserts that no dynamic `import()` survives in
     the shipped package, so if upstream adds a call site this transform does not
     reach, the build fails rather than regressing silently.
+
+    2. Alias `chrome.browserAction` to `chrome.action` for extension pages.
+
+    `webext.js` reads `chrome.browserAction` at module-eval time; MV3 renamed the
+    manifest key to `action`, so it is undefined in every extension page (the
+    service worker aliases it in `mv3-shims.js`, but pages have no such shim). The
+    read throws and aborts the module graph of every page importing webext.js. See
+    the injection site below for the full explanation.
 
     Usage: node tools/patch-mv3-modules.mjs [--dir <package-dir>]
 
@@ -113,6 +123,69 @@ const pageGraph = (( ) => {
     }
     return moduleGraph(entries);
 })();
+
+/******************************************************************************/
+
+// Alias `chrome.browserAction` to `chrome.action` for extension PAGE contexts.
+//
+// `platform/chromium/webext.js` builds its promisified `webext` object at
+// module-evaluation time, reading `chrome.browserAction` directly (its
+// `browserAction:` block passes it to `promisifyNoFail`). MV3 renamed the
+// `browser_action` manifest key to `action`, so `chrome.browserAction` is
+// `undefined` in every context that has not aliased it. The service worker
+// aliases it in `mv3-shims.js` before uBO evaluates; a PAGE has no equivalent
+// shim, so the read throws a TypeError at module scope.
+//
+// Because `webext.js` sits in the static import graph of `broadcast.js` and
+// `cachestorage.js`, that throw aborts the whole module graph of any page which
+// imports them -- Filter lists (3p-filters), My filters (1p-filters), Support and
+// the logger among them. The page's own script never runs, so the pane loads
+// blank even though the service worker answers its messages normally.
+//
+// Prepend the same alias to the built webext.js: it is the single choke point,
+// and as a module its first statement runs before the offending read. Guarded and
+// idempotent -- a no-op in the service worker, where the alias is already set, and
+// on a re-run of this script.
+
+{
+    const rel = 'js/webext.js';
+    const abs = path.join(pkgDir, rel);
+    const marker = 'uBO MV3 page-context browserAction alias';
+    if ( pageGraph.has(rel) === false ) {
+        console.log(
+            `*** patch-mv3-modules: ${rel} is not page-reachable; ` +
+            `skipping the chrome.browserAction alias`
+        );
+    } else if ( fs.existsSync(abs) === false ) {
+        console.error(
+            `*** patch-mv3-modules: ${rel} missing; cannot inject the ` +
+            `chrome.browserAction alias`
+        );
+        process.exit(1);
+    } else {
+        const src = fs.readFileSync(abs, 'utf8');
+        if ( src.includes(marker) ) {
+            console.log(`*** patch-mv3-modules: ${rel} already has the browserAction alias`);
+        } else {
+            const shim = [
+                `// [${marker}] webext.js reads chrome.browserAction at`,
+                `// module-eval time. MV3 renamed browser_action -> action, so it is undefined`,
+                `// in every extension page (the service worker aliases it in mv3-shims.js).`,
+                `// Without this the read throws and aborts the importing page's module graph.`,
+                `if ( typeof chrome !== 'undefined' && chrome.browserAction === undefined && chrome.action !== undefined ) {`,
+                `    chrome.browserAction = chrome.action;`,
+                `}`,
+                ``,
+                ``,
+            ].join('\n');
+            fs.writeFileSync(abs, shim + src);
+            console.log(
+                `*** patch-mv3-modules: ${rel} prepended chrome.browserAction ` +
+                `alias for page contexts`
+            );
+        }
+    }
+}
 
 /******************************************************************************/
 

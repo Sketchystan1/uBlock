@@ -744,6 +744,26 @@ section('port self-checks');
     }
 }
 
+// Extension pages have no equivalent of mv3-shims.js. `webext.js` reads
+// `chrome.browserAction` at module-evaluation time, which MV3 leaves undefined
+// (the key is now `action`), so the read throws and aborts the module graph of
+// every page importing webext.js -- Filter lists, My filters, Support, the
+// logger. tools/patch-mv3-modules.mjs prepends an alias to the packaged webext.js
+// to close this; assert it survived. A blank dashboard pane over a healthy
+// service worker is exactly the kind of failure this port asserts away.
+{
+    const rel = 'js/webext.js';
+    if ( existsPkg(rel) === false ) {
+        // The required-files check already fails on this; don't double-report.
+    } else if ( /chrome\.browserAction\s*=\s*chrome\.action/.test(readPkg(rel)) ) {
+        pass('webext.js has the page-context chrome.browserAction alias');
+    } else {
+        fail('page-browseraction-alias',
+            'js/webext.js is missing the page-context chrome.browserAction alias',
+            'tools/patch-mv3-modules.mjs must prepend `chrome.browserAction = chrome.action` so pages importing webext.js do not throw at load');
+    }
+}
+
 /******************************************************************************/
 
 section('summary');
