@@ -33,32 +33,47 @@
     Two of the gaps are closed by MV3 features which are gated:
     - Blocking `webRequest` requires the `webRequestBlocking` permission, which
       MV3 grants only to policy-installed extensions.
-    - Injecting scriptlet code (arbitrary strings) requires `chrome.userScripts`,
-      which requires the per-extension "Allow user scripts" toggle.
+    - Injecting scriptlet code (arbitrary strings) has no MV3 API at all:
+      scriptlets are carried as data and inserted by functions of ours, in the
+      scriptlet-injection section below.
     See docs/mv3-deployment.md.
 
 **/
 
 /* global chrome */
 
-// Must come before anything which may touch `self.lz4BlockCodec`. This file
-// only assigns `self.LZ4BlockJS`, it has no DOM dependency.
+// Must come before anything which may touch `self.lz4BlockCodec`. The JS
+// flavor only assigns `self.LZ4BlockJS` and has no DOM dependency; the WASM
+// flavor would compute its module's URL from `document.currentScript`,
+// which does not exist in a service worker -- the build rewrites that
+// lookup to a package-root-relative path (tools/patch-mv3-modules.mjs),
+// which the fetch wrapper above resolves. Both flavors are needed: LZ4
+// decompression of the filtering-engine selfie runs 5-20x faster under
+// WASM, and `src/js/lz4.js` asks for the default flavor, which is
+// WASM-first with a JS fallback.
+//
+// SW-crash coupling: these are static imports evaluated at service-worker
+// startup, ahead of every shim, so a throw from either module's top-level
+// evaluation (e.g. a mis-rewritten WASM module URL) aborts the whole worker
+// and with it uBO's boot. Both flavors here only assign a global and must stay
+// that way -- do not add import-time work that could throw.
 import '../lib/lz4/lz4-block-codec-js.js';
+import '../lib/lz4/lz4-block-codec-wasm.js';
 
-// A pure module, safe to import here: it touches neither `chrome.*` nor the DOM,
-// so it cannot depend on a shim this file has not installed yet.
+// Pure modules, safe to import here: neither touches `chrome.*` nor the
+// DOM, so neither can depend on a shim this file has not installed yet.
 import { decodeScriptletMarker } from './mv3-scriptlet-marker.js';
+// Generated into the package by tools/patch-mv3-modules.mjs (it does not
+// exist in the source tree): which file of the sharded scriptlet libraries
+// defines each function, per world. See the scriptlet-injection section
+// below.
+import { scriptletShards } from './mv3-scriptlet-shards.js';
 
 /******************************************************************************/
 
 const OFFSCREEN_PAGE = 'offscreen.html';
 const KEEPALIVE_ALARM = 'mv3ShimsKeepalive';
 const WORKER_CHANNEL = 'uBO-worker-proxy';
-
-// uBO's scriptlets live in the `USER_SCRIPT` world, so the few scriptlet files
-// which read state left behind by them must be injected there too. Everything
-// else belongs in `ISOLATED`, alongside `contentscript.js`.
-const reUserScriptWorldFiles = /\/scriptlet-loglevel-\d+\.js$/;
 
 /******************************************************************************/
 
@@ -69,8 +84,8 @@ const reUserScriptWorldFiles = /\/scriptlet-loglevel-\d+\.js$/;
 // a web-platform API (`fetch`, and anything built on it) is off by one
 // directory and 404s.
 //
-// Extension APIs are not affected: `chrome.scripting`/`chrome.userScripts`
-// resolve `file:` against the extension root in the browser process. But
+// Extension APIs are not affected: `chrome.scripting` resolves `file:` against
+// the extension root in the browser process. But
 // `chrome.action.setIcon({path})` only *looks* like one of those -- Chromium
 // implements the path->ImageData conversion in the calling context, and its
 // service worker branch calls `fetch(path)` right here in the worker
@@ -341,17 +356,34 @@ self.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
 
 // `src/js/lz4.js` expects the global published by
 // `src/lib/lz4/lz4-block-codec-any.js`, which loads its flavors by injecting
-// `<script>` elements. The pure-JS flavor is already imported at the top of
-// this file; the wasm flavor is unreachable from a service worker and is not
-// needed, since uBO's Chromium CSP leaves `vAPI.canWASM` false either way.
+// `<script>` elements -- impossible from a service worker. Stand in for it
+// with the flavors imported at the top of this file, mirroring the order
+// `lz4-block-codec-any.js` itself uses: WASM first when no flavor is
+// requested, the pure-JS flavor on WASM failure or on explicit request.
+// (The MV3 manifest opts into 'wasm-unsafe-eval', which is what makes
+// `vAPI.canWASM` true -- see docs/mv3-deployment.md. Under a manifest
+// without the opt-in, the WASM compile is blocked by the CSP, the codec's
+// `init()` catches it and reports failure, and this falls back to JS -- so
+// the shim is safe under either policy.)
 
 self.lz4BlockCodec = {
-    createInstance: function() {
-        if ( self.LZ4BlockJS instanceof Function === false ) {
-            return Promise.resolve(null);
+    createInstance: function(flavor) {
+        const instantiate = ctor => {
+            if ( ctor instanceof Function === false ) {
+                return Promise.resolve(null);
+            }
+            const instance = new ctor();
+            return instance.init().then(ok => ok ? instance : null);
+        };
+        if ( flavor === 'js' ) {
+            return instantiate(self.LZ4BlockJS);
         }
-        const instance = new self.LZ4BlockJS();
-        return instance.init().then(ok => ok ? instance : null);
+        if ( flavor === 'wasm' ) {
+            return instantiate(self.LZ4BlockWASM);
+        }
+        return instantiate(self.LZ4BlockWASM).then(instance =>
+            instance !== null ? instance : instantiate(self.LZ4BlockJS)
+        );
     },
     reset: function() {
     },
@@ -427,21 +459,48 @@ self.lz4BlockCodec = {
 
 let offscreenPromise;
 
-function ensureOffscreenDocument() {
+// The last moment we had evidence the offscreen document exists -- a keepalive
+// ping from it, a `getContexts` confirmation, or its successful creation.
+// Fresh evidence lets the keepalive alarm skip the `getContexts` IPC entirely:
+// while the document is alive it pings every 20s, so anything older than a
+// couple of missed pings means it died (or was never created), and only then
+// is a re-check warranted. The worker-relay path below still re-checks on its
+// own -- it polls the channel with `ping` until the document answers -- so a
+// stale document costs that path a few hundred milliseconds, not correctness.
+let offscreenEvidenceAt = 0;
+const OFFSCREEN_STALE_AFTER_MS = 45 * 1000;
+
+const offscreenIsFresh = ( ) =>
+    Date.now() - offscreenEvidenceAt < OFFSCREEN_STALE_AFTER_MS;
+
+// `force: true` bypasses the freshness short-circuit and always verifies via
+// `getContexts` (recreating the document only if it is in fact gone). The
+// recovery loop in `whenOffscreenReady` needs this: a document can die while
+// its last ping is still inside the freshness window, and the fast path would
+// then return without recreating it for up to `OFFSCREEN_STALE_AFTER_MS`.
+// Normal callers -- the keepalive alarm and boot -- leave `force` off so they
+// keep skipping the `getContexts` IPC while the evidence is fresh.
+function ensureOffscreenDocument({ force = false } = {}) {
     if ( offscreenPromise !== undefined ) { return offscreenPromise; }
+    if ( force === false && offscreenIsFresh() ) { return Promise.resolve(); }
     offscreenPromise = (async ( ) => {
         try {
             const contexts = await chrome.runtime.getContexts({
                 contextTypes: [ 'OFFSCREEN_DOCUMENT' ],
             });
-            if ( Array.isArray(contexts) && contexts.length !== 0 ) { return; }
+            if ( Array.isArray(contexts) && contexts.length !== 0 ) {
+                offscreenEvidenceAt = Date.now();
+                return;
+            }
             await chrome.offscreen.createDocument({
                 url: OFFSCREEN_PAGE,
                 reasons: [ 'WORKERS' ],
                 justification: 'Host web workers and keep the filtering engines resident, neither of which a service worker can do on its own',
             });
+            offscreenEvidenceAt = Date.now();
         } catch (reason) {
             // Most likely another invocation won the race to create it.
+            // No evidence was recorded, so the next tick re-checks.
             console.info(`uBO: offscreen document: ${reason}`);
         }
     })().finally(( ) => {
@@ -459,16 +518,115 @@ chrome.alarms.create(KEEPALIVE_ALARM, {
 chrome.alarms.onAlarm.addListener(alarm => {
     if ( alarm.name !== KEEPALIVE_ALARM ) { return; }
     ensureOffscreenDocument();
-    recheckUserScripts();
 });
 
 chrome.runtime.onMessage.addListener((message, sender, callback) => {
     if ( message?.what !== 'mv3ShimsKeepalive' ) { return; }
+    // A ping is itself evidence the document is alive.
+    offscreenEvidenceAt = Date.now();
     callback();
     return false;
 });
 
 ensureOffscreenDocument();
+
+/******************************************************************************/
+
+// Pre-warm at browser start. uBO's MV2 background page booted the moment
+// the browser launched; an MV3 service worker starts only when an event
+// requires one, so without a registered interest in `onStartup` the whole
+// engine boot -- selfie hydration, or a full compile on a cold profile --
+// would instead land on the user's first navigation. Registering the
+// listener is itself what makes Chrome start the worker at launch; the
+// callback has nothing to do, because merely evaluating this module graph
+// runs uBO's boot: `src/js/start.js` kicks off its boot sequence at module
+// scope. (Fired once per browser launch, not on service worker restarts.)
+chrome.runtime.onStartup.addListener(( ) => { });
+
+// Chrome dispatches the event which woke a terminated service worker as soon
+// as the worker's initial evaluation finishes; a listener attached later --
+// from a promise callback, or after a filter list has loaded -- never sees
+// it. Two wake-capable listeners are registered exactly that way by uBO's
+// boot sequence, which runs after every module has evaluated:
+//
+// - `chrome.contextMenus.onClicked`: attached by `vAPI.contextMenu.setEntries`
+//   (platform/common/vapi-background.js), reached only from
+//   `contextMenu.update()` at the END of src/js/start.js's async boot. The
+//   menu entries themselves persist across service worker restarts, so the
+//   menu is clickable at precisely the moment its handler is absent.
+// - `chrome.runtime.onUpdateAvailable`: registered at the very same spot in
+//   src/js/start.js, to decide whether an update should force a reload.
+//
+// Buffer the first event of each here, at module scope -- this file is the
+// first thing the service worker evaluates -- and hand it to the real
+// handler once one attaches. `mv3-post.js` does the wiring; it runs after
+// uBO's modules have evaluated but before the async boot completes.
+
+const earlyEvents = {
+    contextMenuClick: null,
+    contextMenuListener: null,
+    contextMenuStoodDown: false,
+    updateAvailable: null,
+    updateAvailableListener: null,
+    updateAvailableStoodDown: false,
+};
+
+if ( chrome.contextMenus instanceof Object &&
+     typeof chrome.contextMenus.onClicked?.addListener === 'function' ) {
+    earlyEvents.contextMenuListener = (info, tab) => {
+        if ( earlyEvents.contextMenuStoodDown ) { return; }
+        // One is enough: a click means "wake up and do this".
+        if ( earlyEvents.contextMenuClick !== null ) { return; }
+        earlyEvents.contextMenuClick = { info, tab };
+    };
+    chrome.contextMenus.onClicked.addListener(earlyEvents.contextMenuListener);
+}
+
+if ( typeof chrome.runtime?.onUpdateAvailable?.addListener === 'function' ) {
+    earlyEvents.updateAvailableListener = details => {
+        if ( earlyEvents.updateAvailableStoodDown ) { return; }
+        if ( earlyEvents.updateAvailable !== null ) { return; }
+        earlyEvents.updateAvailable = details;
+    };
+    chrome.runtime.onUpdateAvailable.addListener(
+        earlyEvents.updateAvailableListener
+    );
+}
+
+// Consumed by mv3-post.js. `replayContextMenuClick(handler)` stands the
+// shim's listener down -- by then `setEntries` has registered the real one
+// -- and delivers the buffered click to it, if any. `consumeUpdateAvailable()`
+// stands its listener down and returns the buffered event, if any: the real
+// listener registered by start.js and the hand-off happen within the same
+// synchronous run of the boot sequence, so no event can slip in between and
+// be handled twice.
+export const mv3EarlyEvents = {
+    replayContextMenuClick(handler) {
+        if ( earlyEvents.contextMenuListener !== null ) {
+            chrome.contextMenus.onClicked.removeListener(
+                earlyEvents.contextMenuListener
+            );
+            earlyEvents.contextMenuListener = null;
+        }
+        earlyEvents.contextMenuStoodDown = true;
+        const buffered = earlyEvents.contextMenuClick;
+        earlyEvents.contextMenuClick = null;
+        if ( buffered === null || typeof handler !== 'function' ) { return; }
+        handler(buffered.info, buffered.tab);
+    },
+    consumeUpdateAvailable() {
+        if ( earlyEvents.updateAvailableListener !== null ) {
+            chrome.runtime.onUpdateAvailable.removeListener(
+                earlyEvents.updateAvailableListener
+            );
+            earlyEvents.updateAvailableListener = null;
+        }
+        earlyEvents.updateAvailableStoodDown = true;
+        const buffered = earlyEvents.updateAvailable;
+        earlyEvents.updateAvailable = null;
+        return buffered;
+    },
+};
 
 /******************************************************************************/
 
@@ -480,8 +638,31 @@ ensureOffscreenDocument();
 // BroadcastChannel rather than `chrome.runtime` messaging, because it is
 // structured-clone rather than JSON: `reverselookup-worker.js` replies with
 // `Object.create(null)` objects which must survive the round trip intact.
+//
+// The offscreen document outlives any number of service worker lifetimes, and
+// every lifetime numbers its workers from 1 again. A relay keyed on the bare
+// id therefore collides the moment a service worker dies without terminating
+// its workers -- which is the norm, since its death takes the code that would
+// terminate them (the reverse lookup worker's TTL timer lives in the service
+// worker; the diff updater's worker has no cleanup at all). The next
+// lifetime's first `create` was ignored by the offscreen document (id already
+// hosted), every message after it was then routed to a stale worker of the
+// WRONG kind, and both worker kinds silently ignore each other's messages --
+// so a cycle of the asset updater would never complete and never reschedule:
+// filter lists silently stopped updating. Two guards, one per side:
+//
+// - Every message carries an `epoch`, unique per service worker lifetime.
+//   On a new epoch the offscreen document terminates every worker it hosts;
+//   on a retired epoch (a straggler racing the new lifetime's first message)
+//   it drops the message. Replies carry the epoch too, so a straggler reply
+//   can never be mistaken for this lifetime's worker answering.
+// - The watchdog below: a round trip with no reply has no other failure path
+//   (the offscreen document vanished, a worker crashed before `onerror`
+//   fired, a message was lost) and uBO's diff updater would wait forever.
 
 if ( typeof Worker !== 'function' ) {
+    const workerEpoch = crypto.randomUUID?.() ??
+        `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     let workerIdGenerator = 1;
     const workers = new Map();
     const channel = new BroadcastChannel(WORKER_CHANNEL);
@@ -489,17 +670,16 @@ if ( typeof Worker !== 'function' ) {
     channel.onmessage = ev => {
         const msg = ev.data;
         if ( msg instanceof Object === false ) { return; }
-        if ( msg.what === 'ready' ) { return; }
+        // Replies from a previous service worker lifetime.
+        if ( msg.epoch !== workerEpoch ) { return; }
         const worker = workers.get(msg.id);
         if ( worker === undefined ) { return; }
         switch ( msg.what ) {
         case 'message':
-            if ( worker.onmessage === null ) { break; }
-            worker.onmessage({ data: msg.data });
+            worker.onReply(msg.data);
             break;
         case 'error':
-            if ( worker.onerror === null ) { break; }
-            worker.onerror(msg.data);
+            worker.onRelayError(msg.data);
             break;
         default:
             break;
@@ -524,7 +704,11 @@ if ( typeof Worker !== 'function' ) {
                     readyPromise = undefined;
                     return reject(new Error('offscreen document did not come up'));
                 }
-                ensureOffscreenDocument().then(( ) => {
+                // `force: true`: recover a document that died while its last
+                // ping was still within the freshness window -- the fast path
+                // would otherwise skip recreation until the evidence goes
+                // stale.
+                ensureOffscreenDocument({ force: true }).then(( ) => {
                     channel.postMessage({ what: 'ping' });
                 });
             };
@@ -541,39 +725,374 @@ if ( typeof Worker !== 'function' ) {
         return readyPromise;
     };
 
+    // How long a round trip may take before the watchdog intervenes. The
+    // reverse lookup worker computes in memory and normally answers in
+    // milliseconds. The diff updater fetches patch files from a shuffled
+    // list of CDNs, any of which may legally hang until the network stack
+    // gives up on it, so its budget is minutes, not seconds.
+    const WATCHDOG_TIMEOUT_MS = {
+        rpc: 45 * 1000,
+        updater: 180 * 1000,
+        unknown: 60 * 1000,
+    };
+
+    // The watchdog understands the two worker protocols uBO actually runs,
+    // learned from the traffic this class relays -- so that it fires only
+    // when a round trip is genuinely outstanding:
+    // - 'rpc' (`reverselookup-worker.js`): requests carry a numeric `id`,
+    //   replies echo it; `setList`/`resetLists` posts expect no reply.
+    // - 'updater' (`diff-updater.js`): requests are `{ what: 'update',
+    //   assetKey, ... }` objects, each answered by the same object coming
+    //   back with a `status`/`error` (or by `{ what: 'broken' }`, which
+    //   ends the whole cycle); its unsolicited `{ what: 'ready' }` is not a
+    //   reply to anything.
+    const classifyRequest = data => {
+        if ( data instanceof Object === false ) { return; }
+        if ( data.what === 'update' ) { return 'updater'; }
+        if ( typeof data.id === 'number' ) { return 'rpc'; }
+    };
+
     self.Worker = class Worker {
         constructor(url) {
-            this.id = workerIdGenerator++;
+            this.url = url;
             this.onmessage = null;
             this.onerror = null;
+            // Messages posted before the offscreen document is ready wait
+            // here; once flushed, `null` means "relay directly".
             this.queue = [];
-            workers.set(this.id, this);
+            // The id at the offscreen document. Changes when the watchdog
+            // replaces a stalled worker, so a fresh `create` can never be
+            // mistaken for the old one.
+            this.hostedId = 0;
+            // Outstanding round trips: numeric ids for 'rpc', asset keys
+            // for 'updater'.
+            this.open = new Set();
+            this.protocol = 'unknown';
+            // Everything ever relayed, in order. The retry replays the
+            // conversation's preamble plus the still-open round trips from
+            // this log -- a fresh worker has none of the context the old one
+            // accumulated (compiled filter lists for the reverse lookup,
+            // patch state for the diff updater).
+            this.sent = [];
+            this.retried = false;
+            this.dead = false;
+            this.watchdogTimer = 0;
+            this.newHostedId();
             whenOffscreenReady().then(( ) => {
-                if ( workers.has(this.id) === false ) { return; }
-                channel.postMessage({ what: 'create', id: this.id, url });
+                if ( this.dead || workers.get(this.hostedId) !== this ) {
+                    return;
+                }
+                channel.postMessage({
+                    what: 'create',
+                    epoch: workerEpoch,
+                    id: this.hostedId,
+                    url,
+                });
                 const queue = this.queue;
                 this.queue = null;
                 for ( const data of queue ) {
-                    channel.postMessage({ what: 'message', id: this.id, data });
+                    this.post(data);
                 }
+                // Round trips opened while the messages were queued have
+                // had no chance of a reply yet -- arm the watchdog for them
+                // like postMessage() does for the non-queued path.
+                this.armWatchdog();
             }).catch(reason => {
-                console.error(`uBO: cannot host worker ${url}: ${reason.message}`);
-                workers.delete(this.id);
+                this.giveUp(`cannot host worker ${url}: ${reason.message}`);
+            });
+        }
+        newHostedId() {
+            if ( this.hostedId !== 0 ) { workers.delete(this.hostedId); }
+            this.hostedId = workerIdGenerator++;
+            workers.set(this.hostedId, this);
+        }
+        post(data) {
+            channel.postMessage({
+                what: 'message',
+                epoch: workerEpoch,
+                id: this.hostedId,
+                data,
             });
         }
         postMessage(data) {
+            if ( this.dead ) {
+                this.deliverToDeadWorker(data);
+                return;
+            }
+            this.sent.push(data);
+            this.trackRequest(data);
             if ( this.queue !== null ) {
                 this.queue.push(data);
                 return;
             }
-            channel.postMessage({ what: 'message', id: this.id, data });
+            this.post(data);
+            this.armWatchdog();
         }
         terminate() {
-            workers.delete(this.id);
+            if ( this.hostedId !== 0 ) {
+                workers.delete(this.hostedId);
+                channel.postMessage({
+                    what: 'terminate',
+                    epoch: workerEpoch,
+                    id: this.hostedId,
+                });
+                this.hostedId = 0;
+            }
+            this.dead = true;
+            this.disarmWatchdog();
+            this.open.clear();
             this.onmessage = null;
             this.onerror = null;
             this.queue = null;
-            channel.postMessage({ what: 'terminate', id: this.id });
+            this.sent = [];
+        }
+        onReply(data) {
+            // `{ what: 'ready' }` is `diff-updater.js` announcing itself,
+            // not an answer to anything.
+            if ( (data instanceof Object && data.what === 'ready') === false ) {
+                this.trackResponse(data);
+            }
+            if ( this.onmessage === null ) { return; }
+            this.onmessage({ data });
+        }
+        onRelayError(data) {
+            if ( this.onerror !== null ) {
+                this.onerror(data);
+            }
+            // The hosted worker threw an uncaught error; it will not answer
+            // whatever is outstanding. Treat it as a watchdog timeout
+            // rather than wait one out.
+            if ( this.open.size !== 0 ) { this.onWatchdog(); }
+        }
+        trackRequest(data) {
+            const protocol = classifyRequest(data);
+            if ( protocol === undefined ) { return; }
+            this.protocol = protocol;
+            if ( protocol === 'updater' ) {
+                if ( typeof data.assetKey === 'string' ) {
+                    this.open.add(data.assetKey);
+                }
+                return;
+            }
+            this.open.add(data.id);
+        }
+        trackResponse(data) {
+            if ( data instanceof Object === false ) { return; }
+            if ( this.protocol === 'updater' ) {
+                if ( data.what === 'broken' ) {
+                    this.open.clear();
+                } else if ( typeof data.assetKey === 'string' ) {
+                    this.open.delete(data.assetKey);
+                    // Retire every `update` message relayed for this asset.
+                    // The diff updater answers each asset with an intermediate
+                    // `needtext` and then a terminal `updated`/`error`; on
+                    // `needtext`, assets.js re-posts the SAME asset as a fresh
+                    // `update` carrying the fetched text (assets.js
+                    // diffUpdater), so the original is now dead weight. This
+                    // reply is tracked BEFORE onReply hands it to onmessage,
+                    // hence before that re-post, so at most one live message
+                    // per assetKey is ever kept. That is what makes a watchdog
+                    // replay re-drive each outstanding asset exactly ONCE:
+                    // replaying the two same-key `update`s a naive log holds
+                    // would make the fresh worker answer the asset twice, and
+                    // assets.js decrements `pendingOps` per reply -- the second
+                    // pushes it below zero and wedges the cycle. Pruning also
+                    // bounds `this.sent`, which terminate() would otherwise be
+                    // the only thing to clear.
+                    this.sent = this.sent.filter(entry =>
+                        entry instanceof Object === false ||
+                        entry.what !== 'update' ||
+                        entry.assetKey !== data.assetKey
+                    );
+                }
+            } else if ( this.protocol === 'rpc' ) {
+                if ( typeof data.id === 'number' ) {
+                    this.open.delete(data.id);
+                    // Same memory bound for the reverse-lookup protocol: drop
+                    // the answered request (its unique id never recurs). The
+                    // id-less preamble -- `setList`/`resetLists` -- has no
+                    // matching reply and stays, which is correct: a replay must
+                    // resend it to prime a fresh worker.
+                    this.sent = this.sent.filter(entry =>
+                        entry instanceof Object === false ||
+                        entry.id !== data.id
+                    );
+                }
+            }
+            if ( this.open.size === 0 ) {
+                this.disarmWatchdog();
+            } else {
+                this.armWatchdog();
+            }
+        }
+        armWatchdog() {
+            if ( this.dead || this.open.size === 0 ) { return; }
+            if ( this.watchdogTimer !== 0 ) { return; }
+            this.watchdogTimer = setTimeout(( ) => {
+                this.watchdogTimer = 0;
+                this.onWatchdog();
+            }, WATCHDOG_TIMEOUT_MS[this.protocol]);
+        }
+        disarmWatchdog() {
+            if ( this.watchdogTimer === 0 ) { return; }
+            clearTimeout(this.watchdogTimer);
+            this.watchdogTimer = 0;
+        }
+        onWatchdog() {
+            if ( this.dead || this.open.size === 0 ) { return; }
+            const outstanding = [ ...this.open ].join(', ').slice(0, 200);
+            if ( this.retried === false ) {
+                this.retried = true;
+                console.error(
+                    `uBO: no reply from the ${this.url} worker for ` +
+                    `${WATCHDOG_TIMEOUT_MS[this.protocol] / 1000}s ` +
+                    `(outstanding: ${outstanding}); replacing the hosted ` +
+                    `worker and replaying the unanswered round trips`
+                );
+                this.replaceHostedWorker();
+                return;
+            }
+            this.giveUp(
+                `no reply from the ${this.url} worker after a retry ` +
+                `(outstanding: ${outstanding})`
+            );
+        }
+        // What the retry replays: a fresh worker needs the conversation's
+        // preamble (the reverse lookup's `setList`s), and the round trips
+        // that are still open. Already-answered requests are NOT replayed:
+        // the reverse lookup would throw on a reply for an id it has
+        // forgotten, and the diff updater counts replies against
+        // `pendingOps` -- a duplicate would push it below zero and hang the
+        // cycle just as effectively as the stall being recovered from.
+        // (`trackResponse` has already dropped answered and superseded
+        // messages from `this.sent`, so this filter never sees a second
+        // still-open message for the same assetKey to begin with.)
+        shouldReplay(data) {
+            if ( data instanceof Object === false ) { return true; }
+            if ( this.protocol === 'updater' ) {
+                if ( data.what === 'update' ) {
+                    return typeof data.assetKey === 'string' &&
+                           this.open.has(data.assetKey);
+                }
+                return true;
+            }
+            if ( this.protocol === 'rpc' ) {
+                if ( typeof data.id === 'number' ) {
+                    return this.open.has(data.id);
+                }
+                return true;
+            }
+            return true;
+        }
+        replaceHostedWorker() {
+            this.disarmWatchdog();
+            // Computed while `this.open` still holds the unanswered round
+            // trips.
+            const replay = this.sent.filter(data => this.shouldReplay(data));
+            this.open.clear();
+            if ( this.hostedId !== 0 ) {
+                channel.postMessage({
+                    what: 'terminate',
+                    epoch: workerEpoch,
+                    id: this.hostedId,
+                });
+            }
+            this.newHostedId();
+            // Posts made while the replacement is being set up are held in
+            // the queue; they were tracked when posted, and are relayed
+            // after the replay below, in order.
+            this.queue = this.queue === null ? null : [];
+            whenOffscreenReady().then(( ) => {
+                if ( this.dead || workers.get(this.hostedId) !== this ) {
+                    return;
+                }
+                channel.postMessage({
+                    what: 'create',
+                    epoch: workerEpoch,
+                    id: this.hostedId,
+                    url: this.url,
+                });
+                const queue = this.queue;
+                this.queue = null;
+                for ( const data of replay ) {
+                    this.post(data);
+                    this.trackRequest(data);
+                }
+                if ( queue !== null ) {
+                    for ( const data of queue ) {
+                        this.post(data);
+                    }
+                }
+                this.armWatchdog();
+            }).catch(reason => {
+                this.giveUp(`cannot re-host worker ${this.url}: ${reason.message}`);
+            });
+        }
+        // The relay can no longer deliver. Fail loudly -- the failure is
+        // otherwise invisible, both consumers simply wait forever -- and,
+        // where the relayed traffic has revealed which of uBO's two worker
+        // protocols this worker speaks, synthesize the reply each one
+        // already handles as "give up", so the caller unwinds instead of
+        // hanging:
+        // - 'rpc' (`reverselookup.js`): `{ id, response }` with an
+        //   undefined response -- exactly what its own TTL timer resolves
+        //   pending lookups with when it reaps the worker.
+        // - 'updater' (`assets.js`): `{ what: 'broken' }` -- which makes
+        //   the diff updater terminate the worker, resolve its cycle, and
+        //   let the regular updater take over with full downloads.
+        giveUp(reason) {
+            if ( this.dead === false ) {
+                console.error(`uBO: worker relay for ${this.url}: ${reason}`);
+            }
+            // Capture before terminate(): it clears the open set and
+            // detaches the handlers.
+            const onmessage = this.onmessage;
+            // Nothing has been relayed yet, so the traffic could not reveal
+            // the protocol -- fall back to the worker script, which the
+            // shim knows because it is the one being asked to host it.
+            // Without this, a diff updater whose relay never came up would
+            // wait forever for the 'ready' it posts nothing before.
+            const protocol = this.protocol !== 'unknown'
+                ? this.protocol
+                : ( this.url.includes('diff-updater') ? 'updater' : 'unknown' );
+            const open = [ ...this.open ];
+            this.terminate();
+            // Keep the consumer's handler attached on this dead instance,
+            // so its later posts can still be answered with a give-up
+            // rather than silently dropped.
+            this.onmessage = onmessage;
+            if ( onmessage === null ) { return; }
+            if ( protocol === 'rpc' ) {
+                for ( const id of open ) {
+                    onmessage({ data: { id, response: undefined } });
+                }
+            } else if ( protocol === 'updater' ) {
+                onmessage({
+                    data: { what: 'broken', error: `uBO: ${reason}` },
+                });
+            }
+        }
+        // A consumer keeps its Worker object even after the relay died; its
+        // posts are answered with the same synthesized give-ups, so it
+        // unwinds instead of silently waiting.
+        deliverToDeadWorker(data) {
+            if ( data instanceof Object && typeof data.id === 'number' ) {
+                if ( this.onmessage !== null ) {
+                    this.onmessage({ data: { id: data.id, response: undefined } });
+                }
+                return;
+            }
+            if ( data instanceof Object && data.what === 'update' ) {
+                if ( this.onmessage !== null ) {
+                    this.onmessage({
+                        data: {
+                            what: 'broken',
+                            error: 'uBO: worker relay is down',
+                        },
+                    });
+                }
+                return;
+            }
         }
     };
 }
@@ -836,259 +1355,429 @@ const targetFromDetails = details => {
     return target;
 };
 
-// Read by `mv3-post.js`, which owns everything user-visible about this state.
-// Enabling the toggle takes effect immediately, so availability is deliberately
-// not a one-shot latch: it is re-probed on every keepalive tick, and `onChange`
-// fires whenever the answer flips.
-export const userScripts = { available: undefined, onChange: undefined };
-
-let userScriptsAvailable;
-
-// The probe below runs every 30s for as long as the toggle stays off. Say so
-// once per outage rather than once per probe, and re-arm when it clears so that
-// a later revocation is reported again.
-let userScriptsWarned = false;
-
-const canUserScripts = ( ) => {
-    if ( userScriptsAvailable !== undefined ) { return userScriptsAvailable; }
-    // The "Allow user scripts" toggle can be revoked while we are running, in
-    // which case the namespace stays defined but its methods throw. This is the
-    // availability check Chrome's own documentation recommends.
-    try {
-        chrome.userScripts.getScripts();
-        userScriptsAvailable = true;
-    } catch {
-        userScriptsAvailable = false;
-    }
-    userScripts.available = userScriptsAvailable;
-    if ( userScriptsAvailable ) {
-        userScriptsWarned = false;
-    } else if ( userScriptsWarned === false ) {
-        userScriptsWarned = true;
-        console.error(
-            'uBO: chrome.userScripts is unavailable, so scriptlet filters will not be injected. ' +
-            'Enable "Allow user scripts" on this extension\'s details page in chrome://extensions.'
-        );
-    }
-    return userScriptsAvailable;
-};
-
-// The toggle is per-extension and can be flipped at any time, but nothing tells
-// us when. Re-probe on the keepalive tick we already pay for rather than adding
-// a timer of its own: 30s is a long time to leave a stale badge up, but it is
-// the difference between "the user enabled it and the badge cleared" and "the
-// user enabled it and nothing visibly happened", which is the failure this is
-// here to avoid. A newly-granted toggle also needs its world configured before
-// the next injection, hence the middle clause.
-const recheckUserScripts = ( ) => {
-    const was = userScriptsAvailable;
-    userScriptsAvailable = undefined;
-    if ( canUserScripts() === was ) { return; }
-    if ( userScriptsAvailable ) {
-        userScriptWorldConfigured = undefined;
-        configureUserScriptWorld();
-    }
-    try {
-        userScripts.onChange?.();
-    } catch (reason) {
-        console.error(`uBO: userScripts.onChange: ${reason}`);
-    }
-};
-
-/******************************************************************************/
-
-// The `USER_SCRIPT` world has no `chrome.*` at all by default, which breaks
-// uBO's scriptlet->logger bridge: the relay that `src/js/scriptlet-filtering.js`
-// injects tests `self.vAPI && self.vAPI.messaging` and falls back to
-// `console.log` when it is absent, so scriptlet log lines end up in the page
-// console instead of uBO's logger.
+// Scriptlet injection under MV3 has to reproduce what MV2's scriptlets
+// observably did -- deliver on strict-CSP pages -- and live testing has now
+// mapped the whole mechanism. MV2 never injected into the page's MAIN world:
+// `chrome.tabs.executeScript({code})` ran the wrapper in that API's isolated
+// world, whose element insertions were *exempt from the page's CSP*. That is
+// the only world kind with the exemption, and the API is gone. On MV3:
+// - a `<script>` element created from a static content-script world is
+//   governed by the PAGE's CSP (blocked on `script-src 'self'` pages);
+// - a `<script>` element created from a `chrome.scripting` ISOLATED world is
+//   governed by that WORLD's own CSP, the extension's (no `unsafe-inline`:
+//   blocked);
+// - but the injected code itself -- func OR file, in ANY world -- always runs
+//   CSP-exempt. Only element creation and eval consult a CSP.
 //
-// `configureWorld({ messaging: true })` exposes `chrome.runtime.sendMessage` in
-// that world, which is enough to rebuild the one thing the relay asks for. This
-// is the same mechanism upstream's own MV3 build uses -- see
-// `platform/mv3/extension/js/background.js` -- and messages so sent arrive on
-// `chrome.runtime.onUserScriptMessage`, which `mv3-post.js` forwards into
-// `vAPI.messaging`.
+// So no element is created at all, and no code string is executed anywhere
+// (there is no API left for that: `chrome.userScripts` needs the per-
+// extension "Allow user scripts" toggle nothing can pre-grant, and `eval()`
+// is blocked in every world `chrome.scripting` can reach). Instead, the
+// scriptlet *functions* -- which are static, all of them registered in
+// `js/resources/scriptlets.js` -- ship as generated classic-script files,
+// and the dynamic part (which functions to call, with which arguments) is
+// handed to them out of band. The program `src/js/scriptlet-filtering.js`
+// assembles is demoted from code to data (`mv3-post.js` prefixes it with a
+// marker carrying the parsed calls for both worlds, the per-document
+// scriptlet globals, the filters that fired and the logger channel name --
+// see `./mv3-scriptlet-marker.js`), and `executeCode()` below performs, in
+// MV2's own order -- relay, wrapper, isolated injector -- what MV2's single
+// injection performed:
 //
-// A `USER_SCRIPT` world is never privileged: it runs on the page's origin, and
-// the code in it came from a filter list. `mv3-post.js` reflects that when it
-// forwards, so this grants scriptlets no more authority than the MV2 content
-// script relay had.
+// 1. `ISOLATED`, beside `contentscript.js`: one func which installs the
+//    scriptlet->logger relay -- MV2's `uBO_bcSecret` BroadcastChannel, which
+//    carries log lines from the scriptlets (in the page) to `vAPI.messaging`
+//    (which exists only here) -- applies MV2's once-per-document + hostname
+//    guards, records `self.uBO_scriptletsInjected` where its two readers
+//    (`src/js/contentscript.js`, `src/js/scriptlets/cosmetic-report.js`)
+//    look for it, and hands each world's launch record to its library (see
+//    step 2 for how). Its return value says whether this call won the right
+//    to inject.
+//
+// 2. The generated sharded libraries, injected as FILES (CSP-exempt, no
+//    elements, no eval). One `chrome.scripting` call per world that fired,
+//    with a files array computed from the launch record's function names
+//    through the `scriptletShards` manifest (generated at build time by
+//    tools/patch-mv3-modules.mjs): the world's "shared" file (the
+//    near-universal dependencies, which also parses the launch record onto
+//    the transient `self.uBO_mv3Lib` registry), then -- main world only,
+//    and only when a called scriptlet's dependency tree reaches for it --
+//    the "heavy" shared file (the dependencies few families need, JSONPath
+//    the largest of them), then every shard holding a called function,
+//    then the world's "launch" file. In that order:
+//    `files:` entries are injected in array order, and only the launch file
+//    executes calls -- after every shard has registered its functions -- so
+//    calls run in payload order, inside a single script evaluation, exactly
+//    as MV2's one payload IIFE ran them (no microtask checkpoint can
+//    interleave between calls). Both the sharding and the cross-file
+//    registry protocol are documented in the generator.
+//
+//    - `js/mv3-mainworld-*.js`, into `world: 'MAIN'` -- the shared file,
+//      shards and launcher for the main-world scriptlets. Every file is an
+//      IIFE, so the page's global object keeps nothing but the transient
+//      `uBO_mv3Lib` registry, which the launcher deletes. The launch record
+//      is written to the frame's DOM by the func above
+//      (`document.documentElement.dataset.uBOmv3Main`, a data attribute
+//      being the only state that crosses from the isolated world into the
+//      page -- each world has its own JS wrappers, so expando properties do
+//      not cross, the DOM does); the shared file reads it, the launcher
+//      deletes it.
+//    - `js/mv3-scriptlet-*.js`, into `world: 'ISOLATED'` -- same shape for
+//      the isolated-world scriptlets, launched from a stash the func leaves
+//      at `self.uBO_mv3IsolatedLaunch` (same world, so no DOM round trip is
+//      needed). This also retires the 38 persistent globals the first
+//      monolithic isolated-world library installed: the functions live in
+//      per-file IIFEs now, reachable only through the registry.
+//
+//    The two worlds' file injections run in parallel rather than in
+//    sequence. Cross-world ordering has no observable semantics here: each
+//    world is its own JS environment, the launch record is written by the
+//    func BEFORE either files call and is read only by the MAIN-world
+//    files, the stash is read only by the ISOLATED-world files, and no file
+//    of either world touches the other's state. (MV2's sequence existed
+//    only because both payloads were inserted by one synchronous
+//    injection; within each world the files-array order above preserves
+//    everything MV2's order carried.) Intra-world order is preserved by
+//    `chrome.scripting`'s documented in-order injection of `files:`.
+//
+// The one observable difference from MV2 is the transient data attribute,
+// which exists in the DOM for roughly one round trip before the MAIN-world
+// launcher consumes and deletes it; MV2's payload lived only inside a
+// synchronously-removed `<script>` element, which MutationObservers could
+// not capture. The transient registry is a strictly smaller surface: it
+// holds function references, no data. See docs/mv3-deployment.md.
 
-let userScriptWorldConfigured;
-
-const configureUserScriptWorld = ( ) => {
-    if ( userScriptWorldConfigured !== undefined ) {
-        return userScriptWorldConfigured;
-    }
-    userScriptWorldConfigured = (async ( ) => {
+// Passed to `chrome.scripting.executeScript({ func })`, which stringifies it
+// -- so it must stay free of references to anything in this module's scope.
+//
+// The relay half mirrors `onScriptletMessageInjector` in
+// `src/js/scriptlet-filtering.js`, the guards and markers mirror the
+// Chromium `vAPI.scriptletsInjector` wrapper, and the two launch records
+// stand in for the wrapper's element insertion and the isolated-world
+// injector that ran after it -- so the observable state and the message
+// handling behave exactly as they did under MV2. `name` is empty when the
+// logger is off; MV2 injected no relay in that case either. `mainCalls` and
+// `calls` carry uBOL-style interned arguments: their arg lists are index
+// arrays into `args`, and the libraries resolve them before invoking (the
+// encoding is chosen in `mv3-post.js`, see `internScriptletArgs` there).
+const prepareScriptletInjection = (
+    name, hostname, filters, isolatedOnly, mainCalls, args, globals, calls
+) => {
+    // Scriptlet -> logger relay. Idempotent, because a frame can be injected
+    // into more than once (uBO re-injects when the logger's level changes, for
+    // one). The handshake is order-proof: whichever side lands first, the
+    // payload buffers its log lines until it hears 'iamready!'.
+    if ( name !== '' && self.uBO_bcSecret === undefined ) {
         try {
-            await chrome.userScripts.configureWorld({ messaging: true });
-        } catch (reason) {
-            // Not fatal: scriptlets still inject, they just cannot reach the
-            // logger. Say so once rather than per injection.
-            console.error(`uBO: userScripts.configureWorld: ${reason}`);
+            const bcSecret = new self.BroadcastChannel(name);
+            bcSecret.onmessage = ev => {
+                const msg = ev.data;
+                switch ( typeof msg ) {
+                case 'string':
+                    if ( msg !== 'areyouready?' ) { break; }
+                    bcSecret.postMessage('iamready!');
+                    break;
+                case 'object':
+                    if ( self.vAPI && self.vAPI.messaging ) {
+                        self.vAPI.messaging.send('contentscript', msg);
+                    } else {
+                        console.log(`[uBO][${msg.type}]${msg.text}`);
+                    }
+                    break;
+                }
+            };
+            bcSecret.postMessage('iamready!');
+            self.uBO_bcSecret = bcSecret;
+        } catch {
         }
-    })();
-    return userScriptWorldConfigured;
+    }
+    // Once-per-document + hostname guards, and the markers they leave behind.
+    // A document with only isolated-world scriptlets never had
+    // `uBO_scriptletsInjected` set under MV2 -- `vAPI.scriptletsInjector` was
+    // not called for it, so the popup panel did not list those filters either
+    // -- so `uBO_isolatedScriptlets` stands in for the same purpose instead.
+    // When both worlds fired, MV2 left both markers; so does this.
+    if ( isolatedOnly === true ) {
+        if ( self.uBO_isolatedScriptlets === 'done' ) { return false; }
+    } else if ( self.uBO_scriptletsInjected !== undefined ) {
+        return false;
+    }
+    const doc = document;
+    const loc = doc.location;
+    if ( loc === null ) { return false; }
+    if ( loc.hostname !== '' && loc.hostname !== hostname ) { return false; }
+    // The wrapper's half: the main-world launch record. Written into the
+    // frame's DOM -- DOM writes from the isolated world are unrestricted,
+    // and the attribute is the only channel that crosses into the page.
+    // Consumed and removed by the MAIN-world library files, which
+    // chrome.scripting injects as a file: file-class injection is
+    // CSP-exempt, which is what makes scriptlets deliver on strict-CSP
+    // pages exactly as MV2 delivered them. Skipped wholesale when there are
+    // no main-world calls.
+    if ( isolatedOnly !== true && Array.isArray(mainCalls) && mainCalls.length !== 0 ) {
+        const root = doc.documentElement;
+        if ( root === null ) { return false; }
+        // SECURITY (LOW): `globals` is the per-document scriptletGlobals --
+        // warOrigin, warSecret, and (logger on) bcSecret -- so this attribute
+        // is a page-readable copy of warSecret from here until the MAIN-world
+        // launcher deletes it. warSecret authorizes /web_accessible_resources,
+        // so a page reading it inside the window could pull uBO's WARs or forge
+        // log lines. The launcher removes it first thing, but runs LAST in the
+        // MAIN-world file chain (shared -> shards -> launch), so the window
+        // spans those injections rather than a single round trip. Narrowing it
+        // to the shared file's read (which parses the record immediately) is a
+        // generator change (tools/patch-mv3-modules.mjs) and out of scope here.
+        root.dataset.uBOmv3Main = JSON.stringify({ globals, args, calls: mainCalls });
+        self.uBO_scriptletsInjected = filters;
+    } else if ( isolatedOnly === true ) {
+        self.uBO_isolatedScriptlets = 'done';
+    }
+    // The isolated-world injector's half: stash the calls for the library
+    // file to consume. MV2 ran that injector after the wrapper in the same
+    // program; the stash is its stand-in. Same world, so no DOM record is
+    // needed.
+    if ( Array.isArray(calls) && calls.length !== 0 ) {
+        self.uBO_isolatedScriptlets = 'done';
+        self.uBO_mv3IsolatedLaunch = { globals, args, calls };
+    }
+    return true;
 };
 
-// Warm it during service worker startup rather than on the first injection.
-// Scriptlets inject at `document_start`, racing the page's own scripts, and only
-// the first injection of each worker lifetime would otherwise pay for this round
-// trip -- which under MV3 means once per respawn, not once per browser launch.
-// It also surfaces the "Allow user scripts" warning in the worker's console
-// immediately, instead of only after the first page with scriptlet filters.
-if ( canUserScripts() ) {
-    configureUserScriptWorld();
-}
-
-// Prepended to every code injection into the `USER_SCRIPT` world. Idempotent,
-// because a frame can be injected into more than once (uBO re-injects when the
-// logger's level changes, for one). Deliberately minimal: `send()` is the only
-// member of `vAPI.messaging` the injected relay touches, and the relay ignores
-// the return value -- hence the `catch`, since `sendMessage()` rejects when the
-// service worker is momentarily gone and an ignored rejection would surface as
-// noise in the page's console.
-const USER_SCRIPT_WORLD_PREAMBLE = [
-    'if ( self.vAPI instanceof Object === false ) { self.vAPI = {}; }',
-    'if ( self.vAPI.messaging instanceof Object === false ) {',
-    '    self.vAPI.messaging = {',
-    '        send: function(channel, msg) {',
-    '            try {',
-    '                return self.chrome.runtime.sendMessage({ channel, msg })',
-    '                    .catch(( ) => {});',
-    '            } catch {',
-    '                return Promise.resolve();',
-    '            }',
-    '        },',
-    '    };',
-    '}',
-].join('\n');
-
-/******************************************************************************/
-
-// Scriptlet injection has to straddle two worlds under MV3, and one bit of
-// state has to straddle with it.
+// Scriptlet code arrives as a string carrying a marker; both are data, and
+// only the func and the generated library files above ever execute.
 //
-// `platform/common/vapi-background.js` leaves `vAPI.scriptletsInjector` for
-// platform code to define, and its Chromium implementation returns a wrapper
-// which does two things: it inserts the main-world scriptlet payload as a
-// `<script>` element, and it records the filters that fired in
-// `self.uBO_scriptletsInjected`. Under MV2 that wrapper ran in the same isolated
-// world as `contentscript.js`, so two readers could see the marker:
-// `src/js/contentscript.js` (to tell the background it already has scriptlets)
-// and `src/js/scriptlets/cosmetic-report.js` (to list scriptlet filters in the
-// popup's "extended" section).
-//
-// Under MV3 the wrapper is a code string, so only `chrome.userScripts` can
-// inject it, and its only non-`MAIN` world is `USER_SCRIPT`. The `<script>`
-// insertion is unaffected -- any world with DOM access can do it -- but the
-// marker now lands somewhere neither reader can see.
-//
-// So `mv3-post.js` wraps `vAPI.scriptletsInjector` to prefix its output with the
-// filters, and `executeCode()` below peels that off and replays the marker into
-// the `ISOLATED` world through `chrome.scripting.executeScript({ func, args })` --
-// which needs no code string, and therefore no `userScripts`. Both worlds then
-// see what MV2's single world saw. `./mv3-scriptlet-marker.js` holds the wire
-// format both ends share.
-
-// Mirrors the guards in the Chromium `vAPI.scriptletsInjector` wrapper, so that
-// the marker appears in the `ISOLATED` world under the same conditions it
-// appears in the `USER_SCRIPT` one: once per document, and only if the document
-// still is where the payload was computed for.
-//
-// Passed to `chrome.scripting.executeScript({ func })`, which stringifies it --
-// so it must stay free of references to anything in this module's scope.
-const markScriptletsInjected = (hostname, filters) => {
-    if ( self.uBO_scriptletsInjected !== undefined ) { return; }
-    const loc = document.location;
-    if ( loc === null ) { return; }
-    if ( loc.hostname !== '' && loc.hostname !== hostname ) { return; }
-    self.uBO_scriptletsInjected = filters;
+// Compute the files array for one world's library injection: the shared
+// file first, the shards holding called functions in name order, and the
+// launcher last (files are injected in array order, and the launcher must
+// run after every shard has registered its functions). Returns `undefined`
+// when a called function cannot be located -- in which case the whole
+// world's call set is dropped rather than running a partial one, the same
+// all-or-nothing rule `parseScriptletCalls()` in `mv3-post.js` applies to
+// the payload itself. `tools/verify-mv3-package.mjs` pins the manifest
+// against the resource table, so this should be unreachable; the error is
+// loud precisely so that it is not silently unreachable.
+const libraryFilesFor = (world, calls) => {
+    const spec = scriptletShards instanceof Object
+        ? scriptletShards[world]
+        : undefined;
+    if (
+        spec instanceof Object === false ||
+        typeof spec.shared !== 'string' ||
+        typeof spec.launch !== 'string' ||
+        spec.fns instanceof Object === false
+    ) {
+        console.error(
+            `uBO: the scriptlet shard manifest has no usable "${world}" ` +
+            `section, so no ${world}-world scriptlet injection is possible. ` +
+            `See tools/patch-mv3-modules.mjs.`
+        );
+        return undefined;
+    }
+    const shardFiles = new Set();
+    for ( const call of calls ) {
+        const file = spec.fns[call[0]];
+        if ( typeof file !== 'string' ) {
+            console.error(
+                `uBO: scriptlet function "${call[0]}" is not in the ` +
+                `"${world}" shard manifest; dropping the whole call set ` +
+                `rather than running a partial one. See ` +
+                `tools/patch-mv3-modules.mjs.`
+            );
+            return undefined;
+        }
+        if ( file !== spec.shared && file !== spec.launch ) {
+            shardFiles.add(file);
+        }
+    }
+    const files = [ spec.shared ];
+    // The heavy half of the shared set is paid for only by navigations
+    // whose called scriptlets (transitively) need something from it; the
+    // manifest's neededBy list is exactly that root set, computed by the
+    // generator from each root's dependency tree.
+    const heavy = spec.heavy;
+    if (
+        heavy instanceof Object &&
+        typeof heavy.file === 'string' &&
+        Array.isArray(heavy.neededBy) &&
+        calls.some(call => heavy.neededBy.includes(call[0]))
+    ) {
+        files.push(heavy.file);
+    }
+    for ( const file of [ ...shardFiles ].sort() ) {
+        if ( files.includes(file) === false ) { files.push(file); }
+    }
+    files.push(spec.launch);
+    return files;
 };
 
-/******************************************************************************/
+// Per-frame injection failures are routine and self-correcting -- a frame
+// navigated away or closed mid-injection, a restricted URL, a race with tab
+// teardown -- so the executeScript calls below fall back rather than reject.
+// But a genuine misconfiguration (a missing host permission, a bad library
+// path) fails through the same catch, and swallowing it silently makes that
+// indistinguishable from the benign case. Surface the reason, rate-limited to
+// once a minute, so a persistent fault is diagnosable without flooding the
+// console on a busy page.
+let lastInjectionErrorAt = 0;
+const logInjectionError = (where, reason) => {
+    const now = Date.now();
+    if ( now - lastInjectionErrorAt < 60000 ) { return; }
+    lastInjectionErrorAt = now;
+    console.error(`uBO: scriptlet injection failed (${where}): ${reason}`);
+};
 
-// Scriptlet code is assembled as a string, which only `userScripts` can inject.
 const executeCode = async details => {
     const target = targetFromDetails(details);
     const injectImmediately = details.runAt === 'document_start';
 
-    let code = details.code;
     let marker;
     try {
-        const decoded = decodeScriptletMarker(code);
-        code = decoded.code;
-        marker = decoded.details;
+        marker = decodeScriptletMarker(details.code).details;
     } catch (reason) {
         console.error(`uBO: scriptlet filters marker: ${reason}`);
     }
-
-    if ( canUserScripts() === false ) { return []; }
-    await configureUserScriptWorld();
-    const results = await chrome.userScripts.execute({
-        js: [ { code: `${USER_SCRIPT_WORLD_PREAMBLE}\n${code}` } ],
-        target,
-        injectImmediately,
-        world: 'USER_SCRIPT',
-    });
-
-    // Replay the `self.uBO_scriptletsInjected` marker into the ISOLATED world --
-    // but only now, having got this far, so that the marker means the same thing
-    // it meant under MV2: the wrapper ran.
-    //
-    // Ordering matters more than it looks. `src/js/messaging.js` treats
-    // `needScriptlets` (which is derived from this marker) as "nothing has been
-    // injected here yet", and for non-network URIs -- `about:blank`, `data:`,
-    // extension pages -- that message is the *only* path which injects at all.
-    // Setting the marker on a failed injection, or before one, would therefore
-    // not merely mislead the popup panel: it would silently drop scriptlets in
-    // those frames. Hence after the await, and hence not at all when
-    // `userScripts` is unavailable.
-    //
-    // Fire-and-forget from here: its two readers run later, and making the
-    // scriptlets wait on bookkeeping would be the wrong trade.
-    //
-    // The `Array.isArray` guard is not paranoia about a value uBO always
-    // supplies -- it is about what happens if it ever does not. `executeScript`
-    // serializes args as JSON, so an absent `filters` would arrive as `null`,
-    // which is `!== undefined` and so counts as a set marker; then
-    // `cosmetic-report.js` does `matchedSelectors.push(...null)` and throws,
-    // taking the popup's cosmetic report with it. Skipping the marker instead
-    // degrades to the pre-fix behaviour, which is merely wasteful.
-    if ( Array.isArray(marker?.filters) ) {
-        chrome.scripting.executeScript({
-            target,
-            injectImmediately,
-            world: 'ISOLATED',
-            func: markScriptletsInjected,
-            args: [ marker.hostname, marker.filters ],
-        }).catch(( ) => {});
-    } else if ( marker !== undefined ) {
-        console.error(
-            `uBO: scriptlet filters marker carried no filter array: ${JSON.stringify(marker)}`
-        );
+    if ( marker === undefined ) {
+        // With `mv3-post.js` in place, every scriptlet injection carries a
+        // marker, including documents where only isolated-world scriptlets
+        // fired. Anything else is not a scriptlet injection, and there is no
+        // code-string API left to run it with -- so refuse rather than guess.
+        console.error('uBO: code injection without a scriptlet marker was not injected');
+        return [];
     }
 
-    return results;
+    // The `filters` guard is not paranoia about a value uBO always supplies --
+    // it is about what happens if it ever does not. `executeScript` serializes
+    // args as JSON, so an absent `filters` would arrive as `null`, which is
+    // `!== undefined` and so counts as a set marker; then
+    // `cosmetic-report.js` does `matchedSelectors.push(...null)` and throws,
+    // taking the popup's cosmetic report with it. An empty array degrades to
+    // a harmless "no scriptlet filters to report".
+    let filters = [];
+    if ( Array.isArray(marker.filters) ) {
+        filters = marker.filters;
+    } else {
+        console.error(
+            `uBO: scriptlet filters marker carried no filter array: ${JSON.stringify(marker.filters)}`
+        );
+    }
+    const calls = Array.isArray(marker.isolatedCalls)
+        ? marker.isolatedCalls
+        : [];
+    const mainCalls = Array.isArray(marker.mainCalls)
+        ? marker.mainCalls
+        : [];
+    // The interned-argument table both call sets index into (see
+    // `internScriptletArgs` in mv3-post.js). Consumers resolve indices
+    // before invoking.
+    const args = Array.isArray(marker.args)
+        ? marker.args
+        : [];
+    const globals = marker.scriptletGlobals instanceof Object
+        ? marker.scriptletGlobals
+        : {};
+    if ( mainCalls.length === 0 && calls.length === 0 ) { return []; }
+
+    // One func does everything MV2's single injection did, in its order:
+    // relay, guards, the markers, the DOM launch record for the MAIN-world
+    // library and the stash for the isolated-world one. Its return value
+    // says which frames won the right to inject -- `src/js/messaging.js`
+    // treats `needScriptlets` (derived from `uBO_scriptletsInjected`) as
+    // "nothing has been injected here yet", and for non-network URIs that
+    // message is the *only* path which injects at all, so the marker must
+    // never land in a frame whose injection then did not happen.
+    // First of two chrome.scripting round trips: this func runs (guards,
+    // markers, the DOM launch record), we await its result, then the library
+    // files inject below. MV2 did both in one synchronous injection; MV3 has
+    // no single call that runs a decision func AND conditionally injects files
+    // from its result, so the split -- and the small window between the two --
+    // is an accepted limitation, not a bug to collapse. See the design note
+    // above.
+    const prepared = await chrome.scripting.executeScript({
+        target,
+        injectImmediately,
+        world: 'ISOLATED',
+        func: prepareScriptletInjection,
+        args: [
+            typeof marker.bcSecret === 'string' ? marker.bcSecret : '',
+            typeof marker.hostname === 'string' ? marker.hostname : '',
+            filters,
+            marker.isolatedOnly === true,
+            mainCalls,
+            args,
+            globals,
+            calls,
+        ],
+    }).catch(reason => { logInjectionError('prepare', reason); return []; });
+    const frameIds = [];
+    if ( Array.isArray(prepared) ) {
+        for ( const result of prepared ) {
+            if ( result?.result !== true ) { continue; }
+            if ( typeof result.frameId !== 'number' ) { continue; }
+            frameIds.push(result.frameId);
+        }
+    }
+    if ( frameIds.length === 0 ) { return prepared; }
+    const libraryTarget = { tabId: target.tabId, frameIds };
+
+    // The sharded library files are extension-injected, so they run
+    // CSP-exempt in their worlds -- no `<script>` element is ever created,
+    // which is the whole point: every world MV3 offers governs elements
+    // with some CSP, and MV2's element exemption died with
+    // tabs.executeScript. Only the shards holding a called function are
+    // injected (plus the always-needed shared file and the launcher), so a
+    // typical 1-3-scriptlet navigation delivers a fraction of the whole
+    // library instead of all of it.
+    const injections = [ ];
+    if ( mainCalls.length !== 0 ) {
+        const files = libraryFilesFor('main', mainCalls);
+        if ( files !== undefined ) {
+            injections.push(chrome.scripting.executeScript({
+                target: libraryTarget,
+                injectImmediately,
+                world: 'MAIN',
+                files,
+            }).catch(reason => {
+                logInjectionError('main-world library', reason);
+                return null;
+            }));
+        }
+    }
+    if ( calls.length !== 0 ) {
+        const files = libraryFilesFor('isolated', calls);
+        if ( files !== undefined ) {
+            injections.push(chrome.scripting.executeScript({
+                target: libraryTarget,
+                injectImmediately,
+                world: 'ISOLATED',
+                files,
+            }).catch(reason => {
+                logInjectionError('isolated-world library', reason);
+                return null;
+            }));
+        }
+    }
+    if ( injections.length === 0 ) { return prepared; }
+    // The two worlds are injected in parallel -- see the design comment
+    // above for why cross-world ordering carries no observable semantics.
+    // The return value keeps the old shape: the results of the LAST world
+    // that fired and succeeded (the isolated-world one when both did),
+    // falling back to `prepared`.
+    const results = await Promise.all(injections);
+    let lastResults = prepared;
+    for ( const result of results ) {
+        if ( result !== null ) { lastResults = result; }
+    }
+    return lastResults;
 };
 
 const executeFile = async details => {
     // uBO passes both `/js/foo.js` and `js/foo.js`; MV2 accepted either.
-    // `chrome.scripting` and `chrome.userScripts` both document paths as
-    // relative to the extension root, so normalize to that form.
+    // `chrome.scripting` documents paths as relative to the extension root,
+    // so normalize to that form. Everything runs in the `ISOLATED` world,
+    // alongside `contentscript.js` -- the cross-world state the scriptlet
+    // helpers read (`uBO_bcSecret`, `uBO_scriptletsInjected`) is written
+    // there by `prepareScriptletInjection` above.
     const file = details.file.replace(/^\/+/, '');
-    if ( reUserScriptWorldFiles.test(`/${file}`) ) {
-        if ( canUserScripts() === false ) { return []; }
-        await configureUserScriptWorld();
-        return chrome.userScripts.execute({
-            js: [ { file } ],
-            target: targetFromDetails(details),
-            injectImmediately: details.runAt === 'document_start',
-            world: 'USER_SCRIPT',
-        });
-    }
     return chrome.scripting.executeScript({
         files: [ file ],
         target: targetFromDetails(details),

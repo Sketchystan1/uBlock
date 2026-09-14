@@ -24,10 +24,10 @@
 
     Apply MV3 fix-ups to the built package that can only be made to the output.
 
-    Two transforms, both against the BUILD OUTPUT and never the source tree: the
-    port must not modify a single upstream file, so that the unattended merge from
-    upstream can never conflict. Transforming the copy is the same approach the
-    port already takes for the manifest.
+    Five transforms, all against the BUILD OUTPUT and never the source tree:
+    the port must not modify a single upstream file, so that the unattended
+    merge from upstream can never conflict. Transforming the copy is the same
+    approach the port already takes for the manifest.
 
     1. Rewrite dynamic `import()` in the service worker's module graph.
 
@@ -54,12 +54,72 @@
     read throws and aborts the module graph of every page importing webext.js. See
     the injection site below for the full explanation.
 
+    3. Generate the sharded scriptlet libraries: per world, one "shared" file
+       (the near-universal dependencies, always injected when any call of
+       that world fires), a small number of "shard" files holding the
+       callable scriptlets plus their cluster-local dependencies, and one
+       "launch" file which dispatches every call in payload order. Plus
+       the manifest module `js/mv3-scriptlet-shards.js` mapping every
+       function name to its file.
+
+    No MV3 API executes a code string in either world: `eval()` inside
+    anything `chrome.scripting` injects is blocked by that world's CSP,
+    and a `<script>` element created by extension code is blocked too --
+    by the page's CSP from the MAIN world, by the world's own (extension)
+    CSP from the scripting API's ISOLATED world. The one CSP exemption
+    MV2 enjoyed, for elements created by `chrome.tabs.executeScript`'s
+    isolated world, died with that API. What extension injection DOES
+    still guarantee is that the injected code itself -- func or file,
+    any world -- runs CSP-exempt. So the scriptlet *functions*, which are
+    static (they all live in `src/js/resources/`, registered in
+    `js/resources/scriptlets.js`'s `builtinScriptlets`), are shipped as
+    classic-script files and the dynamic part -- which functions to call,
+    with which arguments -- is handed to them out of band. This transform
+    imports the resources module here in Node, takes the transitive
+    closure of each world's scriptlet set over their declared
+    dependencies *and* their bare-name references to one another, and
+    emits each function's source verbatim. See the generator below for
+    how the functions are split across files and why.
+
+    4. Expose the strict-block bypass deadline map on the exported webRequest
+    object in `js/traffic.js`.
+
+    `strictBlockBypasser` is module-private in `src/js/traffic.js`; only its
+    `bypass()` method is exported (as `webRequest.strictBlockBypass`). The map of
+    "proceed anyway" deadlines lives in the service worker's memory and dies with
+    it, which MV3 does often. `platform/chromium-mv3/mv3-post.js` persists it to
+    `storage.session` and restores it after boot -- for which it needs a reference
+    to the live Map. One property is added to the object literal; the anchor and
+    the result are pinned by `tools/verify-mv3-package.mjs`.
+
+    5. Point the WASM LZ4 codec at the package root.
+
+    `lib/lz4/lz4-block-codec-wasm.js` locates its `.wasm` module relative to
+    `document.currentScript.src`, which does not exist in a service worker. The
+    build replaces that directory-deriving IIFE with a package-root-relative
+    constant, resolved by `platform/chromium-mv3/mv3-shims.js`'s fetch() wrapper.
+    This is what makes the WASM LZ4 flavor -- opted into with 'wasm-unsafe-eval'
+    in platform/chromium-mv3/manifest.overlay.json -- reachable at all. See the
+    injection site below for the full rationale.
+
     Usage: node tools/patch-mv3-modules.mjs [--dir <package-dir>]
 
 **/
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+/******************************************************************************/
+
+// Escape a string for literal use inside a RegExp. Several patterns below
+// interpolate resource-derived function names; `$` is legal in a JS identifier
+// but is a RegExp metacharacter, so an unescaped name like `foo$bar` would
+// silently fail to match -- a missed dependency/reference edge, which would
+// violate the "can only over-include" invariant this file relies on.
+function escapeRe(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 /******************************************************************************/
 
@@ -239,6 +299,930 @@ for ( const rel of conflicts ) {
         `have mv3-post.js patch the specific function.`
     );
 }
+
+/******************************************************************************/
+/******************************************************************************/
+
+// Expose the strict-block bypass deadline map on the exported webRequest
+// object. See the header comment (transform 4) for the full rationale; the
+// anchor is the object literal's tail in js/traffic.js, so any drift in it
+// fails the build rather than silently shipping a `strictBlockBypassMap` the
+// restore code cannot use (mv3-post.js also complains loudly at runtime).
+
+{
+    const rel = 'js/traffic.js';
+    const abs = path.join(pkgDir, rel);
+    const marker = 'uBO MV3 strict-block bypass map exposure';
+    // The upstream source may use either line ending (and has used CRLF);
+    // build the anchor and the replacement with the file's own.
+    const lines = [
+        '    strictBlockBypass: hostname => {',
+        '        strictBlockBypasser.bypass(hostname);',
+        '    },',
+        '};',
+    ];
+    const replacementLines = [
+        '    strictBlockBypass: hostname => {',
+        '        strictBlockBypasser.bypass(hostname);',
+        '    },',
+        '',
+        `    // [${marker}] The deadline map is module-private; expose the live`,
+        '    // Map so platform/chromium-mv3/mv3-post.js can persist it to',
+        '    // storage.session and restore it after a service worker restart.',
+        '    strictBlockBypassMap: strictBlockBypasser.hostnameToDeadlineMap,',
+        '};',
+    ];
+
+    if ( swGraph.has(rel) === false ) {
+        console.error(
+            `*** patch-mv3-modules: ${rel} is not reachable from js/sw.js; ` +
+            `cannot expose the strict-block bypass map`
+        );
+        process.exit(1);
+    } else if ( fs.existsSync(abs) === false ) {
+        console.error(
+            `*** patch-mv3-modules: ${rel} missing; cannot expose the ` +
+            `strict-block bypass map`
+        );
+        process.exit(1);
+    } else {
+        const src = fs.readFileSync(abs, 'utf8');
+        if ( src.includes(marker) ) {
+            console.log(`*** patch-mv3-modules: ${rel} already exposes the strict-block bypass map`);
+        } else {
+            const eol = src.includes('\r\n') ? '\r\n' : '\n';
+            const anchor = lines.join(eol);
+            const replacement = replacementLines.join(eol);
+            const count = src.split(anchor).length - 1;
+            if ( count !== 1 ) {
+                console.error(
+                    `*** patch-mv3-modules: ${rel} contains ${count} ` +
+                    `occurrence(s) of the expected strictBlockBypass tail of ` +
+                    `the webRequest object literal (expected exactly 1):\n` +
+                    `${lines.join(eol)}\n` +
+                    `    Reconcile tools/patch-mv3-modules.mjs with the new ` +
+                    `upstream shape (and platform/chromium-mv3/mv3-post.js, ` +
+                    `which reads webRequest.strictBlockBypassMap).`
+                );
+                process.exit(1);
+            }
+            fs.writeFileSync(abs, src.replace(anchor, () => replacement));
+            console.log(
+                `*** patch-mv3-modules: ${rel} exposes ` +
+                `webRequest.strictBlockBypassMap`
+            );
+        }
+    }
+}
+
+/******************************************************************************/
+/******************************************************************************/
+
+// Point lib/lz4/lz4-block-codec-wasm.js at the package root.
+//
+// The WASM flavor of the LZ4 codec locates its .wasm module relative to its
+// own script URL through `document.currentScript.src` -- a concept that does
+// not exist in a service worker (the shims' `document` stand-in has no
+// `currentScript`, so the module would throw at evaluation time). The file
+// is only ever imported by `js/mv3-shims.js` in this build (no extension
+// page loads it), so replace the whole directory-deriving IIFE with a
+// package-root-relative constant: the shims' fetch() wrapper resolves
+// relative URLs against the package root, which lands on
+// `lib/lz4/lz4-block-codec.wasm` exactly as `wd` would have computed it.
+//
+// This is what makes the WASM flavor reachable at all, which matters because
+// the MV3 manifest opts into 'wasm-unsafe-eval' (see
+// platform/chromium-mv3/manifest.overlay.json) and `src/js/lz4.js` asks for
+// the default flavor -- WASM first, JS on failure -- whenever
+// `vAPI.canWASM` is true. The rewrite is asserted by
+// tools/verify-mv3-package.mjs so an upstream change to the anchor fails the
+// build instead of silently disabling WASM-flavored selfie decompression.
+{
+    const rel = 'lib/lz4/lz4-block-codec-wasm.js';
+    const abs = path.join(pkgDir, rel);
+    const marker = 'uBO MV3 service-worker wasm path';
+    if ( fs.existsSync(abs) === false ) {
+        console.error(
+            `*** patch-mv3-modules: ${rel} missing; cannot make the WASM ` +
+            `LZ4 codec service-worker-safe`
+        );
+        process.exit(1);
+    }
+    const src = fs.readFileSync(abs, 'utf8');
+    const eol = src.includes('\r\n') ? '\r\n' : '\n';
+    const anchor = [
+        'const wd = (function() {',
+        "    let url = document.currentScript.src;",
+        '    let match = /[^\\/]+$/.exec(url);',
+        '    return match !== null ?',
+        '        url.slice(0, match.index) :',
+        "        '';",
+        '})();',
+    ].join(eol);
+    const replacement = [
+        `// [${marker}] A service worker has no document.currentScript; the`,
+        '// build replaces the directory-deriving IIFE with a package-root-',
+        "// relative path, which platform/chromium-mv3/mv3-shims.js's fetch()",
+        '// wrapper resolves against the extension origin.',
+        "const wd = 'lib/lz4/';",
+    ].join(eol);
+    if ( src.includes(marker) ) {
+        console.log(`*** patch-mv3-modules: ${rel} already has the service-worker wasm path`);
+    } else {
+        const count = src.split(anchor).length - 1;
+        if ( count !== 1 ) {
+            console.error(
+                `*** patch-mv3-modules: ${rel} contains ${count} ` +
+                `occurrence(s) of the expected document.currentScript-based ` +
+                `wd initializer (expected exactly 1):\n${anchor}\n` +
+                `    Reconcile tools/patch-mv3-modules.mjs with the new ` +
+                `upstream shape -- without the rewrite, importing the WASM ` +
+                `codec from mv3-shims.js would throw at module evaluation.`
+            );
+            process.exit(1);
+        }
+        fs.writeFileSync(abs, src.replace(anchor, () => replacement));
+        console.log(
+            `*** patch-mv3-modules: ${rel} resolves its wasm module ` +
+            `through the package root`
+        );
+    }
+}
+
+/******************************************************************************/
+/******************************************************************************/
+
+// Generate the sharded scriptlet libraries. See the header comment (transform
+// 3) for the CSP rationale; what follows decides how the functions are split
+// across files, which is a performance decision with correctness constraints.
+//
+// The cost being optimized is the bytes injected per scriptlet-bearing
+// navigation. MV2 assembled one small payload per navigation (1-20 KB); a
+// single per-world library file instead makes every navigation inject the
+// whole of it (213 KB for MAIN, 57 KB more for ISOLATED when both worlds
+// fired). The fix is to split each library into an always-injected "shared"
+// file plus per-cluster "shard" files, and have `mv3-shims.js` inject only
+// the shards holding the called functions -- computed from the launch
+// record's function names, in one `chrome.scripting` call per world.
+//
+// The correctness constraints, each of which shaped the design:
+//
+// - Scriptlet sources reference their dependencies by bare name. A bare name
+//   resolves only through the defining closure (same file) or the world's
+//   global object. Globals were rejected: in the MAIN world they would be
+//   page-visible AND page-redefinable (a page could neuter deferred scriptlet
+//   calls by overwriting `window.proxyApplyFn` after the injection -- MV2's
+//   closure scoping was immune, and so is this). So every reference must
+//   resolve within the file that contains it: each shard is closed under the
+//   functions it needs, and the ones it needs from elsewhere are
+//   destructured out of the injection-time registry (see below), capturing
+//   the function at evaluation time -- tamper-proof afterwards.
+//
+// - `safeSelf()` (and a few other sources) read the per-document
+//   `scriptletGlobals` as a bare identifier -- under MV2 it was a closure
+//   `const` at the top of the payload IIFE. It must therefore be a closure
+//   variable of every file whose sources read it; a page-visible global of
+//   that generic name was rejected (page collision, and it would carry the
+//   logger secret). Every generated file declares its own
+//   `const scriptletGlobals` from the launch record.
+//
+// - Functions that keep state on themselves (`safeSelf.safe`,
+//   `proxyApplyFn.proxies`, `trapPropertyFn.db`, ...) must exist exactly
+//   once per world, or two copies would each install their own
+//   `Function.prototype.toString` proxy / WeakMap and the earlier copy's
+//   registrations would be silently dropped. The generator detects
+//   self-referential state and forces any such function needed by more than
+//   one shard into the shared file.
+//
+// - Calls must run in payload order, and -- as under MV2, where the whole
+//   payload was one synchronous script evaluation -- with no microtask
+//   checkpoint between them (a page's MutationObserver could otherwise
+//   observe intermediate states MV2 never showed). Only the launch file
+//   executes calls, in one evaluation, after every other file has run.
+//
+// The resulting file set per world, injected in this order by ONE
+// `chrome.scripting` call:
+//
+//   1. the shared file -- an IIFE which parses the launch record (MAIN: the
+//      DOM data attribute the ISOLATED guard func wrote; ISOLATED: the
+//      `self.uBO_mv3IsolatedLaunch` stash), stashes it on the transient
+//      `self.uBO_mv3Lib` registry, declares `scriptletGlobals`, defines the
+//      shared functions and registers them on the registry;
+//   2. zero or more shard files -- IIFEs which destructure the shared
+//      functions they need out of the registry, declare `scriptletGlobals`,
+//      define their scriptlets and cluster-local dependencies, and register
+//      their functions on the registry;
+//   3. the launch file -- an IIFE which consumes the launch record,
+//      dispatches every call in payload order through the registry (each in
+//      the same silent try/catch the assembled payload used, resolving the
+//      interned-argument indices), then deletes the registry and the launch
+//      record. Deferred scriptlet callbacks keep working: they hold direct
+//      references captured at evaluation time.
+//
+// `self.uBO_mv3Lib` is the one transient cross-file channel -- function
+// references cannot cross files any other way without globals. It exists for
+// the duration of the injection and is deleted by the launch file; the
+// page-observable surface it adds is strictly smaller than that of the
+// launch-record data attribute, which already exists for one round trip (the
+// registry holds no data, only function references).
+//
+// The layout algorithm is deterministic -- roots are processed in name
+// order, every derived set is built from sorted iteration, and the loop
+// count is fixed -- so the same resource table always yields the same
+// layout:
+//
+// - The "tree" of a callable scriptlet is the transitive closure over its
+//   declared `dependencies` plus any bare-name references to other known
+//   functions found in its source (upstream has undeclared references; the
+//   regex over-approximates, which can only pull a function into a shard
+//   that did not strictly need it).
+// - Roots are packed into shards in name order -- alphabetical order keeps
+//   same-family scriptlets (json-*, prevent-*, set-*) together, so a
+//   navigation's scriptlets usually land in one shard -- splitting whenever
+//   a shard's non-shared content reaches the byte target.
+// - A function needed by several shards either goes into the shared file
+//   (paid by every navigation, once) or is duplicated into each shard that
+//   needs it (paid only by those navigations, once per shard). Functions
+//   needed by many shards, or carrying self-referential state, are shared;
+//   the rest are duplicated. Sharing must be closed under dependencies and
+//   references -- a shared function's own references must resolve in the
+//   shared file -- and because a function referenced from everywhere is
+//   itself needed everywhere, that closure never pulls a cluster-local
+//   function in by surprise.
+// - Packing and sharing are interdependent (sharing shrinks shards), so the
+//   two run together to a fixed point over a bounded number of rounds.
+//
+// The byte targets below were tuned against the current resource table (129
+// MAIN functions / 208 KB, 38 ISOLATED / 54 KB) so that a typical 1-3
+// scriptlet navigation injects well under 100 KB per world; the
+// per-navigation worst case is bounded by the total size of all of a
+// world's files, and tools/verify-mv3-package.mjs asserts budget ceilings
+// so upstream growth fails the build rather than silently regressing the
+// delivery cost.
+
+// Tuning constants. Byte targets are per shard, excluding shared content.
+const SCRIPTLET_SHARDING = {
+    ISOLATED: {
+        worldKey: 'isolated',
+        label: 'isolated-world',
+        targetBytes: 9 * 1024,
+        shareMinShards: 5,
+        shared: 'js/mv3-scriptlet-shared.js',
+        shardPrefix: 'js/mv3-scriptlet-library-',
+        launch: 'js/mv3-scriptlet-launch.js',
+        // The isolated-world shared file is small enough that splitting it
+        // would trade a file injection for a few KB; leave it whole.
+        splitShared: false,
+    },
+    MAIN: {
+        worldKey: 'main',
+        label: 'main-world',
+        targetBytes: 10 * 1024,
+        // Deliberately high: sharing is a byte trade that also forces a
+        // function into whichever shared file holds it, and the main-world
+        // shared set is split into core (every navigation pays) and heavy
+        // (paid only by the navigations that need it). A stateless dep
+        // needed by a minority of shards is cheaper duplicated into each
+        // shard that uses it than shared -- sharing it would drag the
+        // whole heavy file onto every navigation whose tree touches it
+        // (validateConstantFn, needed by 4 of ~24 shards, once cost every
+        // set-constant page the entire 48 KB heavy half). Only functions
+        // needed by most shards -- or carrying self-referential state,
+        // which the fixed point shares unconditionally -- stay shared.
+        shareMinShards: 15,
+        shared: 'js/mv3-mainworld-shared-core.js',
+        heavy: 'js/mv3-mainworld-shared-heavy.js',
+        shardPrefix: 'js/mv3-mainworld-library-',
+        launch: 'js/mv3-mainworld-launch.js',
+        // The main-world shared set is dominated by dependencies only some
+        // scriptlet families reach for (JSONPath alone is ~20 KB); split it
+        // so a navigation pays for those only when it calls something that
+        // needs them.
+        splitShared: true,
+    },
+};
+const SHARD_MAX_BYTES = 48 * 1024;
+const SHARED_CORE_MAX_BYTES = 16 * 1024;
+const SHARED_MAX_BYTES = 64 * 1024;  // the unsplit (isolated-world) shared file
+const HEAVY_MAX_BYTES = 64 * 1024;
+const MAX_SHARDS = 99;
+const PACKING_ROUNDS = 8;
+
+const generateScriptletLibraries = async ( ) => {
+    const resourcesModule = await import(pathToFileURL(
+        path.join(pkgDir, 'js', 'resources', 'scriptlets.js')
+    ).href);
+    const entries = resourcesModule.builtinScriptlets;
+    if ( Array.isArray(entries) === false || entries.length === 0 ) {
+        console.error(
+            `*** patch-mv3-modules: js/resources/scriptlets.js exports no ` +
+            `builtinScriptlets -- cannot generate the scriptlet libraries`
+        );
+        process.exit(1);
+    }
+    const byName = new Map(entries.map(e => [ e.name, e ]));
+
+    // The closure of a world's scriptlet set: every entry routed to that
+    // world plus everything reachable through their declared dependencies,
+    // mirroring the walk `lookupScriptlet()` in
+    // src/js/scriptlet-filtering-core.js performs when it assembles that
+    // world's payload.
+    const makeClosure = world => {
+        const closure = [];
+        const seen = new Set();
+        const visit = name => {
+            if ( seen.has(name) ) { return; }
+            seen.add(name);
+            const entry = byName.get(name);
+            if ( entry === undefined || typeof entry.fn !== 'function' ) { return; }
+            closure.push(entry);
+            for ( const dep of entry.dependencies || [] ) { visit(dep); }
+        };
+        for ( const entry of entries ) {
+            if ( typeof entry.fn !== 'function' ) { continue; }
+            if ( world === 'ISOLATED' ? entry.world !== 'ISOLATED' : entry.world === 'ISOLATED' ) {
+                continue;
+            }
+            visit(entry.name);
+        }
+        return closure;
+    };
+
+    // The injection protocols resolve scriptlets by declared function name,
+    // exactly as the payload's calls do (`fname(args);` from
+    // patchScriptlet()). A function that is not a named declaration has no
+    // such name and cannot be called -- fail the build rather than silently
+    // skipping it. Duplicates would silently shadow each other. Named
+    // `class` declarations and `async function` declarations are accepted
+    // alongside plain ones: the resource table uses both (`jsonpath.fn` is a
+    // class, `edit-element-object.fn` is async), and a classic script
+    // declares them just as well.
+    const collectFunctions = (closure, label) => {
+        const fns = new Map();   // entry name -> { fnName, src, size, deps }
+        const byFnName = new Map();
+        for ( const entry of closure ) {
+            const fnName = entry.fn.name;
+            const src = entry.fn.toString();
+            const reName = escapeRe(fnName);
+            const isDecl = typeof fnName === 'string' && fnName !== '' && (
+                new RegExp(`^(async\\s+)?function\\s+${reName}\\s*\\(`).test(src) ||
+                new RegExp(`^class\\s+${reName}\\s*(\\{|extends)`).test(src)
+            );
+            if ( isDecl === false ) {
+                console.error(
+                    `*** patch-mv3-modules: ${entry.name} is not a named ` +
+                    `declaration (${src.slice(0, 60)}...); the ${label} ` +
+                    `injection protocol cannot call it`
+                );
+                process.exit(1);
+            }
+            if ( byFnName.has(fnName) ) {
+                console.error(
+                    `*** patch-mv3-modules: two ${label} resources declare ` +
+                    `the same function name (${fnName})`
+                );
+                process.exit(1);
+            }
+            byFnName.set(fnName, entry.name);
+            fns.set(entry.name, {
+                fnName,
+                src,
+                size: src.length,
+                deps: new Set(entry.dependencies || []),
+            });
+        }
+        return { fns, byFnName };
+    };
+
+    const banner = ( marker, description ) => [
+        '/*******************************************************************************',
+        '',
+        `    ${marker} -- DO NOT EDIT.`,
+        '',
+        '    Generated by tools/patch-mv3-modules.mjs from js/resources/scriptlets.js:',
+        ...description,
+        '',
+        '*******************************************************************************/',
+        '',
+    ];
+
+    const results = { };
+
+    for ( const world of [ 'ISOLATED', 'MAIN' ] ) {
+        const spec = SCRIPTLET_SHARDING[world];
+        const closure = makeClosure(world);
+        if ( closure.length === 0 ) {
+            console.error(
+                `*** patch-mv3-modules: no world:'${world}' scriptlets found ` +
+                `in js/resources/scriptlets.js -- that injection path would ` +
+                `be dead. Reconcile platform/chromium-mv3/mv3-shims.js and ` +
+                `tools/patch-mv3-modules.mjs with the new upstream shape.`
+            );
+            process.exit(1);
+        }
+        const { fns, byFnName } = collectFunctions(closure, spec.label);
+
+        // Bare-name references between the world's functions: the payload
+        // assembled them all into one script scope, so an undeclared
+        // reference worked as long as the referent was somewhere in the
+        // library. Preserve that by treating every reference as a
+        // dependency edge. The regex over-approximates (string literals,
+        // comments) which can only over-include.
+        const reAnyFn = new RegExp(`\\b(${[ ...byFnName.keys() ].map(escapeRe).join('|')})\\b`, 'g');
+        const refs = new Map();  // entry name -> Set<entry name>
+        for ( const [ name, info ] of fns ) {
+            const out = new Set();
+            let match;
+            reAnyFn.lastIndex = 0;
+            while ( (match = reAnyFn.exec(info.src)) !== null ) {
+                const ref = byFnName.get(match[1]);
+                if ( ref !== undefined && ref !== name ) { out.add(ref); }
+            }
+            refs.set(name, out);
+        }
+
+        // Functions that keep state on their own function object must never
+        // be duplicated across shards (two `Function.prototype.toString`
+        // proxies, two WeakMaps, half the registrations lost).
+        const stateful = new Set();
+        for ( const [ name, info ] of fns ) {
+            if ( new RegExp(`\\b${escapeRe(info.fnName)}\\s*\\.[A-Za-z_$][\\w$]*`).test(info.src) ) {
+                stateful.add(name);
+            }
+        }
+
+        // The tree of each callable root: itself plus everything reachable
+        // through declared dependencies and bare-name references.
+        const rootNames = closure
+            .filter(e => world === 'ISOLATED' ? e.world === 'ISOLATED' : e.world !== 'ISOLATED')
+            .map(e => e.name)
+            .sort();
+        const treeOf = new Map();
+        for ( const root of rootNames ) {
+            const tree = new Set();
+            const stack = [ root ];
+            while ( stack.length !== 0 ) {
+                const name = stack.pop();
+                if ( tree.has(name) ) { continue; }
+                tree.add(name);
+                const info = fns.get(name);
+                if ( info === undefined ) { continue; }
+                for ( const dep of info.deps ) { stack.push(dep); }
+                for ( const ref of refs.get(name) ) { stack.push(ref); }
+            }
+            treeOf.set(root, tree);
+        }
+
+        // Seed the shared set with what at least half the roots need
+        // (safeSelf today); the fixed point below grows it from there.
+        const rootUsage = new Map();
+        for ( const tree of treeOf.values() ) {
+            for ( const name of tree ) {
+                rootUsage.set(name, (rootUsage.get(name) || 0) + 1);
+            }
+        }
+        const seed = new Set(
+            [ ...rootUsage ].filter(([ , n ]) => n >= rootNames.length / 2)
+                .map(([ name ]) => name)
+        );
+
+        // Fixed point: pack roots into shards by non-shared bytes, then move
+        // cross-shard functions that qualify into the shared set, until a
+        // round changes nothing. Bounded rounds keep the outcome
+        // deterministic even if the two steps were to oscillate.
+        let shared = new Set(seed);
+        let shards = [ ];
+        for ( let round = 0; round < PACKING_ROUNDS; round++ ) {
+            shards = [ ];
+            let content = new Set();
+            let roots = [ ];
+            let bytes = 0;
+            for ( const root of rootNames ) {
+                for ( const name of treeOf.get(root) ) {
+                    if ( content.has(name) ) { continue; }
+                    content.add(name);
+                    if ( shared.has(name) === false ) { bytes += fns.get(name).size; }
+                }
+                roots.push(root);
+                if ( bytes >= spec.targetBytes && root !== rootNames[rootNames.length - 1] ) {
+                    shards.push({ roots, content });
+                    content = new Set();
+                    roots = [ ];
+                    bytes = 0;
+                }
+            }
+            if ( roots.length !== 0 ) { shards.push({ roots, content }); }
+
+            const needShards = new Map();
+            shards.forEach((shard, i) => {
+                for ( const name of shard.content ) {
+                    let set = needShards.get(name);
+                    if ( set === undefined ) {
+                        needShards.set(name, set = new Set());
+                    }
+                    set.add(i);
+                }
+            });
+            const next = new Set(seed);
+            for ( const [ name, set ] of needShards ) {
+                if ( set.size < 2 ) { continue; }
+                if ( set.size >= spec.shareMinShards || stateful.has(name) ) {
+                    next.add(name);
+                }
+            }
+            // Close under dependencies and references: a shared function's
+            // own bare-name needs must resolve inside the shared file.
+            for (;;) {
+                const before = next.size;
+                for ( const name of next ) {
+                    const info = fns.get(name);
+                    if ( info === undefined ) { continue; }
+                    for ( const dep of info.deps ) { next.add(dep); }
+                    for ( const ref of refs.get(name) ) { next.add(ref); }
+                }
+                if ( next.size === before ) { break; }
+            }
+            const converged =
+                next.size === shared.size &&
+                [ ...next ].every(name => shared.has(name));
+            shared = next;
+            if ( converged ) { break; }
+        }
+
+        if ( shards.length > MAX_SHARDS ) {
+            console.error(
+                `*** patch-mv3-modules: the ${spec.label} library split into ` +
+                `${shards.length} shards (max ${MAX_SHARDS}) -- the resource ` +
+                `table has outgrown the packing targets in ` +
+                `SCRIPTLET_SHARDING.`
+            );
+            process.exit(1);
+        }
+
+        // Split the shared set when configured to: "core" is what the seed
+        // -- the functions at least half the roots need -- closes to under
+        // dependencies and references; it is what every scriptlet-bearing
+        // navigation pays for. The remainder, "heavy", is dependencies only
+        // some families reach for (JSONPath, lookupElementsFn,
+        // proxyApplyFn, ...); it is injected only when a called root's tree
+        // includes something from it (the manifest carries that set as
+        // `heavy.neededBy`, and mv3-shims.js consults it). The split is
+        // disjoint, so no function -- stateful ones included -- can exist
+        // in both files at once, and core is closed, so it never needs
+        // anything from heavy.
+        let core = shared;
+        let heavy = new Set();
+        if ( spec.splitShared ) {
+            core = new Set(seed);
+            for (;;) {
+                const before = core.size;
+                for ( const name of core ) {
+                    const info = fns.get(name);
+                    if ( info === undefined ) { continue; }
+                    for ( const dep of info.deps ) { core.add(dep); }
+                    for ( const ref of refs.get(name) ) { core.add(ref); }
+                }
+                if ( core.size === before ) { break; }
+            }
+            // The fixed point closed `shared` over the same edges and
+            // contains the seed, so core is a subset of it by construction.
+            heavy = new Set([ ...shared ].filter(name => core.has(name) === false));
+        }
+        const sharedPool = new Set([ ...core, ...heavy ]);
+
+        // Which roots reach for the heavy half, by function name.
+        const heavyNeededBy = [ ];
+        if ( heavy.size !== 0 ) {
+            for ( const root of rootNames ) {
+                const tree = treeOf.get(root);
+                if ( [ ...heavy ].some(name => tree.has(name)) === false ) { continue; }
+                heavyNeededBy.push(fns.get(root).fnName);
+            }
+            heavyNeededBy.sort();
+        }
+
+        // --- emit the shared file(s) ---
+        const coreNames = [ ...core ].sort((a, b) =>
+            fns.get(a).fnName < fns.get(b).fnName ? -1 : 1);
+        const heavyNames = [ ...heavy ].sort((a, b) =>
+            fns.get(a).fnName < fns.get(b).fnName ? -1 : 1);
+        const readLaunch = world === 'MAIN'
+            ? [
+                'self.uBO_mv3Lib = self.uBO_mv3Lib || {};',
+                'self.uBO_mv3Lib.launch = document.documentElement.dataset.uBOmv3Main === undefined',
+                '    ? undefined',
+                '    : JSON.parse(document.documentElement.dataset.uBOmv3Main);',
+            ]
+            : [
+                'self.uBO_mv3Lib = self.uBO_mv3Lib || {};',
+                'self.uBO_mv3Lib.launch = self.uBO_mv3IsolatedLaunch;',
+            ];
+        {
+            const parts = banner('uBO MV3 auto-generated shared scriptlet library', [
+                `    the ${spec.label} dependencies needed by nearly every shard,`,
+                '    each function\'s source emitted verbatim. Injected into the',
+                `    ${world} world first whenever any of its scriptlets fire. It`,
+                '    also parses the launch record onto the transient',
+                '    self.uBO_mv3Lib registry, where the shard and launch files',
+                '    find it.',
+                ...(heavy.size !== 0 ? [
+                    '    Only the core half of the shared set lives here; the',
+                    '    heavy half (dependencies few families need) is a separate',
+                    '    file, injected only when a called scriptlet reaches for it.',
+                ] : []),
+            ]);
+            parts.push('(function() {');
+            parts.push(...readLaunch);
+            parts.push(
+                'const scriptletGlobals = self.uBO_mv3Lib.launch?.globals || {};',
+            );
+            for ( const name of coreNames ) {
+                parts.push(fns.get(name).src, '');
+            }
+            parts.push(
+                'Object.assign(self.uBO_mv3Lib, {',
+                ...coreNames.map(name => `    ${fns.get(name).fnName},`),
+                '});',
+                '})();',
+                '',
+            );
+            fs.writeFileSync(path.join(pkgDir, spec.shared), parts.join('\n'));
+        }
+        if ( heavy.size !== 0 ) {
+            // The heavy half runs after the core file and destructures the
+            // core functions its own sources reference out of the registry,
+            // exactly as shard files do -- bare names must resolve within
+            // the file.
+            const needed = new Set();
+            for ( const name of heavyNames ) {
+                const info = fns.get(name);
+                for ( const dep of info.deps ) {
+                    if ( core.has(dep) && heavy.has(dep) === false ) { needed.add(dep); }
+                }
+                for ( const ref of refs.get(name) ) {
+                    if ( core.has(ref) && heavy.has(ref) === false ) { needed.add(ref); }
+                }
+            }
+            const parts = banner('uBO MV3 auto-generated heavy shared scriptlet library', [
+                `    the ${spec.label} dependencies shared across several shards`,
+                '    but needed only by some scriptlet families, each function\'s',
+                '    source emitted verbatim. Injected into the ' + world + ' world',
+                '    only when a called scriptlet\'s dependencies reach this half',
+                '    (see heavy.neededBy in js/mv3-scriptlet-shards.js);',
+                '    mv3-shims.js places it right after the core shared file.',
+            ]);
+            parts.push('(function() {');
+            if ( needed.size !== 0 ) {
+                const names = [ ...needed ]
+                    .sort((a, b) => fns.get(a).fnName < fns.get(b).fnName ? -1 : 1)
+                    .map(name => fns.get(name).fnName);
+                parts.push(`const { ${names.join(', ')} } = self.uBO_mv3Lib || {};`);
+            }
+            parts.push(
+                'const scriptletGlobals = self.uBO_mv3Lib?.launch?.globals || {};',
+            );
+            for ( const name of heavyNames ) {
+                parts.push(fns.get(name).src, '');
+            }
+            parts.push(
+                'Object.assign(self.uBO_mv3Lib || (self.uBO_mv3Lib = {}), {',
+                ...heavyNames.map(name => `    ${fns.get(name).fnName},`),
+                '});',
+                '})();',
+                '',
+            );
+            fs.writeFileSync(path.join(pkgDir, spec.heavy), parts.join('\n'));
+        }
+
+        // --- emit the shard files ---
+        const shardFiles = [ ];
+        const fnToFile = new Map();   // entry name -> package-relative file
+        for ( const name of coreNames ) { fnToFile.set(name, spec.shared); }
+        for ( const name of heavyNames ) { fnToFile.set(name, spec.heavy); }
+        shards.forEach((shard, i) => {
+            const file = `${spec.shardPrefix}${String(i + 1).padStart(2, '0')}.js`;
+            const content = [ ...shard.content ]
+                .filter(name => sharedPool.has(name) === false)
+                .sort((a, b) => fns.get(a).fnName < fns.get(b).fnName ? -1 : 1);
+            const defined = new Set(content);
+            // Everything this shard's sources reference that lives in the
+            // shared core or heavy files must be destructured out of the
+            // registry, so bare names resolve through the shard's own
+            // closure. A function needed only by a not-called sibling root
+            // in the same shard can destructure to undefined: it is never
+            // invoked, so the hole is unreachable.
+            const needed = new Set();
+            for ( const name of content ) {
+                const info = fns.get(name);
+                for ( const dep of info.deps ) {
+                    if ( sharedPool.has(dep) && defined.has(dep) === false ) {
+                        needed.add(dep);
+                    }
+                }
+                for ( const ref of refs.get(name) ) {
+                    if ( sharedPool.has(ref) && defined.has(ref) === false ) {
+                        needed.add(ref);
+                    }
+                }
+            }
+            const parts = banner('uBO MV3 auto-generated scriptlet library shard', [
+                `    a cluster of ${spec.label} scriptlets with their`,
+                '    cluster-local dependencies, each function\'s source emitted',
+                '    verbatim. Injected into the ' + world + ' world only when one of',
+                '    its functions is called: mv3-shims.js computes the shard set',
+                '    from the launch record\'s function names.',
+            ]);
+            parts.push('(function() {');
+            if ( needed.size !== 0 ) {
+                const names = [ ...needed ]
+                    .sort((a, b) => fns.get(a).fnName < fns.get(b).fnName ? -1 : 1)
+                    .map(name => fns.get(name).fnName);
+                parts.push(`const { ${names.join(', ')} } = self.uBO_mv3Lib || {};`);
+            }
+            parts.push(
+                'const scriptletGlobals = self.uBO_mv3Lib?.launch?.globals || {};',
+            );
+            for ( const name of content ) {
+                parts.push(fns.get(name).src, '');
+            }
+            parts.push(
+                'Object.assign(self.uBO_mv3Lib || (self.uBO_mv3Lib = {}), {',
+                ...content.map(name => `    ${fns.get(name).fnName},`),
+                '});',
+                '})();',
+                '',
+            );
+            fs.writeFileSync(path.join(pkgDir, file), parts.join('\n'));
+            shardFiles.push(file);
+            for ( const name of content ) { fnToFile.set(name, file); }
+        });
+
+        // --- emit the launch file ---
+        {
+            const consumeLaunch = world === 'MAIN'
+                ? [
+                    'if ( document.documentElement.dataset.uBOmv3Main !== undefined ) {',
+                    '    delete document.documentElement.dataset.uBOmv3Main;',
+                    '}',
+                    'const launch = self.uBO_mv3Lib?.launch;',
+                ]
+                : [
+                    'const launch = self.uBO_mv3IsolatedLaunch;',
+                    'self.uBO_mv3IsolatedLaunch = undefined;',
+                ];
+            const parts = banner('uBO MV3 auto-generated scriptlet library launcher', [
+                `    consumes the ${spec.label} launch record and dispatches every`,
+                '    call in payload order inside the same silent try/catch the',
+                '    assembled payload used, resolving the interned-argument',
+                '    indices (see internScriptletArgs in',
+                '    platform/chromium-mv3/mv3-post.js), then removes the',
+                '    transient registry. Runs last: all shard files must have',
+                '    registered their functions first.',
+            ]);
+            parts.push(
+                '(function() {',
+                ...consumeLaunch,
+                'try {',
+                '    if ( launch instanceof Object && launch.calls instanceof Array ) {',
+                '        const args = launch.args || [];',
+                '        for ( const [ fnName, argIndices ] of launch.calls ) {',
+                '            const fn = self.uBO_mv3Lib?.[fnName];',
+                '            if ( typeof fn !== \'function\' ) { continue; }',
+                '            try { fn(...argIndices.map(i => args[i])); } catch { }',
+                '        }',
+                '    }',
+                '} finally {',
+                '    delete self.uBO_mv3Lib;',
+                '}',
+                '})();',
+                '',
+            );
+            fs.writeFileSync(path.join(pkgDir, spec.launch), parts.join('\n'));
+        }
+
+        // --- byte report + hard ceilings ---
+        const fileSize = rel => fs.statSync(path.join(pkgDir, rel)).size;
+        const sharedBytes = fileSize(spec.shared);
+        const heavyBytes = heavy.size !== 0 ? fileSize(spec.heavy) : 0;
+        const launchBytes = fileSize(spec.launch);
+        const shardBytes = shardFiles.map(fileSize);
+        const totalBytes = sharedBytes + heavyBytes + launchBytes +
+            shardBytes.reduce((a, b) => a + b, 0);
+        const largestShard = shardBytes.reduce((a, b) => Math.max(a, b), 0);
+        const sharedCeiling = spec.splitShared ? SHARED_CORE_MAX_BYTES : SHARED_MAX_BYTES;
+        if ( sharedBytes > sharedCeiling ) {
+            console.error(
+                `*** patch-mv3-modules: the ${spec.label} core shared file is ` +
+                `${sharedBytes} bytes (max ${sharedCeiling}) -- the resource ` +
+                `table has outgrown the sharding constants.`
+            );
+            process.exit(1);
+        }
+        if ( heavyBytes > HEAVY_MAX_BYTES ) {
+            console.error(
+                `*** patch-mv3-modules: the ${spec.label} heavy shared file ` +
+                `is ${heavyBytes} bytes (max ${HEAVY_MAX_BYTES}) -- the ` +
+                `resource table has outgrown the sharding constants.`
+            );
+            process.exit(1);
+        }
+        for ( let i = 0; i < shardFiles.length; i++ ) {
+            if ( shardBytes[i] <= SHARD_MAX_BYTES ) { continue; }
+            console.error(
+                `*** patch-mv3-modules: ${shardFiles[i]} is ${shardBytes[i]} ` +
+                `bytes (max ${SHARD_MAX_BYTES}) -- a single cluster has ` +
+                `outgrown the sharding constants.`
+            );
+            process.exit(1);
+        }
+        console.log(
+            `*** patch-mv3-modules: generated the ${spec.label} library: ` +
+            `${shards.length} shard(s) + shared${heavy.size !== 0 ? ' (core+heavy)' : ''} + launch, ` +
+            `${closure.length} functions, ${totalBytes} bytes total`
+        );
+        console.log(
+            `    shared ${sharedBytes} B` +
+            (heavy.size !== 0 ? ` (core) + ${heavyBytes} B (heavy, needed by ${heavyNeededBy.length} of ${rootNames.length} scriptlets)` : '') +
+            `, shards ${shardBytes.join(' + ')} B, launch ${launchBytes} B`
+        );
+        console.log(
+            `    worst case (all files) ${totalBytes} B; typical ` +
+            `(shared + largest shard + launch) ` +
+            `${sharedBytes + largestShard + launchBytes} B`
+        );
+
+        results[world] = {
+            spec,
+            heavyNeededBy,
+            fnToFile: [ ...fnToFile ]
+                .sort((a, b) => fns.get(a[0]).fnName < fns.get(b[0]).fnName ? -1 : 1)
+                .map(([ name, file ]) => [ fns.get(name).fnName, file ]),
+        };
+    }
+
+    // --- emit the manifest module consumed by mv3-shims.js and pinned by
+    // verify-mv3-package.mjs ---
+    const parts = [
+        '/*******************************************************************************',
+        '',
+        '    uBO MV3 auto-generated scriptlet shard manifest -- DO NOT EDIT.',
+        '',
+        '    Generated by tools/patch-mv3-modules.mjs from js/resources/scriptlets.js.',
+        '    Maps every scriptlet-library function name to the file defining it,',
+        '    per world, so that platform/chromium-mv3/mv3-shims.js can inject only',
+        '    the shards a navigation actually calls.',
+        '',
+        '*******************************************************************************/',
+        '',
+        'export const scriptletShards = {',
+    ];
+    for ( const world of [ 'ISOLATED', 'MAIN' ] ) {
+        const { spec, heavyNeededBy, fnToFile } = results[world];
+        parts.push(
+            `    ${spec.worldKey}: {`,
+            `        shared: '${spec.shared}',`,
+        );
+        if ( typeof spec.heavy === 'string' && heavyNeededBy.length !== 0 ) {
+            parts.push(
+                `        heavy: {`,
+                `            file: '${spec.heavy}',`,
+                `            neededBy: [`,
+            );
+            for ( const fnName of heavyNeededBy ) {
+                parts.push(`                ${JSON.stringify(fnName)},`);
+            }
+            parts.push(
+                `            ],`,
+                `        },`,
+            );
+        }
+        parts.push(
+            `        launch: '${spec.launch}',`,
+            `        fns: {`,
+        );
+        for ( const [ fnName, file ] of fnToFile ) {
+            parts.push(`            ${JSON.stringify(fnName)}: '${file}',`);
+        }
+        parts.push(
+            '        },',
+            '    },',
+        );
+    }
+    parts.push('};', '');
+    fs.writeFileSync(
+        path.join(pkgDir, 'js/mv3-scriptlet-shards.js'),
+        parts.join('\n')
+    );
+    console.log(
+        `*** patch-mv3-modules: generated js/mv3-scriptlet-shards.js ` +
+        `(${results.ISOLATED.fnToFile.length + results.MAIN.fnToFile.length} ` +
+        `function entries)`
+    );
+};
+
+await generateScriptletLibraries();
+/******************************************************************************/
+/******************************************************************************/
 
 let total = 0;
 for ( const { rel, count } of rewritten ) {

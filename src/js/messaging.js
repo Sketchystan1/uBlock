@@ -265,6 +265,38 @@ vAPI.messaging.setup(onMessage);
 /******************************************************************************/
 /******************************************************************************/
 
+// Several message handlers routed through `whenReady()` (the popup-panel
+// commands, and `getLists`) report or mutate state which is fully initialized
+// only at the very end of the launch sequence, so they must wait on
+// `µb.isReadyPromise`. That promise is created with a resolve handler only (see
+// background.js) and is resolved as the last statement of a *successful* launch
+// (see start.js); a launch which throws at an earlier `await` leaves it forever
+// pending. To ensure the framework's reply `callback` is invoked exactly once
+// -- so the caller never hangs and the reply callback is never leaked -- race
+// readiness against a bounded timeout and degrade gracefully on timeout or
+// error. `fn` performs the work and resolves to the response; `fallback`
+// resolves to a safe degraded response (default: no data).
+const whenReady = (( ) => {
+    const readyTimeout = { sec: 5 };
+    return (callback, fn, fallback) => {
+        let answered = false;
+        const answer = response => {
+            if ( answered ) { return; }
+            answered = true;
+            callback(response);
+        };
+        const degrade = ( ) => {
+            if ( answered ) { return; }
+            Promise.resolve().then(fallback).then(answer, ( ) => answer());
+        };
+        µb.isReadyPromise.then(fn).then(answer, degrade);
+        vAPI.defer.once(readyTimeout).then(degrade);
+    };
+})();
+
+/******************************************************************************/
+/******************************************************************************/
+
 // Channel:
 //      popupPanel
 //      privileged
@@ -527,10 +559,15 @@ const onMessage = function(request, sender, callback) {
         return;
 
     case 'getPopupData':
-        popupDataFromRequest(request).then(popupData => {
-            callback(popupData);
-        });
-        return;
+        // Answer only once uBO is fully launched: page stores are bound to
+        // existing tabs at the end of the launch sequence, and answering
+        // before that would report a not-yet-initialized state, i.e. one
+        // where the current site appears to not be filtered at all.
+        return whenReady(
+            callback,
+            ( ) => popupDataFromRequest(request),
+            ( ) => popupDataFromRequest(request).catch(( ) => ({}))
+        );
 
     default:
         break;
@@ -552,77 +589,86 @@ const onMessage = function(request, sender, callback) {
         break;
     }
 
-    case 'launchReporter': {
-        launchReporter(request).then(url => {
+    // The commands below act on -- or report -- state which is fully
+    // initialized only by the end of the launch sequence: page stores,
+    // per-session and persistent rulesets. Defer them until then, else
+    // they would act on a not-yet-initialized state: a toggle command
+    // would be silently dropped, or worse a not-yet-loaded ruleset would
+    // be persisted over the user's own.
+    case 'launchReporter':
+        return whenReady(callback, ( ) => launchReporter(request).then(url => {
             if ( typeof url !== 'string' ) { return; }
             µb.openNewTab({ url, select: true, index: -1 });
-        });
-        break;
-    }
+        }));
 
     case 'revertFirewallRules':
-        // TODO: use Set() to message around sets of hostnames
-        sessionFirewall.copyRules(
-            permanentFirewall,
-            request.srcHostname,
-            Object.assign(Object.create(null), request.desHostnames)
-        );
-        sessionSwitches.copyRules(
-            permanentSwitches,
-            request.srcHostname
-        );
-        // https://github.com/gorhill/uBlock/issues/188
-        cosmeticFilteringEngine.removeFromSelectorCache(
-            request.srcHostname,
-            'net'
-        );
-        µb.updateToolbarIcon(request.tabId, 0b100);
-        response = popupDataFromTabId(request.tabId);
-        break;
-
-    case 'saveFirewallRules':
-        // TODO: use Set() to message around sets of hostnames
-        if (
-            permanentFirewall.copyRules(
-                sessionFirewall,
+        return whenReady(callback, ( ) => {
+            // TODO: use Set() to message around sets of hostnames
+            sessionFirewall.copyRules(
+                permanentFirewall,
                 request.srcHostname,
                 Object.assign(Object.create(null), request.desHostnames)
-            )
-        ) {
-            µb.savePermanentFirewallRules();
-        }
-        if (
-            permanentSwitches.copyRules(
-                sessionSwitches,
+            );
+            sessionSwitches.copyRules(
+                permanentSwitches,
                 request.srcHostname
-            )
-        ) {
-            µb.saveHostnameSwitches();
-        }
-        break;
+            );
+            // https://github.com/gorhill/uBlock/issues/188
+            cosmeticFilteringEngine.removeFromSelectorCache(
+                request.srcHostname,
+                'net'
+            );
+            µb.updateToolbarIcon(request.tabId, 0b100);
+            return popupDataFromTabId(request.tabId);
+        }, ( ) => popupDataFromTabId(request.tabId));
+
+    case 'saveFirewallRules':
+        return whenReady(callback, ( ) => {
+            // TODO: use Set() to message around sets of hostnames
+            if (
+                permanentFirewall.copyRules(
+                    sessionFirewall,
+                    request.srcHostname,
+                    Object.assign(Object.create(null), request.desHostnames)
+                )
+            ) {
+                µb.savePermanentFirewallRules();
+            }
+            if (
+                permanentSwitches.copyRules(
+                    sessionSwitches,
+                    request.srcHostname
+                )
+            ) {
+                µb.saveHostnameSwitches();
+            }
+        });
 
     case 'toggleHostnameSwitch':
-        µb.toggleHostnameSwitch(request);
-        response = popupDataFromTabId(request.tabId);
-        break;
+        return whenReady(callback, ( ) => {
+            µb.toggleHostnameSwitch(request);
+            return popupDataFromTabId(request.tabId);
+        }, ( ) => popupDataFromTabId(request.tabId));
 
     case 'toggleFirewallRule':
-        µb.toggleFirewallRule(request);
-        response = popupDataFromTabId(request.tabId);
-        break;
+        return whenReady(callback, ( ) => {
+            µb.toggleFirewallRule(request);
+            return popupDataFromTabId(request.tabId);
+        }, ( ) => popupDataFromTabId(request.tabId));
 
-    case 'toggleNetFiltering': {
-        const pageStore = µb.pageStoreFromTabId(request.tabId);
-        if ( pageStore ) {
-            pageStore.toggleNetFilteringSwitch(
-                request.url,
-                request.scope,
-                request.state
-            );
-            µb.updateToolbarIcon(request.tabId, 0b111);
-        }
-        break;
-    }
+    case 'toggleNetFiltering':
+        return whenReady(callback, ( ) => {
+            const pageStore = µb.pageStoreFromTabId(request.tabId);
+            if ( pageStore ) {
+                pageStore.toggleNetFilteringSwitch(
+                    request.url,
+                    request.scope,
+                    request.state
+                );
+                µb.updateToolbarIcon(request.tabId, 0b111);
+            }
+        });
+
     default:
         return vAPI.messaging.UNHANDLED;
     }
@@ -1428,9 +1474,20 @@ const onMessage = function(request, sender, callback) {
         });
 
     case 'getLists':
-        return µb.isReadyPromise.then(( ) => {
-            getLists(callback);
-        });
+        // Same readiness/hang guard as the popup-panel commands: `getLists`
+        // reads engine state that is only valid at the end of the launch
+        // sequence, and `µb.isReadyPromise` stays pending forever on a failed
+        // launch. Route through `whenReady()` so the reply callback fires
+        // exactly once -- with the lists on success, or an empty (but
+        // object-shaped) degraded response on timeout/error so the dashboard's
+        // `Object.entries(response.available)` cannot throw.
+        return whenReady(
+            callback,
+            ( ) => new Promise((resolve, reject) => {
+                getLists(resolve).then(undefined, reject);
+            }),
+            ( ) => ({ available: {}, cache: {} })
+        );
 
     case 'getLocalData':
         return getLocalData().then(localData => {

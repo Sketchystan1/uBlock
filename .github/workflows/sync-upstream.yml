@@ -291,6 +291,7 @@ jobs:
       - name: Select upstream tag
         id: upstream
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           if [ -n "$INPUT_TAG" ]; then
@@ -314,6 +315,48 @@ jobs:
             exit 0
           fi
 
+          # Is a -mv3 tag actually RELEASED? The tag existing is necessary but
+          # not sufficient: the tag is pushed BEFORE release.yml runs, so a tag
+          # with no release -- or with a draft, or with a published release
+          # that has no CRX asset -- is the signature of a release run that
+          # failed or never fired. Treating that state as already-released is
+          # self-latching: every later run skips the tag, autoupdate freezes
+          # for every policy client, and nothing reports it.
+          #
+          # One state is deliberately NOT a defect: while no signed release
+          # has ever been published, releases are zip-only by design (no
+          # CRX_PRIVATE_KEY secret yet -- the documented bootstrap state in
+          # docs/mv3-deployment.md). The Pages update manifests are written
+          # only by a signed run, so their absence marks that state.
+          release_state() {
+            # $1 = upstream tag; echoes one of: ok, missing, draft, no-crx
+            if ! gh release view "$1-mv3" --json isDraft >/dev/null 2>&1; then
+              echo missing
+            elif [ "$(gh release view "$1-mv3" --json isDraft --jq .isDraft)" = true ]; then
+              echo draft
+            elif gh release view "$1-mv3" --json assets \
+                --jq '[.assets[].name|test("^uBlock0_.*\\.chromium-mv3\\.crx$")]|any' \
+                | grep -qx true; then
+              echo ok
+            else
+              echo no-crx
+            fi
+          }
+          signed_releases_exist() {
+            pages_base="https://$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]').github.io/$(basename '${{ github.repository }}')"
+            curl -fsSL --max-time 20 "$pages_base/update-dev.xml" 2>/dev/null | grep -q 'appid=' \
+              || curl -fsSL --max-time 20 "$pages_base/update.xml" 2>/dev/null | grep -q 'appid='
+          }
+          tag_is_released() {
+            # $1 = upstream tag
+            git rev-parse -q --verify "refs/tags/$1-mv3" >/dev/null || return 1
+            state=$(release_state "$1")
+            if [ "$state" = no-crx ] && ! signed_releases_exist; then
+              return 0  # bootstrap state: zip-only releases are expected
+            fi
+            [ "$state" = ok ]
+          }
+
           # Only ever the single newest release-shaped tag. Considering the whole
           # backlog would mean treating all ~1100 historical upstream tags as
           # pending releases on the first run; this fork exists to track upstream
@@ -330,18 +373,37 @@ jobs:
             echo 'release=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
           if git rev-parse -q --verify "refs/tags/$newest-mv3" >/dev/null; then
-            echo "Newest upstream tag $newest is already released as $newest-mv3; nothing to do."
+            state=$(release_state "$newest")
+            if [ "$state" = ok ]; then
+              echo "Newest upstream tag $newest is released as $newest-mv3 and healthy; nothing to do."
+              echo 'release=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$state" = no-crx ] && ! signed_releases_exist; then
+              echo "Newest upstream tag $newest is released as $newest-mv3, zip-only (no CRX_PRIVATE_KEY yet -- the documented bootstrap state); nothing to do."
+              echo 'release=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # missing / draft / no-crx with a signed channel live: the release
+            # build for this tag failed or never fired. "Repair an incomplete
+            # release" below re-dispatches it and files an issue.
+            echo "::warning::tag $newest-mv3 exists but its release is '$state'; the release build must have failed or never fired -- dispatching it again"
+            echo "tag=$newest" >> "$GITHUB_OUTPUT"
+            echo 'repair=true' >> "$GITHUB_OUTPUT"
             echo 'release=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # If tags arrived in a burst, only the newest is picked up. Name the
           # others rather than letting them vanish silently -- bounded to the
-          # recent window so this stays readable.
+          # recent window so this stays readable. tag_is_released, not a bare
+          # tag-exists test, because a tag with a broken release counts as
+          # unreleased: nothing else will ever pick it up.
           skipped=''
           for t in $(echo "$recent" | tail -n +2); do
-            git rev-parse -q --verify "refs/tags/$t-mv3" >/dev/null && continue
+            if tag_is_released "$t"; then continue; fi
             skipped="$skipped $t"
           done
           if [ -n "$skipped" ]; then
@@ -351,6 +413,41 @@ jobs:
           echo "Releasing: $newest"
           echo "tag=$newest" >> "$GITHUB_OUTPUT"
           echo 'release=true' >> "$GITHUB_OUTPUT"
+
+      - name: Repair an incomplete release
+        # Only reachable from the scheduled path: the newest upstream tag has a
+        # -mv3 tag on the remote, but no published release with a CRX asset for
+        # it -- i.e. the release build for that tag failed or never fired. This
+        # run is otherwise green, so nothing would notify anyone. File an issue
+        # (deduplicated by title, like the reporters above), and re-dispatch
+        # release.yml for the existing tag; that workflow is idempotent -- it
+        # rebuilds the tree the tag points at, re-uploads assets with --clobber,
+        # de-drafts an existing release, and re-stages both Pages manifests --
+        # and its own failure path files an issue if the retry fails too.
+        if: steps.upstream.outputs.repair == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          title="MV3 release for $TAG is incomplete"
+          body=$(printf '%s\n' \
+            "The tag \`$TAG-mv3\` exists on the remote, but it has no published release with a CRX asset, so no update manifest can advertise it. A release build for this tag must have failed or never fired; without the check that filed this issue, the sync would have treated the tag as already released and skipped it forever -- freezing autoupdate for every policy client." \
+            '' \
+            "Run: $RUN_URL" \
+            '' \
+            'The release build has been dispatched again. If it succeeds, this can be closed; if it fails, it files its own issue with the details. If the state keeps coming back, check:' \
+            '' \
+            '- the `CRX_PRIVATE_KEY` secret -- without it a release is deliberately zip-only and the update channels stay dark' \
+            '- that upstream `main.yml` is still disabled -- a draft release usually means it raced `release.yml` for `gh release create`' \
+            '- the release workflow runs: `gh run list --workflow=release.yml`')
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+          gh workflow run release.yml -f tag="$TAG-mv3"
 
       # Build the tree we will actually ship: upstream AT THE TAG, plus this
       # fork's added files. Tagging the merge commit instead (what this workflow

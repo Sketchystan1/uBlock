@@ -3,19 +3,27 @@
 This fork adds a Chromium **Manifest V3** build of the full uBlock Origin — the real
 filtering engine, not the declarativeNetRequest-based uBO Lite that lives in `platform/mv3/`.
 
-Two of the capabilities uBO depends on are gated under MV3. Both are reachable, but neither is
+One of the capabilities uBO depends on is gated under MV3. It is reachable, but not
 automatic, and **network filtering does nothing until you complete step 3**.
 
 | Capability | Gate | Consequence if not set up |
 |---|---|---|
 | Blocking `webRequest` (all network filtering) | Extension must be **policy-installed** | No network requests are blocked at all |
-| `chrome.userScripts` (scriptlet / `+js(...)` filters) | Per-extension **Allow user scripts** toggle | Scriptlet filters do not inject; the toolbar button shows a `!` badge |
 
-A policy install additionally lets the port hold requests during a cold start rather than cancelling
-them — see [step 5](#5-optional-reduce-how-often-a-cold-start-happens).
+Scriptlet filters (`+js(...)`) need no setup: they are injected through
+`chrome.scripting` like every other injection, with no toggle to find. Both payloads run as
+**CSP-exempt extension-injected function calls** — no inline `<script>` element is ever
+created, so the page's CSP is never consulted — which is the same observable behaviour MV2
+had (MV2 reached it through a page-CSP exemption for elements created by
+`tabs.executeScript`'s isolated world, an exemption no MV3 world enjoys). On strict-CSP
+pages the filters deliver exactly as under MV2, while the page's own inline scripts stay
+blocked.
+
+A policy install additionally lets the port hold requests during a cold start rather
+than cancelling them — see [step 4](#4-optional-reduce-how-often-a-cold-start-happens).
 
 Cosmetic filtering, the element picker and zapper, the logger, and the dashboard all work without
-either gate.
+the gate.
 
 ## Why MV2 is not an option
 
@@ -172,23 +180,7 @@ differences](#behavioural-differences-from-the-mv2-build) is unavailable: during
 the filter lists finish loading, subresource requests are cancelled rather than held, and the
 affected tabs are reloaded once uBO is ready.
 
-## 4. Enable user scripts (for scriptlet filters)
-
-`chrome.userScripts` is the only MV3 API that can inject arbitrary code strings, which is what
-uBO's scriptlet filters are. There is currently **no enterprise policy** that pre-grants it, so it
-takes one manual step per profile:
-
-The extension requires **Chrome 138+** (`minimum_chrome_version` in the manifest, enforced by
-`tools/verify-mv3-package.mjs`), so there is one path: `chrome://extensions` → uBlock Origin →
-**Details** → enable **Allow user scripts**.
-
-Until this is done, scriptlet filters are skipped and everything else keeps working. The service
-worker logs one explanatory error, and the toolbar button shows a `!` badge — the same warning uBO
-uses for requests it could not process — so the state is visible without opening the console. The
-toggle is re-checked every 30 seconds, so enabling or revoking it takes effect without restarting
-anything.
-
-## 5. Optional: reduce how often a cold start happens
+## 4. Optional: reduce how often a cold start happens
 
 uBO keeps its compiled filter lists in memory, so a service worker eviction costs a full reload of
 every list. The port already mitigates this: an offscreen document pings the service worker every
@@ -198,7 +190,7 @@ throttling — Chromium creates them as nominally visible — so the 20-second i
 
 **A cold start is still an unfiltered window in principle, and on a policy install this port closes
 it completely.** uBO handles the window by suspending network activity until the engines are ready,
-but what "suspend" means has always been per-platform: Firefox returns a promise from its blocking
+but what "suspend" means has always been per-platform: Firefox returns a promise from a blocking
 listener and resolves it once the lists are loaded, while Chromium MV2 cannot defer a blocking
 decision at all and so *cancels* non-main-frame requests instead, reloading the affected tabs
 afterwards. That is why `vAPI.Net.canSuspend()` returns `false` on Chromium
@@ -206,6 +198,18 @@ afterwards. That is why `vAPI.Net.canSuspend()` returns `false` on Chromium
 `suspendUntilListsAreLoaded` user setting to `false` — requests are simply **allowed** through.
 Under MV2 that mattered once per browser launch; under MV3 it would recur on every service worker
 respawn.
+
+The port also **pre-warms at browser start**: `mv3-shims.js` registers a
+`chrome.runtime.onStartup` listener at module scope, which is what makes Chrome start the
+service worker at launch instead of on the first request or keepalive-alarm tick (up to 30 s
+later). Merely evaluating the worker's module graph boots uBO — `src/js/start.js` kicks off its
+boot sequence at module scope — so the engine load (selfie hydration or a full compile) overlaps
+the user's think-time on the start page rather than landing on their first navigation, exactly
+as MV2's always-booted background page did. The keepalive offscreen document keeps the worker
+resident afterwards; its existence is cached from the document's own 20-second pings, so the
+keepalive alarm no longer issues a `chrome.runtime.getContexts` IPC on every 30-second tick —
+a re-check happens only once the pings go stale (~45 s), which is also the signal that the
+document died and must be recreated.
 
 MV3 supplies the missing capability. Chromium honours a promise returned from a blocking
 `webRequest` listener when the extension is policy-installed — the same installs that are the only
@@ -261,53 +265,119 @@ Chromium does not expose.
    still compile and still work — they are evaluated in the content script, as before. A malformed
    one now fails silently at match time instead of being rejected when the list loads.
 
-2. **Scriptlets run in a third world.** `chrome.userScripts` is the only MV3 API that can inject a
-   code string, and its only non-`MAIN` world is `USER_SCRIPT` — there is no `ISOLATED` option. So
-   the wrapper uBO injects lands in `USER_SCRIPT` rather than in the same isolated world as
-   `contentscript.js`. This is also how upstream's own MV3 build routes them
-   (`platform/mv3/extension/js/compiled-filters.js` maps `ISOLATED` → `world: 'USER_SCRIPT'`), so it
-   is the platform's answer, not a workaround.
+2. **Scriptlet injection is rebuilt from generated function libraries, not code strings.**
+   MV3 has no API that injects a code string without a gate: `chrome.userScripts` requires
+   the per-extension **Allow user scripts** toggle, which no policy can pre-grant.
+   `chrome.scripting` injects a `func` and JSON `args` only, and `eval()` inside anything it
+   injects is blocked by the isolated world's CSP. Live testing mapped what is left: the
+   injected code itself — func **or file**, in **any** world — always runs CSP-exempt; it is
+   only element creation and eval that consult a CSP. A `<script>` element created from a
+   static content-script world is governed by the page's CSP, and one created from a
+   `chrome.scripting` ISOLATED world is governed by that world's own CSP (the extension's) —
+   so no element is created at all. MV2's scriptlets worked on strict-CSP pages because
+   `tabs.executeScript`'s isolated world enjoyed an element-creation exemption; that API and
+   its exemption are gone, and the observable behaviour — delivery on strict-CSP pages — is
+   reproduced instead by never touching the CSP.
 
-   Note what this does **not** cost. Main-world scriptlets — the large majority — are unaffected:
-   the wrapper inserts them as a `<script>` element, and any world with DOM access can do that.
-   Three consequences that did bite have been closed:
+   So the program `src/js/scriptlet-filtering.js` assembles is never executed; it is carried
+   as data (`mv3-post.js` prefixes it with a marker holding the scriptlet *calls* for both
+   worlds parsed back out of their payloads, the per-document scriptlet globals, the filters
+   that fired and the logger channel name — see `mv3-scriptlet-marker.js`), and the scriptlet
+   functions — which are static, all registered in `js/resources/scriptlets.js` — ship as
+   generated classic-script *libraries*, sharded at build time by `tools/patch-mv3-modules.mjs`
+   (each function's source emitted verbatim, the transitive closure of that world's scriptlets
+   over their declared dependencies **and** their bare-name references to one another).
+   `mv3-shims.js` computes, from the marker's function names, the handful of files a
+   navigation actually needs and injects them in **one** `chrome.scripting` call per world —
+   so a typical 1-2-scriptlet navigation injects ~24 KB instead of the whole ~330 KB
+   library. Per world the files are:
 
-   - `self.uBO_scriptletsInjected` is written in `USER_SCRIPT`, but `src/js/contentscript.js` and
-     `src/js/scriptlets/cosmetic-report.js` read it from `ISOLATED`.
-     `platform/chromium-mv3/mv3-post.js` prefixes the wrapper's output with the filters that fired
-     and `mv3-shims.js` replays the marker into `ISOLATED` via
-     `chrome.scripting.executeScript({ func, args })` — which needs no code string, and so no
-     `userScripts`. So the popup panel's "extended" section lists scriptlet filters again, and the
-     background no longer recomputes and re-ships the whole payload for every frame on every
-     navigation.
-   - The scriptlet→logger bridge tests `self.vAPI && self.vAPI.messaging`
-     (`src/js/scriptlet-filtering.js`), which does not exist in `USER_SCRIPT`, so scriptlet log lines
-     went to the page console. `mv3-shims.js` now calls
-     `chrome.userScripts.configureWorld({ messaging: true })` and prepends a minimal
-     `vAPI.messaging.send` to every injection; `mv3-post.js` forwards the resulting
-     `chrome.runtime.onUserScriptMessage` into `vAPI.messaging` on the same unprivileged footing a
-     content-script port would have had. Scriptlet log lines reach uBO's logger again.
+   - the **core shared** file (`js/mv3-mainworld-shared-core.js` /
+     `js/mv3-scriptlet-shared.js`) — the near-universal dependencies (`safeSelf` and its
+     closure, ~8 KB), always injected when any of that world's scriptlets fire. It parses
+     the launch record onto a transient `self.uBO_mv3Lib` registry and declares the
+     per-document `scriptletGlobals` closure variable.
+   - the **heavy shared** file (`js/mv3-mainworld-shared-heavy.js`, main world only,
+     ~44 KB) — dependencies that must exist exactly once (they keep state on themselves:
+     `JSONPath`, `proxyApplyFn`, `trapPropertyFn`, …) but are needed only by some scriptlet
+     families. Injected **only** when a called scriptlet's dependency tree reaches for it;
+     the shard manifest carries that root set as `heavy.neededBy`.
+   - the **shards** (`js/mv3-*-library-NN.js`) — clusters of same-family scriptlets plus
+     their cluster-local dependencies (mid-frequency stateless dependencies are duplicated
+     into each shard that needs them, which is what keeps the core file small), injected
+     only when one of their functions is called.
+   - the **launcher** (`js/mv3-mainworld-launch.js` / `js/mv3-scriptlet-launch.js`) —
+     consumes the launch record and dispatches every call in payload order inside the same
+     silent try/catch the assembled payload used, then deletes the registry.
 
-   What remains is one genuine loss: ⚠️ **closed shadow DOM piercing stops working for
-   `trusted-click-element`.** `src/js/resources/utils.js`'s `lookupElementsFn` needs
-   `self.chrome.dom.openOrClosedShadowRoot` to follow the `>>>` combinator, and `chrome.dom` is
-   declared for `content_script` but not `user_script`; it falls through to `elem.shadowRoot`, which
-   is `null` for a closed root. There is no way for an extension to grant that API to a
-   `USER_SCRIPT` world, so this cannot be shimmed.
+   Every file is an IIFE and all cross-file references are captured as closure constants at
+   evaluation time, so nothing leaks into the page and nothing can be redefined by it; the
+   launcher runs last, so calls execute in payload order within a single script evaluation,
+   exactly as MV2's one payload IIFE did. The two worlds' injections run in parallel — they
+   share no state (the launch record is written by the guard func before both and read only
+   by the MAIN-world files; the isolated stash only by the ISOLATED-world ones).
+   `tools/verify-mv3-package.mjs` re-derives the shard manifest, checks every cross-file
+   reference resolves, and enforces byte budgets. What MV2's single injection performed, the
+   port performs in MV2's own order — relay, wrapper, isolated injector:
 
-   The blast radius is narrow, and worth stating precisely. `lookup-elements.fn` has exactly two
-   consumers: `trusted-click-element` (declared `world: 'ISOLATED'`, so affected) and `json-edit`
-   (main-world, where `chrome.dom` was never available under MV2 either, so unchanged). The other six
-   built-in `world: 'ISOLATED'` scriptlets — `trusted-replace-node-text`, `remove-node-text`,
-   `remove-class`, `prevent-refresh`, `close-window`, `multiup` — do not use it. Procedural cosmetic
-   filters are also unaffected: `:shadow()` is evaluated by `src/js/contentscript-extra.js`, which is
-   a declarative content script and still has `chrome.dom`. So the loss is `+js(trusted-click-element,
-   … >>> …)` against a *closed* shadow root, and nothing else.
+   - `world: 'ISOLATED'`, beside `contentscript.js` — one func which does everything MV2's
+     program did, in its order: installs the scriptlet→logger relay (MV2's `uBO_bcSecret`
+     BroadcastChannel, which carries log lines from the scriptlets to `vAPI.messaging`),
+     applies MV2's once-per-document + hostname guards, records
+     `self.uBO_scriptletsInjected` where `contentscript.js` and `cosmetic-report.js` read
+     it, and hands each world's launch record to its library. The popup panel's "extended"
+     section lists scriptlet filters, log lines reach the logger, and the guards mean
+     exactly what they meant under MV2 — all with no `userScripts` and no toggle.
+   - `world: 'MAIN'` — the MAIN-world core shared file, heavy shared file (only when
+     needed), shards and launcher, each an
+     IIFE (the page's global object is left untouched, as MV2's payload IIFE
+     left it). The launch record is the one DOM write in the whole design: the
+     ISOLATED func writes `{ globals, args, calls }` to
+     `document.documentElement.dataset.uBOmv3Main` — a data attribute, the only state
+     that crosses from the isolated world into the page (each world has its own JS
+     wrappers, so expando properties do not cross; the DOM does) — the core shared file
+     reads it and the launcher deletes it after dispatching every call in payload order
+     inside the same silent try/catch the assembled payload used. This is the same shape
+     uBOL uses for its pre-generated scriptlet files, adapted to runtime-assembled
+     payloads and sharded for delivery cost.
+   - `world: 'ISOLATED'` again — the isolated-world shared file, shards and launcher,
+     same pattern, launched from a stash at `self.uBO_mv3IsolatedLaunch` (same world, so no
+     DOM record is needed). Documents with only isolated-world scriptlets write no DOM
+     record and inject no MAIN-world file at all.
+
+   Running in the isolated world also restores `chrome.dom.openOrClosedShadowRoot`
+   for `trusted-click-element`'s `>>>` combinator against closed shadow roots
+   (`chrome.dom` is declared for content-script worlds, which the old `USER_SCRIPT` routing
+   was denied) — confirmed live 2026-09-14: a `+js(trusted-click-element, #host >>> button)`
+   user filter clicks a button inside a `mode:'closed'` shadow root on Chrome 154 Beta,
+   identical to the MV2 build.
+
+   What it costs, precisely:
+
+   - Two `chrome.scripting` calls when both worlds fired (the func, then the two worlds'
+     file injections in parallel) versus MV2's single injection: each call is a
+     service-worker round trip, so the payloads land a millisecond-scale delay later. The
+     files of one call are injected in array order; only the launcher executes calls, after
+     every file of its world has run, so payload order is preserved exactly.
+   - The transient `data-uBO…` launch attribute is the one observable difference from MV2:
+     it exists in the DOM for roughly one round trip before the MAIN-world launcher
+     consumes and deletes it, and a page watching `documentElement` attribute mutations
+     could read the scriptlet arguments and globals during that window. MV2's payload lived
+     only inside a synchronously-removed `<script>` element, which MutationObservers could
+     not capture. The transient `uBO_mv3Lib` registry is a strictly smaller surface: it
+     holds function references only, no data, and the launcher deletes it.
+   - No scriptlet function is ever a global of either world: every generated file is an
+     IIFE, and the only cross-file channel is the transient registry the launcher deletes.
+     (The first iteration of this design did install the isolated-world functions as
+     globals of that world; the sharded libraries retire all 38 of them.)
+   - `hiddenSettings.debugScriptletInjector` and `debugScriptlets` no longer produce
+     `debugger` statements or per-call `console.error` output; they were artifacts of the
+     code-string path.
 
 3. **`matchAboutBlank` is silently dropped.** ⚠️ *Regression.* uBO passes it at ten call sites —
    six `executeScript` (`src/js/messaging.js`, `src/js/scriptlet-filtering.js`) and four
    `insertCSS`/`removeCSS` (`src/js/cosmetic-filtering.js`, `platform/common/vapi-background.js`) —
-   but MV3's `scripting`/`userScripts` have no equivalent. The nearest relation,
+   but MV3's `scripting` API has no equivalent. The nearest relation,
    `matchOriginAsFallback`, exists only on `registerContentScripts`.
 
    The declarative content script keeps `match_about_blank: true`, which the manifest generator
@@ -316,28 +386,143 @@ Chromium does not expose.
    injection. Note this is a limit on what MV3 exposes, not something the port chose — the option
    simply does not exist on those APIs.
 
-4. **WebAssembly stays disabled, matching the MV2 Chromium build.** uBO enables its WASM fast paths
-   only when the manifest CSP contains `'wasm-unsafe-eval'`. `platform/chromium/manifest.json` does
-   not, so `vAPI.canWASM` is false on MV2 Chromium too, and the generated MV3 CSP reproduces that
-   policy verbatim — this is parity, not a gap.
+4. **WebAssembly is enabled — a deliberate divergence from the MV2 Chromium build.** uBO
+   enables its WASM fast paths only when the manifest CSP contains `'wasm-unsafe-eval'`;
+   `platform/chromium/manifest.json` does not, so `vAPI.canWASM` is false on MV2 Chromium.
+   The MV3 build opts in (`platform/chromium-mv3/manifest.overlay.json` sets the
+   `extension_pages` CSP with the token) because a service worker pays the cost of these
+   engines on every cold boot: LZ4-block decompression of the ~31 MB filtering-engine
+   selfie runs 5-20x faster under the WASM codec, and the hostname/URL tries
+   (`hntrie.wasm`, `biditrie.wasm`) and the public-suffix list produce the same match
+   results as their JS implementations while being faster to start (the JS tries
+   JIT-compile tens of thousands of lines; the WASM modules stream-compile). This is the
+   one place the MV3 build is faster than the shipped MV2 build rather than merely equal
+   to it.
 
-   The opt-in now works, though, which it previously did not: both loaders fetch with a *relative*
-   path (`src/js/start.js` with `'./js/wasm/'`, `src/js/storage.js` with
-   `'./lib/publicsuffixlist/wasm/'`), which in a service worker used to resolve against `/js/` and
-   404 with the error swallowed by `ubolog`. `mv3-shims.js` now resolves relative `fetch()` URLs
-   against the package root, as `background.html` did. To enable it, add to
-   `platform/chromium-mv3/manifest.overlay.json`:
+   What the opt-in rests on:
 
-   ```json
-   "content_security_policy": {
-     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
-   }
-   ```
+   - the shims' normalized `chrome.runtime.getManifest()` hands uBO the object-form CSP as
+     a string, so its existing `'wasm-unsafe-eval'` probe flips `vAPI.canWASM` on its own;
+   - `mv3-shims.js` imports both LZ4 flavors and instantiates WASM-first with a JS
+     fallback, mirroring `src/lib/lz4/lz4-block-codec-any.js`. The WASM codec locates its
+     module through `document.currentScript`, which does not exist in a service worker, so
+     the build rewrites that lookup to a package-root-relative path
+     (`tools/patch-mv3-modules.mjs`), which the shims' `fetch()` wrapper resolves;
+   - all three `.wasm` modules are packaged by the normal copy steps and are fetched from
+     the extension's own origin — no host permission and no `web_accessible_resources`
+     entry needed (that key governs *web pages* fetching from the extension, not the
+     extension fetching itself).
+
+   **Selfie compatibility: none of the WASM paths invalidates existing selfies.** The trie
+   selfie format is engine-agnostic — `toSelfie()` serializes the cell buffer and a
+   checksum, nothing about which matcher will read it, and `fromSelfie()` loads the same
+   bytes into plain arrays (JS mode) or WASM memory (WASM mode) interchangeably
+   (`src/js/hntrie.js`, `src/js/biditrie.js`). Upstream's own `enableWASM()` is designed to
+   swap the WASM matchers in *over already-populated JS tries* mid-session, and upstream
+   runs exactly this mixed-mode reuse on Firefox — where `canWASM` is always true and the
+   user-settable `disableWebAssembly` hidden setting flips a profile between modes across
+   restarts with no selfie invalidation anywhere. The LZ4 layer is likewise codec-agnostic:
+   the block format and the header `src/js/lz4.js` writes are identical for both flavors.
+   So an update to this build loads the existing selfie as-is, under the faster engines —
+   **no one-time recompile happens**. Should a selfie ever fail to load anyway, the
+   existing defenses apply: a checksum mismatch triggers a full recompile from the compiled
+   lists, and the one-shot boot recovery reloads the extension once if even that fails.
 
 5. **The MV2 `chromium` target still exists** and still builds via `tools/make-chromium.sh`. Its
    output no longer installs in Chrome 139+, but it is left untouched on purpose — see below.
    Releases from this fork contain the MV3 package only.
 
+6. **`replace=` filters: this build tracks upstream master, the MV2 original tracks 1.74.0.**
+   Upstream commit `3ab731942` (in 1.74.1b6+) made the parser reject `replace=` rules unless the
+   platform can filter response bodies (`canFilterResponseData`), which Chromium never can — so
+   this build prunes them at compile time, while a 1.74.0-era build still compiles them into the
+   engine as runtime-inert entries. Benchmarking the two builds against the same dataset
+   therefore shows `replace=` matching 0 here and ~125 there, with every other counter
+   identical; the counts converge once the MV2 original is updated past 1.74.1b6. Nothing to
+   fix — noted so the divergence is not mistaken for a port defect in A/B comparisons.
+
+7. **Service worker deaths no longer revert session-scope state.** MV2's background page lived for
+   the whole browsing session; an MV3 service worker does not. Three classes of state used to
+   silently reset on every worker death, and are now persisted to `chrome.storage.session` (which
+   lives in the browser process, survives any number of worker deaths, and is cleared when the
+   browsing session ends — the same lifetime they had under MV2) and restored before the boot
+   sequence resolves `µb.isReadyPromise`, so popup reads never observe the un-restored state:
+
+   - **Session dynamic rules** — the un-pinned popup/firewall/switch toggles. `start.js` re-seeds
+     them from the permanent rules at every worker start; the port now serializes them through the
+     same `toString()`/`fromString()` round trip backup-restore uses, writes on a short debounce
+     after every mutation, and re-applies the snapshot after the seeding.
+   - **Per-tab page stores** — toolbar badges and popup counts. Per-tab counters (blocked/allowed,
+     by type), popup/large-media/remote-font counts, the large-media allow flag, and up to 100
+     hostname rows for the popup's per-site breakdown are snapshotted on mutation (hooked onto
+     `µb.updateToolbarIcon()`, which every count change calls) and written on a 1s debounce. A
+     snapshot is restored only when the tab's URL is unchanged since it was taken; a navigation
+     during the worker's death discards it, as those counts belong to the previous page. Closed
+     tabs evict their snapshot; at most 500 tabs hold one.
+   - **Strict-block bypasses** ("proceed anyway"). The deadline map inside `src/js/traffic.js` is
+     exposed onto the exported `webRequest` object by a build-time transform
+     (`tools/patch-mv3-modules.mjs`), persisted on the same kind of debounce, and re-applied with
+     expired entries dropped.
+
+   Windows that remain: whatever mutated in the last debounce interval before a death (0.5-2s for
+the rule sets and bypasses, 1s for page stores) is lost; the large-media allow flag is only
+piggy-backed onto the next toolbar-icon update rather than persisted at the moment of the
+toggle; hostname rows beyond 100 per tab are not kept; per-frame stores are not kept at all
+(they rebuild from navigation events); and the logger's in-memory buffer is deliberately not
+persisted — it is a bounded ring that exists only while a logger tab is actively reading it,
+and its janitor disables it after 30s without a reader, so a persisted copy would outlive its
+own usefulness while costing unbounded writes for every logged request. The snapshots are also
+**byte-budgeted** against `storage.session`'s hard 10 MB quota (writes past it fail silently):
+the flush measures `getBytesInUse()`, and past a 4 MB budget it degrades — hostname rows
+first, then whole entries oldest-dirtied first, then stored snapshots of tabs not being
+rewritten — logging once per episode so the degradation stays observable.
+
+8. **The context menu and update notifications survive a cold wake.** Chrome dispatches the event
+   which woke a terminated service worker only to listeners registered synchronously during the
+   worker's initial evaluation. uBO registers its context-menu click handler and its
+   `runtime.onUpdateAvailable` handler at the *end* of its async boot — after every filter list
+   has loaded — so the very events that wake the worker were dropped. `mv3-shims.js` now buffers
+   the first of each at module scope and `mv3-post.js` replays them once the real handlers exist.
+   Residual: only the first event of each kind per worker lifetime is buffered (a second click
+   while the lists are still loading is dropped), and the observation-only webRequest listeners
+   (`onResponseStarted`, `onSendHeaders`, `onCompleted`, …) are still registered by
+   `webRequest.start()` after boot — deliberately: they need the engines loaded to be useful, and
+   the load-bearing paths (blocking `onBeforeRequest`, `webNavigation.onCommitted`, tabs events,
+   `runtime.onConnect`, commands, alarms) are all registered at module scope already. A navigation
+   completing during boot loses only the response-time scriptlet injection attempt, which
+   `onCommitted` performs again.
+
+9. **The offscreen worker relay is epoch-namespaced, with a watchdog.** The offscreen document
+   outlives any number of service worker lifetimes, and each lifetime numbers its workers from 1
+   again — so a worker that outlived its service worker silently ate the next lifetime's messages
+   (both worker kinds ignore each other's), which stopped filter list updates with no error
+   anywhere. Every relay message now carries a per-lifetime epoch: the offscreen document
+   terminates all hosted workers when the epoch changes and ignores stragglers from an epoch it
+   has already replaced. A watchdog in the shim additionally converts a stalled round trip (offscreen
+   document vanished, worker crashed before `onerror` fired) into: one loud `console.error`, a
+   fresh worker under a fresh id with the unanswered round trips replayed, and — if that also
+   stalls — a second loud error plus the reply each consumer already handles as "give up"
+   (undefined for the reverse lookup, `broken` for the diff updater, which then falls back to full
+   downloads). Residual: a legitimately slow diff cycle (multiple hanging CDNs) can trip the 180s
+   updater budget and be retried once; the retry starts the cycle over rather than resuming
+   mid-patch, and a second trip falls back to full downloads.
+
+
+## Boot recovery
+
+uBO's boot is defensive — every phase catches its own exceptions — so a corrupt selfie or a
+broken storage backend at launch produces an extension that runs half-initialized for the
+whole browser session: nothing filtered, no recovery. The port borrows uBOL's `goodStart`
+behavior: once the boot settles, it is audited (`readyToFilter` reached, storage reads
+healthy, compiled filter data present when a filter-list selection exists), and a failed
+audit reloads the extension **exactly once** per failure streak — the retry marker lives in
+`chrome.storage.local` (session storage cannot gate it: Chrome clears session storage on
+`runtime.reload()` itself), is written only after a failed audit and before the reload, and
+is cleared only by a successful boot, so a reload loop is impossible. If the retried boot
+also fails, the port stays half-up exactly as it did before this existed. The reload clears
+`storage.session` wholesale, so the per-tab page-store snapshots do not survive a retry —
+losing session bookkeeping once, to recover a working filter engine, is the right trade.
+See the "One-shot recovery" block in `platform/chromium-mv3/mv3-post.js`.
 
 ## How the port is structured
 
@@ -352,12 +537,12 @@ Everything MV3-specific is additive:
 | `platform/chromium-mv3/sw.js` | Service worker entry, replacing `src/background.html` |
 | `platform/chromium-mv3/mv3-shims.js` | Re-creates the MV2 `chrome.*` surface and the DOM globals uBO's background expects, before any uBO module evaluates |
 | `platform/chromium-mv3/mv3-post.js` | The other half: fix-ups that can only be applied *after* uBO's modules have evaluated. Imported by `sw.js` last |
-| `platform/chromium-mv3/mv3-scriptlet-marker.js` | The wire format the two above share to carry the scriptlet filters that fired across execution worlds. Pure, so `verify-mv3-package.mjs` can round-trip it |
+| `platform/chromium-mv3/mv3-scriptlet-marker.js` | The wire format that carries a whole scriptlet injection (payloads, filters, logger channel) across the func/args boundary between the two patch modules. Pure, so `verify-mv3-package.mjs` can round-trip it |
 | `platform/chromium-mv3/offscreen.{html,js}` | Hosts web workers (a service worker cannot construct one) and keeps the worker resident |
 | `platform/chromium-mv3/manifest.overlay.json` | MV3-only manifest values |
 | `tools/make-chromium-mv3.sh` | Build, mirroring `tools/make-chromium.sh` |
 | `tools/make-chromium-mv3-meta.py` | Derives the MV3 manifest from the MV2 one |
-| `tools/patch-mv3-modules.mjs` | Rewrites uBO's dynamic `import()` calls in the build output (forbidden in a service worker) |
+| `tools/patch-mv3-modules.mjs` | Rewrites uBO's dynamic `import()` calls in the build output (forbidden in a service worker), aliases `chrome.browserAction` for extension pages, makes the WASM LZ4 codec service-worker-safe, generates the sharded scriptlet libraries (`js/mv3-scriptlet-shared.js`, `js/mv3-mainworld-shared-core.js` + `-shared-heavy.js`, `-library-NN.js` shards and `-launch.js` per world, plus the `js/mv3-scriptlet-shards.js` manifest `mv3-shims.js` computes per-navigation file sets from), and exposes the strict-block bypass deadline map so `mv3-post.js` can persist it |
 | `tools/verify-mv3-package.mjs` | Asserts the package shape, every upstream assumption the port hard-codes, and that the port's own modules parse |
 | `tools/make-crx.mjs` | CRX3 packer and update-manifest generator |
 

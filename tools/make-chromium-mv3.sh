@@ -55,6 +55,27 @@ python3 tools/make-chromium-mv3-meta.py $DES/
 echo "*** uBlock0.chromium-mv3: Patching service worker modules..."
 node tools/patch-mv3-modules.mjs --dir $DES
 
+# The patcher above is a plain regex pass, not a JS parser: an upstream string
+# literal or comment containing "import(" would be rewritten in place and
+# shipped silently. Syntax-check every packaged JS file (module first, then
+# classic -- uBO's lib/ contains both flavors) so a mangled file fails the
+# build instead of the service worker.
+echo "*** uBlock0.chromium-mv3: Syntax-checking packaged modules..."
+find $DES -name '*.js' -type f -print0 | while IFS= read -r -d '' f; do
+    if ! mod_err=$(node --input-type=module --check < "$f" 2>&1); then
+        if ! cjs_err=$(node --input-type=commonjs --check < "$f" 2>&1); then
+            {
+                echo "SYNTAX FAIL: $f"
+                echo "--- checked as module ---"
+                echo "$mod_err"
+                echo "--- checked as commonjs ---"
+                echo "$cjs_err"
+            } >&2
+            exit 1
+        fi
+    fi
+done
+
 # tools/pull-assets.sh clones uAssets at the tip of master/gh-pages, so two
 # builds of the same tag can embed different filter lists. Record exactly what
 # went in, so a "version X misbehaves" report is actionable.

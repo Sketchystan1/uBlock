@@ -21,17 +21,26 @@
 
 /*******************************************************************************
 
-    Carries the list of scriptlet filters that fired from `mv3-post.js`, which
-    knows it, to `mv3-shims.js`, which needs it in a different execution world.
+    Carries a whole scriptlet injection from `mv3-post.js`, which knows it, to
+    `mv3-shims.js`, which can only inject functions and JSON.
 
-    Under MV2 the wrapper returned by `vAPI.scriptletsInjector` recorded those
-    filters in `self.uBO_scriptletsInjected`, in the same isolated world as
-    `contentscript.js`. Under MV3 the wrapper is a code string, so only
-    `chrome.userScripts` can inject it, and its only non-`MAIN` world is
-    `USER_SCRIPT` -- where neither of the marker's readers can see it. The two
-    ends of this module put it back: `mv3-post.js` prefixes the wrapper's output
-    with an encoded marker, and `mv3-shims.js` peels it off before injecting and
-    replays it into the `ISOLATED` world.
+    `chrome.scripting` -- the one injection API left to this port, now that
+    `chrome.userScripts` is gone -- accepts a `func` and JSON-serializable
+    `args`, but never a code string. uBO assembles scriptlets as code strings,
+    so the assembled program can no longer be *executed*: it is demoted to
+    data, and everything needed to perform the injection properly rides in
+    this marker instead. `mv3-post.js` prefixes the wrapper's output with it,
+    and `mv3-shims.js` peels it off and performs the injection it describes:
+    the scriptlet calls for both worlds, parsed back out of their payloads
+    (executed by generated function libraries -- a MAIN-world file reading
+    its launch record from a DOM data attribute the ISOLATED injection func
+    writes, and an ISOLATED-world file reading a stash; both file-class
+    injections are CSP-exempt, which is how scriptlets deliver on strict-CSP
+    pages exactly as MV2 delivered them), the per-document
+    `scriptletGlobals`, the filters that fired (for the
+    `self.uBO_scriptletsInjected` marker), the `bcSecret` BroadcastChannel
+    name (for the scriptlet->logger relay) when the logger is on, and whether
+    only isolated-world scriptlets fired.
 
     It lives in a module of its own, with no dependency on `chrome.*` or the DOM,
     for two reasons: the two ends must not drift apart, and
@@ -69,8 +78,10 @@ export function encodeScriptletMarker(details) {
 }
 
 // Returns the code with the marker removed, plus whatever it carried --
-// `undefined` when there is no marker, which is the normal case for a document
-// where only isolated-world scriptlets fired.
+// `undefined` when there is no marker. With `mv3-post.js` in place every
+// scriptlet injection carries one, including documents where only
+// isolated-world scriptlets fired; an absent marker means the code did not
+// come from the scriptlet injector at all.
 export function decodeScriptletMarker(code) {
     const match = reMarker.exec(code);
     if ( match === null ) {

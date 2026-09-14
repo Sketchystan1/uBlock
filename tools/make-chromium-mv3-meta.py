@@ -63,16 +63,14 @@ for src_key, dst_key in (
     if hosts:
         manifest[dst_key] = sorted(hosts)
 
-# content_security_policy: string -> object.
-#
-# Deliberately the same policy string as MV2. uBO decides whether it may use
-# WebAssembly by looking for 'wasm-unsafe-eval' in this value (see
-# platform/common/vapi-background.js), so keeping it verbatim keeps behaviour
-# identical to the MV2 Chromium build. Adding 'wasm-unsafe-eval' here is a
-# supported opt-in -- see docs/mv3-deployment.md.
-csp = manifest.get('content_security_policy')
-if isinstance(csp, str):
-    manifest['content_security_policy'] = {'extension_pages': csp}
+# content_security_policy is supplied entirely by the overlay
+# (platform/chromium-mv3/manifest.overlay.json) and applied verbatim by the
+# overlay loop below, so no base-manifest transform is needed here. The overlay
+# policy is the MV2 string plus 'wasm-unsafe-eval', which lets the service worker
+# run the WASM LZ4 codec (see tools/patch-mv3-modules.mjs and
+# docs/mv3-deployment.md); MV3 therefore enables WebAssembly where the MV2
+# Chromium build does not. uBO detects this by looking for 'wasm-unsafe-eval' in
+# the effective policy (see platform/common/vapi-background.js).
 
 # web_accessible_resources: [str] -> [{ resources, matches }].
 #
@@ -86,12 +84,38 @@ if isinstance(war, list) and war and isinstance(war[0], str):
         'matches': ['<all_urls>'],
     }]
 
-# Apply the overlay. Keys replace the transformed value, except "permissions",
-# which is unioned so that upstream additions survive.
+# Apply the overlay. Keys replace the transformed value, except where a plain
+# replacement could silently weaken a value the OTHER side owns:
+# - "permissions" is unioned, so upstream additions survive.
+# - "minimum_chrome_version" becomes the MAXIMUM of the base and overlay
+#   values. The overlay carries the oldest Chrome the MV3 port itself
+#   supports, but upstream owns the other bound and can raise the MV2
+#   minimum past ours at any time; a plain replacement would mask the raise
+#   and ship an MV3 build that claims to run on a Chrome upstream's own code
+#   no longer supports. Chrome version values are dotted numerics, compared
+#   component by component ("139.0" > "138.0.7"; a missing component counts
+#   as 0, which is tuple comparison).
+def chrome_version_key(value):
+    return tuple(int(part) for part in str(value).split('.'))
+
 for key, value in overlay.items():
     if key == 'permissions':
         existing = manifest.get(key, [])
         manifest[key] = sorted(set(existing) | set(value))
+    elif key == 'minimum_chrome_version':
+        base = manifest.get(key)
+        if base is None:
+            manifest[key] = value
+        else:
+            try:
+                manifest[key] = max((base, value), key=chrome_version_key)
+            except ValueError:
+                # Refuse to guess which requirement is stronger rather than
+                # silently dropping one of them.
+                raise SystemExit(
+                    'minimum_chrome_version must be dotted-numeric to compare '
+                    f'(base {base!r}, overlay {value!r})'
+                )
     else:
         manifest[key] = value
 
