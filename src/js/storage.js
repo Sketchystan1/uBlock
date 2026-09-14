@@ -451,28 +451,8 @@ onBroadcast(msg => {
 /******************************************************************************/
 
 µb.loadSelectedFilterLists = async function() {
-    // `vAPI.storage.get()` fulfills with `null` when the read failed, and
-    // with an object -- possibly an empty one -- otherwise. A failed read
-    // must not be handled as a first-time launch: persisting the default
-    // selection over an unread one would silently revert the user's own
-    // selection.
-    let bin = null;
-    // A failed read may be the result of a transient condition, retry.
-    for ( let i = 0; i < 3 && bin === null; i++ ) {
-        if ( i !== 0 ) { await vAPI.defer.once(1000); }
-        bin = await vAPI.storage.get('selectedFilterLists');
-    }
-    // Record whether the read failed so downstream consumers (e.g. selfie
-    // creation) can tell an empty selection caused by a failed read apart
-    // from one the user deliberately chose.
-    this.selectedFilterListsReadFailed = bin === null;
-    if ( bin === null ) {
-        // Keep the current selection as-is, and write nothing. The selection
-        // will be read again at next launch.
-        ubolog(`Selected filter lists could not be read from storage`);
-        return;
-    }
-    if ( Array.isArray(bin.selectedFilterLists) ) {
+    const bin = await vAPI.storage.get('selectedFilterLists');
+    if ( bin instanceof Object && Array.isArray(bin.selectedFilterLists) ) {
         this.selectedFilterLists = bin.selectedFilterLists;
         return;
     }
@@ -1329,19 +1309,6 @@ onBroadcast(msg => {
         createTimer.off();
         if ( µb.inMemoryFilters.length !== 0 ) { return; }
         if ( Object.keys(µb.availableFilterLists).length === 0 ) { return; }
-        // A selfie built from an empty filtering engine is legitimate only
-        // when the empty selection is the user's own choice. If the selection
-        // could not be read this launch, the empty engine is not trustworthy:
-        // skip the selfie so it does not overwrite a valid one, letting the
-        // real selection be read again at next launch. An empty selection from
-        // a successful read is a valid state, and a selfie is created for it as
-        // usual, avoiding a needless full re-parse at every launch.
-        if (
-            µb.selectedFilterLists.length === 0 &&
-            µb.selectedFilterListsReadFailed
-        ) {
-            return;
-        }
         await Promise.all([
             io.toCache('selfie/staticMain', {
                 magic: µb.systemSettings.selfieMagic,

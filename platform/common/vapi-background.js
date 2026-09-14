@@ -130,18 +130,10 @@ vAPI.sessionStorage = browser.storage.session || {
  * */
 
 vAPI.storage = {
-    // A read which did not fulfill with an object means it failed, in
-    // which case fulfill with `null`, so as to allow callers to
-    // distinguish a failed read from a successful one which found no
-    // data to return.
     get(key, ...args) {
-        return webext.storage.local.get(key, ...args).then(
-            bin => bin instanceof Object ? bin : null,
-            reason => {
-                console.log(reason);
-                return null;
-            }
-        );
+        return webext.storage.local.get(key, ...args).catch(reason => {
+            console.log(reason);
+        });
     },
     set(...args) {
         return webext.storage.local.set(...args).catch(reason => {

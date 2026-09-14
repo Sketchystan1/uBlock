@@ -24,7 +24,7 @@
 
     Apply MV3 fix-ups to the built package that can only be made to the output.
 
-    Five transforms, all against the BUILD OUTPUT and never the source tree:
+    Six transforms, all against the BUILD OUTPUT and never the source tree:
     the port must not modify a single upstream file, so that the unattended
     merge from upstream can never conflict. Transforming the copy is the same
     approach the port already takes for the manifest.
@@ -101,6 +101,36 @@
     This is what makes the WASM LZ4 flavor -- opted into with 'wasm-unsafe-eval'
     in platform/chromium-mv3/manifest.overlay.json -- reachable at all. See the
     injection site below for the full rationale.
+
+    6. Harden the MV3 runtime against mid-boot messages and failed storage
+       reads, in `js/vapi-background.js`, `js/messaging.js` and `js/storage.js`.
+
+    A service worker is not a background page: Chrome can dispatch an extension
+    message at any point of the boot sequence -- while start.js is still
+    awaiting its first asset fetch, or after a launch that threw partway
+    through and left the worker half-up. The handlers this covers (the
+    popup-panel commands, and getLists) report or mutate state which is fully
+    initialized only at the very end of the launch sequence, so they await
+    `µb.isReadyPromise` -- a promise created with a resolve handler only and
+    resolved as the last statement of a *successful* launch (see background.js
+    and start.js); a failed launch leaves it pending forever, and a handler
+    awaiting it hangs the reply `callback` (the popup panel never paints). The
+    `whenReady()` helper races readiness against a bounded timeout, answers the
+    callback exactly once, and degrades gracefully on timeout or error.
+    Symmetrically, a failed storage read must not be treated as a first-run:
+    upstream `vAPI.storage.get()` swallows the read error and fulfills with
+    `undefined`, indistinguishable from "no data found". It is made to fulfill
+    with `null` on failure, and `µb.loadSelectedFilterLists` retries the read,
+    records the failure and keeps the current selection -- persisting the
+    default selection over an unread one would silently revert the user's own,
+    and a selfie built from the empty engine a failed read leaves behind would
+    overwrite a valid one.
+
+    These are upstream files, so the hardening is applied here, against the
+    build output. The patched bytes are identical, hunk for hunk, to the
+    source-modified versions this transform replaces; because of that, no
+    marker comment is added to the patched text and idempotency is probed on
+    a substring unique to it instead (see the section below).
 
     Usage: node tools/patch-mv3-modules.mjs [--dir <package-dir>]
 
@@ -446,6 +476,506 @@ for ( const rel of conflicts ) {
             `*** patch-mv3-modules: ${rel} resolves its wasm module ` +
             `through the package root`
         );
+    }
+}
+
+/******************************************************************************/
+/******************************************************************************/
+
+// Harden the MV3 runtime against mid-boot messages and failed storage reads.
+// See the header comment (transform 6) for the full rationale.
+//
+// Each edit's anchor is upstream's exact code -- the whole diff hunk plus the
+// context lines around it, so the anchor is unique in the file -- and any
+// upstream drift inside a region fails the build rather than shipping a
+// half-hardened runtime. Unlike the other transforms, no marker comment is
+// added to the patched text: the output must stay byte-identical to the
+// source-modified code this replaces (parts of it are pinned by
+// tools/verify-mv3-package.mjs), so idempotency is probed on a substring
+// unique to the patched text instead. The edits below do not touch any
+// dynamic `import(` text, so they cannot interact with transform 1's rewrite
+// pass, which has already run by the time this section executes.
+
+{
+    const RUNTIME_HARDENING = [
+        {
+            // js/vapi-background.js -- vAPI.storage.get() fulfills with `null`
+            // when the read failed, so callers can tell a failed read from a
+            // successful one which found no data. The one-shot boot recovery in
+            // mv3-post.js probes exactly this as its storage-health signal.
+            rel: 'js/vapi-background.js',
+            probe: 'bin instanceof Object ? bin : null',
+            edits: [
+                // 1. (anchor: 10 lines, replacement: 18 lines)
+                {
+                    anchor: [
+                        ' * */',
+                        '',
+                        'vAPI.storage = {',
+                        '    get(key, ...args) {',
+                        '        return webext.storage.local.get(key, ...args).catch(reason => {',
+                        '            console.log(reason);',
+                        '        });',
+                        '    },',
+                        '    set(...args) {',
+                        '        return webext.storage.local.set(...args).catch(reason => {',
+                    ],
+                    replacement: [
+                        ' * */',
+                        '',
+                        'vAPI.storage = {',
+                        '    // A read which did not fulfill with an object means it failed, in',
+                        '    // which case fulfill with `null`, so as to allow callers to',
+                        '    // distinguish a failed read from a successful one which found no',
+                        '    // data to return.',
+                        '    get(key, ...args) {',
+                        '        return webext.storage.local.get(key, ...args).then(',
+                        '            bin => bin instanceof Object ? bin : null,',
+                        '            reason => {',
+                        '                console.log(reason);',
+                        '                return null;',
+                        '            }',
+                        '        );',
+                        '    },',
+                        '    set(...args) {',
+                        '        return webext.storage.local.set(...args).catch(reason => {',
+                    ],
+                },
+            ],
+        },
+        {
+            // js/messaging.js -- the `whenReady()` helper plus the eight handlers
+            // routed through it: getPopupData, launchReporter, revertFirewallRules,
+            // saveFirewallRules, toggleHostnameSwitch, toggleFirewallRule,
+            // toggleNetFiltering and getLists.
+            rel: 'js/messaging.js',
+            probe: 'const whenReady = (( ) => {',
+            edits: [
+                // 1. (anchor: 6 lines, replacement: 38 lines)
+                {
+                    anchor: [
+                        '/******************************************************************************/',
+                        '/******************************************************************************/',
+                        '',
+                        '// Channel:',
+                        '//      popupPanel',
+                        '//      privileged',
+                    ],
+                    replacement: [
+                        '/******************************************************************************/',
+                        '/******************************************************************************/',
+                        '',
+                        '// Several message handlers routed through `whenReady()` (the popup-panel',
+                        '// commands, and `getLists`) report or mutate state which is fully initialized',
+                        '// only at the very end of the launch sequence, so they must wait on',
+                        '// `µb.isReadyPromise`. That promise is created with a resolve handler only (see',
+                        '// background.js) and is resolved as the last statement of a *successful* launch',
+                        '// (see start.js); a launch which throws at an earlier `await` leaves it forever',
+                        '// pending. To ensure the framework\'s reply `callback` is invoked exactly once',
+                        '// -- so the caller never hangs and the reply callback is never leaked -- race',
+                        '// readiness against a bounded timeout and degrade gracefully on timeout or',
+                        '// error. `fn` performs the work and resolves to the response; `fallback`',
+                        '// resolves to a safe degraded response (default: no data).',
+                        'const whenReady = (( ) => {',
+                        '    const readyTimeout = { sec: 5 };',
+                        '    return (callback, fn, fallback) => {',
+                        '        let answered = false;',
+                        '        const answer = response => {',
+                        '            if ( answered ) { return; }',
+                        '            answered = true;',
+                        '            callback(response);',
+                        '        };',
+                        '        const degrade = ( ) => {',
+                        '            if ( answered ) { return; }',
+                        '            Promise.resolve().then(fallback).then(answer, ( ) => answer());',
+                        '        };',
+                        '        µb.isReadyPromise.then(fn).then(answer, degrade);',
+                        '        vAPI.defer.once(readyTimeout).then(degrade);',
+                        '    };',
+                        '})();',
+                        '',
+                        '/******************************************************************************/',
+                        '/******************************************************************************/',
+                        '',
+                        '// Channel:',
+                        '//      popupPanel',
+                        '//      privileged',
+                    ],
+                },
+                // 2. (anchor: 10 lines, replacement: 15 lines)
+                {
+                    anchor: [
+                        '        return;',
+                        '',
+                        '    case \'getPopupData\':',
+                        '        popupDataFromRequest(request).then(popupData => {',
+                        '            callback(popupData);',
+                        '        });',
+                        '        return;',
+                        '',
+                        '    default:',
+                        '        break;',
+                    ],
+                    replacement: [
+                        '        return;',
+                        '',
+                        '    case \'getPopupData\':',
+                        '        // Answer only once uBO is fully launched: page stores are bound to',
+                        '        // existing tabs at the end of the launch sequence, and answering',
+                        '        // before that would report a not-yet-initialized state, i.e. one',
+                        '        // where the current site appears to not be filtered at all.',
+                        '        return whenReady(',
+                        '            callback,',
+                        '            ( ) => popupDataFromRequest(request),',
+                        '            ( ) => popupDataFromRequest(request).catch(( ) => ({}))',
+                        '        );',
+                        '',
+                        '    default:',
+                        '        break;',
+                    ],
+                },
+                // 3. (anchor: 77 lines, replacement: 86 lines)
+                {
+                    anchor: [
+                        '        break;',
+                        '    }',
+                        '',
+                        '    case \'launchReporter\': {',
+                        '        launchReporter(request).then(url => {',
+                        '            if ( typeof url !== \'string\' ) { return; }',
+                        '            µb.openNewTab({ url, select: true, index: -1 });',
+                        '        });',
+                        '        break;',
+                        '    }',
+                        '',
+                        '    case \'revertFirewallRules\':',
+                        '        // TODO: use Set() to message around sets of hostnames',
+                        '        sessionFirewall.copyRules(',
+                        '            permanentFirewall,',
+                        '            request.srcHostname,',
+                        '            Object.assign(Object.create(null), request.desHostnames)',
+                        '        );',
+                        '        sessionSwitches.copyRules(',
+                        '            permanentSwitches,',
+                        '            request.srcHostname',
+                        '        );',
+                        '        // https://github.com/gorhill/uBlock/issues/188',
+                        '        cosmeticFilteringEngine.removeFromSelectorCache(',
+                        '            request.srcHostname,',
+                        '            \'net\'',
+                        '        );',
+                        '        µb.updateToolbarIcon(request.tabId, 0b100);',
+                        '        response = popupDataFromTabId(request.tabId);',
+                        '        break;',
+                        '',
+                        '    case \'saveFirewallRules\':',
+                        '        // TODO: use Set() to message around sets of hostnames',
+                        '        if (',
+                        '            permanentFirewall.copyRules(',
+                        '                sessionFirewall,',
+                        '                request.srcHostname,',
+                        '                Object.assign(Object.create(null), request.desHostnames)',
+                        '            )',
+                        '        ) {',
+                        '            µb.savePermanentFirewallRules();',
+                        '        }',
+                        '        if (',
+                        '            permanentSwitches.copyRules(',
+                        '                sessionSwitches,',
+                        '                request.srcHostname',
+                        '            )',
+                        '        ) {',
+                        '            µb.saveHostnameSwitches();',
+                        '        }',
+                        '        break;',
+                        '',
+                        '    case \'toggleHostnameSwitch\':',
+                        '        µb.toggleHostnameSwitch(request);',
+                        '        response = popupDataFromTabId(request.tabId);',
+                        '        break;',
+                        '',
+                        '    case \'toggleFirewallRule\':',
+                        '        µb.toggleFirewallRule(request);',
+                        '        response = popupDataFromTabId(request.tabId);',
+                        '        break;',
+                        '',
+                        '    case \'toggleNetFiltering\': {',
+                        '        const pageStore = µb.pageStoreFromTabId(request.tabId);',
+                        '        if ( pageStore ) {',
+                        '            pageStore.toggleNetFilteringSwitch(',
+                        '                request.url,',
+                        '                request.scope,',
+                        '                request.state',
+                        '            );',
+                        '            µb.updateToolbarIcon(request.tabId, 0b111);',
+                        '        }',
+                        '        break;',
+                        '    }',
+                        '    default:',
+                        '        return vAPI.messaging.UNHANDLED;',
+                        '    }',
+                    ],
+                    replacement: [
+                        '        break;',
+                        '    }',
+                        '',
+                        '    // The commands below act on -- or report -- state which is fully',
+                        '    // initialized only by the end of the launch sequence: page stores,',
+                        '    // per-session and persistent rulesets. Defer them until then, else',
+                        '    // they would act on a not-yet-initialized state: a toggle command',
+                        '    // would be silently dropped, or worse a not-yet-loaded ruleset would',
+                        '    // be persisted over the user\'s own.',
+                        '    case \'launchReporter\':',
+                        '        return whenReady(callback, ( ) => launchReporter(request).then(url => {',
+                        '            if ( typeof url !== \'string\' ) { return; }',
+                        '            µb.openNewTab({ url, select: true, index: -1 });',
+                        '        }));',
+                        '',
+                        '    case \'revertFirewallRules\':',
+                        '        return whenReady(callback, ( ) => {',
+                        '            // TODO: use Set() to message around sets of hostnames',
+                        '            sessionFirewall.copyRules(',
+                        '                permanentFirewall,',
+                        '                request.srcHostname,',
+                        '                Object.assign(Object.create(null), request.desHostnames)',
+                        '            );',
+                        '            sessionSwitches.copyRules(',
+                        '                permanentSwitches,',
+                        '                request.srcHostname',
+                        '            );',
+                        '            // https://github.com/gorhill/uBlock/issues/188',
+                        '            cosmeticFilteringEngine.removeFromSelectorCache(',
+                        '                request.srcHostname,',
+                        '                \'net\'',
+                        '            );',
+                        '            µb.updateToolbarIcon(request.tabId, 0b100);',
+                        '            return popupDataFromTabId(request.tabId);',
+                        '        }, ( ) => popupDataFromTabId(request.tabId));',
+                        '',
+                        '    case \'saveFirewallRules\':',
+                        '        return whenReady(callback, ( ) => {',
+                        '            // TODO: use Set() to message around sets of hostnames',
+                        '            if (',
+                        '                permanentFirewall.copyRules(',
+                        '                    sessionFirewall,',
+                        '                    request.srcHostname,',
+                        '                    Object.assign(Object.create(null), request.desHostnames)',
+                        '                )',
+                        '            ) {',
+                        '                µb.savePermanentFirewallRules();',
+                        '            }',
+                        '            if (',
+                        '                permanentSwitches.copyRules(',
+                        '                    sessionSwitches,',
+                        '                    request.srcHostname',
+                        '                )',
+                        '            ) {',
+                        '                µb.saveHostnameSwitches();',
+                        '            }',
+                        '        });',
+                        '',
+                        '    case \'toggleHostnameSwitch\':',
+                        '        return whenReady(callback, ( ) => {',
+                        '            µb.toggleHostnameSwitch(request);',
+                        '            return popupDataFromTabId(request.tabId);',
+                        '        }, ( ) => popupDataFromTabId(request.tabId));',
+                        '',
+                        '    case \'toggleFirewallRule\':',
+                        '        return whenReady(callback, ( ) => {',
+                        '            µb.toggleFirewallRule(request);',
+                        '            return popupDataFromTabId(request.tabId);',
+                        '        }, ( ) => popupDataFromTabId(request.tabId));',
+                        '',
+                        '    case \'toggleNetFiltering\':',
+                        '        return whenReady(callback, ( ) => {',
+                        '            const pageStore = µb.pageStoreFromTabId(request.tabId);',
+                        '            if ( pageStore ) {',
+                        '                pageStore.toggleNetFilteringSwitch(',
+                        '                    request.url,',
+                        '                    request.scope,',
+                        '                    request.state',
+                        '                );',
+                        '                µb.updateToolbarIcon(request.tabId, 0b111);',
+                        '            }',
+                        '        });',
+                        '',
+                        '    default:',
+                        '        return vAPI.messaging.UNHANDLED;',
+                        '    }',
+                    ],
+                },
+                // 4. (anchor: 9 lines, replacement: 20 lines)
+                {
+                    anchor: [
+                        '        });',
+                        '',
+                        '    case \'getLists\':',
+                        '        return µb.isReadyPromise.then(( ) => {',
+                        '            getLists(callback);',
+                        '        });',
+                        '',
+                        '    case \'getLocalData\':',
+                        '        return getLocalData().then(localData => {',
+                    ],
+                    replacement: [
+                        '        });',
+                        '',
+                        '    case \'getLists\':',
+                        '        // Same readiness/hang guard as the popup-panel commands: `getLists`',
+                        '        // reads engine state that is only valid at the end of the launch',
+                        '        // sequence, and `µb.isReadyPromise` stays pending forever on a failed',
+                        '        // launch. Route through `whenReady()` so the reply callback fires',
+                        '        // exactly once -- with the lists on success, or an empty (but',
+                        '        // object-shaped) degraded response on timeout/error so the dashboard\'s',
+                        '        // `Object.entries(response.available)` cannot throw.',
+                        '        return whenReady(',
+                        '            callback,',
+                        '            ( ) => new Promise((resolve, reject) => {',
+                        '                getLists(resolve).then(undefined, reject);',
+                        '            }),',
+                        '            ( ) => ({ available: {}, cache: {} })',
+                        '        );',
+                        '',
+                        '    case \'getLocalData\':',
+                        '        return getLocalData().then(localData => {',
+                    ],
+                },
+            ],
+        },
+        {
+            // js/storage.js -- µb.loadSelectedFilterLists retries a failed read
+            // (3 attempts, 1s apart), records selectedFilterListsReadFailed and
+            // keeps the current selection when the read fails; selfie creation is
+            // skipped when the selection is empty AND the read failed.
+            rel: 'js/storage.js',
+            probe: 'selectedFilterListsReadFailed',
+            edits: [
+                // 1. (anchor: 8 lines, replacement: 28 lines)
+                {
+                    anchor: [
+                        '/******************************************************************************/',
+                        '',
+                        'µb.loadSelectedFilterLists = async function() {',
+                        '    const bin = await vAPI.storage.get(\'selectedFilterLists\');',
+                        '    if ( bin instanceof Object && Array.isArray(bin.selectedFilterLists) ) {',
+                        '        this.selectedFilterLists = bin.selectedFilterLists;',
+                        '        return;',
+                        '    }',
+                    ],
+                    replacement: [
+                        '/******************************************************************************/',
+                        '',
+                        'µb.loadSelectedFilterLists = async function() {',
+                        '    // `vAPI.storage.get()` fulfills with `null` when the read failed, and',
+                        '    // with an object -- possibly an empty one -- otherwise. A failed read',
+                        '    // must not be handled as a first-time launch: persisting the default',
+                        '    // selection over an unread one would silently revert the user\'s own',
+                        '    // selection.',
+                        '    let bin = null;',
+                        '    // A failed read may be the result of a transient condition, retry.',
+                        '    for ( let i = 0; i < 3 && bin === null; i++ ) {',
+                        '        if ( i !== 0 ) { await vAPI.defer.once(1000); }',
+                        '        bin = await vAPI.storage.get(\'selectedFilterLists\');',
+                        '    }',
+                        '    // Record whether the read failed so downstream consumers (e.g. selfie',
+                        '    // creation) can tell an empty selection caused by a failed read apart',
+                        '    // from one the user deliberately chose.',
+                        '    this.selectedFilterListsReadFailed = bin === null;',
+                        '    if ( bin === null ) {',
+                        '        // Keep the current selection as-is, and write nothing. The selection',
+                        '        // will be read again at next launch.',
+                        '        ubolog(`Selected filter lists could not be read from storage`);',
+                        '        return;',
+                        '    }',
+                        '    if ( Array.isArray(bin.selectedFilterLists) ) {',
+                        '        this.selectedFilterLists = bin.selectedFilterLists;',
+                        '        return;',
+                        '    }',
+                    ],
+                },
+                // 2. (anchor: 6 lines, replacement: 19 lines)
+                {
+                    anchor: [
+                        '        createTimer.off();',
+                        '        if ( µb.inMemoryFilters.length !== 0 ) { return; }',
+                        '        if ( Object.keys(µb.availableFilterLists).length === 0 ) { return; }',
+                        '        await Promise.all([',
+                        '            io.toCache(\'selfie/staticMain\', {',
+                        '                magic: µb.systemSettings.selfieMagic,',
+                    ],
+                    replacement: [
+                        '        createTimer.off();',
+                        '        if ( µb.inMemoryFilters.length !== 0 ) { return; }',
+                        '        if ( Object.keys(µb.availableFilterLists).length === 0 ) { return; }',
+                        '        // A selfie built from an empty filtering engine is legitimate only',
+                        '        // when the empty selection is the user\'s own choice. If the selection',
+                        '        // could not be read this launch, the empty engine is not trustworthy:',
+                        '        // skip the selfie so it does not overwrite a valid one, letting the',
+                        '        // real selection be read again at next launch. An empty selection from',
+                        '        // a successful read is a valid state, and a selfie is created for it as',
+                        '        // usual, avoiding a needless full re-parse at every launch.',
+                        '        if (',
+                        '            µb.selectedFilterLists.length === 0 &&',
+                        '            µb.selectedFilterListsReadFailed',
+                        '        ) {',
+                        '            return;',
+                        '        }',
+                        '        await Promise.all([',
+                        '            io.toCache(\'selfie/staticMain\', {',
+                        '                magic: µb.systemSettings.selfieMagic,',
+                    ],
+                },
+            ],
+        },
+    ];
+
+    for ( const { rel, probe, edits } of RUNTIME_HARDENING ) {
+        const abs = path.join(pkgDir, rel);
+        if ( swGraph.has(rel) === false ) {
+            console.error(
+                `*** patch-mv3-modules: ${rel} is not reachable from js/sw.js; ` +
+                `cannot apply the runtime hardening`
+            );
+            process.exit(1);
+        } else if ( fs.existsSync(abs) === false ) {
+            console.error(
+                `*** patch-mv3-modules: ${rel} missing; cannot apply the ` +
+                `runtime hardening`
+            );
+            process.exit(1);
+        } else {
+            const src = fs.readFileSync(abs, 'utf8');
+            if ( src.includes(probe) ) {
+                console.log(
+                    `*** patch-mv3-modules: ${rel} is already hardened ` +
+                    `against mid-boot messages and failed reads`
+                );
+            } else {
+                const eol = src.includes('\r\n') ? '\r\n' : '\n';
+                let out = src;
+                for ( const [ i, edit ] of edits.entries() ) {
+                    const anchor = edit.anchor.join(eol);
+                    const count = out.split(anchor).length - 1;
+                    if ( count !== 1 ) {
+                        console.error(
+                            `*** patch-mv3-modules: ${rel} contains ${count} ` +
+                            `occurrence(s) of edit ${i + 1} of ${edits.length} ` +
+                            `of the runtime hardening (expected exactly 1):\n` +
+                            `${anchor}\n` +
+                            `    Reconcile tools/patch-mv3-modules.mjs with ` +
+                            `the new upstream shape.`
+                        );
+                        process.exit(1);
+                    }
+                    out = out.replace(anchor, ( ) => edit.replacement.join(eol));
+                }
+                fs.writeFileSync(abs, out);
+                console.log(
+                    `*** patch-mv3-modules: ${rel} hardened against mid-boot ` +
+                    `messages and failed storage reads (${edits.length} edit(s))`
+                );
+            }
+        }
     }
 }
 

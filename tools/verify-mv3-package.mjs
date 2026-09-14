@@ -1484,12 +1484,17 @@ section('port self-checks');
           'start.js no longer sets readyToFilter, which the boot audit reads' ],
         [ 'src/js/background.js', /readyToFilter: false,/,
           'background.js no longer initializes readyToFilter' ],
-        [ 'platform/common/vapi-background.js', /bin instanceof Object \? bin : null/,
-          'vAPI.storage.get no longer fulfills with null on failure, which the boot audit uses as its storage-health signal' ],
     ];
     for ( const [ rel, re, message ] of drift ) {
         if ( re.test(readRepo(rel)) ) { continue; }
         problems.push(`${rel}: ${message}`);
+    }
+    // vAPI.storage.get's null-on-failure fulfillment is a build-time
+    // transform (tools/patch-mv3-modules.mjs, transform 6) applied to the
+    // packaged copy -- the source tree is upstream's again -- so this pin
+    // reads the package, not the repo.
+    if ( /bin instanceof Object \? bin : null/.test(readPkg('js/vapi-background.js')) === false ) {
+        problems.push('js/vapi-background.js: vAPI.storage.get no longer fulfills with null on failure, which the boot audit uses as its storage-health signal');
     }
     if ( problems.length !== 0 ) {
         fail('boot-recovery', problems.join('\n'),

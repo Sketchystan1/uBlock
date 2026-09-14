@@ -524,6 +524,21 @@ also fails, the port stays half-up exactly as it did before this existed. The re
 losing session bookkeeping once, to recover a working filter engine, is the right trade.
 See the "One-shot recovery" block in `platform/chromium-mv3/mv3-post.js`.
 
+Two related guards cover what the UI sees while a worker is half-up. They patch upstream
+files, so they are applied by the same build-time mechanism as the bypass-map exposure
+(`tools/patch-mv3-modules.mjs`, transform 6 — against the build output, keeping the
+zero-conflict property). First, the popup-panel commands and `getLists` are routed through
+a `whenReady()` wrapper racing `µb.isReadyPromise` against a 5 s timeout: that promise is
+resolve-only and stays pending forever on a launch that threw partway, so a handler
+awaiting it hangs the reply callback — the popup panel or dashboard never paints — and on
+timeout the handler now answers with a safe degraded response instead. Second,
+`vAPI.storage.get()` is made to fulfill with `null` on a failed read (upstream swallows
+the error into `undefined`, indistinguishable from "no data found"), which
+`µb.loadSelectedFilterLists` uses to retry the read and keep the current selection —
+persisting the default selection over an unread one would silently revert the user's own —
+and to skip the selfie an empty-because-unread selection would otherwise overwrite a valid
+one with.
+
 ## How the port is structured
 
 The design constraint was that a bot must be able to keep this fork merged with upstream without
@@ -542,7 +557,7 @@ Everything MV3-specific is additive:
 | `platform/chromium-mv3/manifest.overlay.json` | MV3-only manifest values |
 | `tools/make-chromium-mv3.sh` | Build, mirroring `tools/make-chromium.sh` |
 | `tools/make-chromium-mv3-meta.py` | Derives the MV3 manifest from the MV2 one |
-| `tools/patch-mv3-modules.mjs` | Rewrites uBO's dynamic `import()` calls in the build output (forbidden in a service worker), aliases `chrome.browserAction` for extension pages, makes the WASM LZ4 codec service-worker-safe, generates the sharded scriptlet libraries (`js/mv3-scriptlet-shared.js`, `js/mv3-mainworld-shared-core.js` + `-shared-heavy.js`, `-library-NN.js` shards and `-launch.js` per world, plus the `js/mv3-scriptlet-shards.js` manifest `mv3-shims.js` computes per-navigation file sets from), and exposes the strict-block bypass deadline map so `mv3-post.js` can persist it |
+| `tools/patch-mv3-modules.mjs` | Rewrites uBO's dynamic `import()` calls in the build output (forbidden in a service worker), aliases `chrome.browserAction` for extension pages, makes the WASM LZ4 codec service-worker-safe, generates the sharded scriptlet libraries (`js/mv3-scriptlet-shared.js`, `js/mv3-mainworld-shared-core.js` + `-shared-heavy.js`, `-library-NN.js` shards and `-launch.js` per world, plus the `js/mv3-scriptlet-shards.js` manifest `mv3-shims.js` computes per-navigation file sets from), exposes the strict-block bypass deadline map so `mv3-post.js` can persist it, and hardens the packaged runtime (launch-gated message handlers, storage read-failure handling) |
 | `tools/verify-mv3-package.mjs` | Asserts the package shape, every upstream assumption the port hard-codes, and that the port's own modules parse |
 | `tools/make-crx.mjs` | CRX3 packer and update-manifest generator |
 
