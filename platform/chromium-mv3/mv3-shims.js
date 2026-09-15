@@ -204,10 +204,23 @@ self.document = {
     // `src/js/static-filtering-parser.js` compiles an XPath expression purely
     // to validate it, and treats a throw as "invalid filter". There is no XPath
     // engine in a service worker, so accept the expression as-is: it is still
-    // evaluated for real in the content script.
+    // evaluated for real in the content script. The caller also reads
+    // `XPathResult.ANY_UNORDERED_NODE_TYPE` after createExpression() -- a
+    // global that does not exist in a service worker either, whose
+    // ReferenceError was silently discarding every `:xpath()` filter at
+    // compile time (live-reproduced 2026-09-16, uBOL test page's
+    // `pcf14:xpath(.//b/../..)`).
     createExpression() {
         return { evaluate() {} };
     },
+};
+
+// See the `createExpression` shim above: `static-filtering-parser.js` reads
+// `XPathResult.ANY_UNORDERED_NODE_TYPE` (a plain integer, 8) when validating
+// `:xpath()` filter arguments. The constant is all the parser needs; the
+// result object itself is the shim's no-op `evaluate()`.
+self.XPathResult = {
+    ANY_UNORDERED_NODE_TYPE: 8,
 };
 
 /******************************************************************************/
@@ -1416,12 +1429,11 @@ const targetFromDetails = details => {
 //      shards and launcher for the main-world scriptlets. Every file is an
 //      IIFE, so the page's global object keeps nothing but the transient
 //      `uBO_mv3Lib` registry, which the launcher deletes. The launch record
-//      is written to the frame's DOM by the func above
-//      (`document.documentElement.dataset.uBOmv3Main`, a data attribute
-//      being the only state that crosses from the isolated world into the
-//      page -- each world has its own JS wrappers, so expando properties do
-//      not cross, the DOM does); the shared file reads it, the launcher
-//      deletes it.
+//      reaches the shared file through the synchronous CustomEvent handshake
+//      the func and the shared file run (fixed-name ready event, answer on an
+//      unguessable per-record event id; Chromium structured-clones
+//      `CustomEvent.detail` across worlds -- expando properties do not cross,
+//      events do), so no state is ever left in the DOM.
 //    - `js/mv3-scriptlet-*.js`, into `world: 'ISOLATED'` -- same shape for
 //      the isolated-world scriptlets, launched from a stash the func leaves
 //      at `self.uBO_mv3IsolatedLaunch` (same world, so no DOM round trip is
@@ -1440,12 +1452,15 @@ const targetFromDetails = details => {
 //    everything MV2's order carried.) Intra-world order is preserved by
 //    `chrome.scripting`'s documented in-order injection of `files:`.
 //
-// The one observable difference from MV2 is the transient data attribute,
-// which exists in the DOM for roughly one round trip before the MAIN-world
-// launcher consumes and deletes it; MV2's payload lived only inside a
-// synchronously-removed `<script>` element, which MutationObservers could
-// not capture. The transient registry is a strictly smaller surface: it
-// holds function references, no data. See docs/mv3-deployment.md.
+// The one observable difference from MV2 is the handshake itself: a
+// fixed-name CustomEvent dispatched (and its unguessable-id answer received)
+// during the MAIN-world shared file's evaluation, entirely synchronous. MV2's
+// payload lived only inside a synchronously-removed `<script>` element; this
+// leaves nothing in the DOM at any point, so MutationObservers see nothing
+// either. A page hooking addEventListener before document_start could still
+// observe the handshake's existence (not its payload -- the record travels
+// on the fresh random id), a strictly smaller surface than MV3's earlier
+// DOM-attribute channel. See docs/mv3-deployment.md.
 
 // Passed to `chrome.scripting.executeScript({ func })`, which stringifies it
 // -- so it must stay free of references to anything in this module's scope.
@@ -1506,28 +1521,29 @@ const prepareScriptletInjection = (
     const loc = doc.location;
     if ( loc === null ) { return false; }
     if ( loc.hostname !== '' && loc.hostname !== hostname ) { return false; }
-    // The wrapper's half: the main-world launch record. Written into the
-    // frame's DOM -- DOM writes from the isolated world are unrestricted,
-    // and the attribute is the only channel that crosses into the page.
-    // Consumed and removed by the MAIN-world library files, which
-    // chrome.scripting injects as a file: file-class injection is
-    // CSP-exempt, which is what makes scriptlets deliver on strict-CSP
-    // pages exactly as MV2 delivered them. Skipped wholesale when there are
-    // no main-world calls.
+    // The wrapper's half: the main-world launch record. Handed to the
+    // MAIN-world library files through a synchronous CustomEvent handshake
+    // instead of a DOM data attribute: Chromium structured-clones
+    // `CustomEvent.detail` across worlds (expando properties still do not
+    // cross), so the record -- already plain data, it arrives here as
+    // `executeScript` args -- travels as an event payload with no DOM
+    // mutation at all. The MAIN-world shared file dispatches a fixed-name
+    // 'uBOmv3MainReady' event whose detail is a fresh unguessable data-event
+    // id; this listener, registered before that file can possibly run (it
+    // injects in the second executeScript round, below), answers
+    // synchronously with the record as that id's event detail, during the
+    // shared file's own dispatchEvent. The library files are CSP-exempt
+    // file-class injections, which is what makes scriptlets deliver on
+    // strict-CSP pages exactly as MV2 delivered them. Skipped wholesale when
+    // there are no main-world calls.
     if ( isolatedOnly !== true && Array.isArray(mainCalls) && mainCalls.length !== 0 ) {
-        const root = doc.documentElement;
-        if ( root === null ) { return false; }
-        // SECURITY (LOW): `globals` is the per-document scriptletGlobals --
-        // warOrigin, warSecret, and (logger on) bcSecret -- so this attribute
-        // is a page-readable copy of warSecret from here until the MAIN-world
-        // launcher deletes it. warSecret authorizes /web_accessible_resources,
-        // so a page reading it inside the window could pull uBO's WARs or forge
-        // log lines. The launcher removes it first thing, but runs LAST in the
-        // MAIN-world file chain (shared -> shards -> launch), so the window
-        // spans those injections rather than a single round trip. Narrowing it
-        // to the shared file's read (which parses the record immediately) is a
-        // generator change (tools/patch-mv3-modules.mjs) and out of scope here.
-        root.dataset.uBOmv3Main = JSON.stringify({ globals, args, calls: mainCalls });
+        const record = { globals, args, calls: mainCalls };
+        self.addEventListener('uBOmv3MainReady', ev => {
+            const dataId = ev.detail;
+            if ( typeof dataId !== 'string' ) { return; }
+            ev.stopImmediatePropagation();
+            self.dispatchEvent(new CustomEvent(dataId, { detail: record }));
+        }, { once: true, capture: true });
         self.uBO_scriptletsInjected = filters;
     } else if ( isolatedOnly === true ) {
         self.uBO_isolatedScriptlets = 'done';
@@ -1678,8 +1694,8 @@ const executeCode = async details => {
     if ( mainCalls.length === 0 && calls.length === 0 ) { return []; }
 
     // One func does everything MV2's single injection did, in its order:
-    // relay, guards, the markers, the DOM launch record for the MAIN-world
-    // library and the stash for the isolated-world one. Its return value
+    // relay, guards, the markers, the CustomEvent handshake listener for the
+    // MAIN-world library and the stash for the isolated-world one. Its return value
     // says which frames won the right to inject -- `src/js/messaging.js`
     // treats `needScriptlets` (derived from `uBO_scriptletsInjected`) as
     // "nothing has been injected here yet", and for non-network URIs that

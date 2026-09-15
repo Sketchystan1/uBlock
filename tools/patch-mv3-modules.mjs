@@ -408,7 +408,68 @@ for ( const rel of conflicts ) {
 /******************************************************************************/
 /******************************************************************************/
 
-// Point lib/lz4/lz4-block-codec-wasm.js at the package root.
+// Make `onHeadersReceived` see all request-derivable response headers.
+//
+// Upstream registers the listener with `[ 'blocking', 'responseHeaders' ]`
+// only; on Chromium that hides the `extraHeaders` class of request-side
+// headers (`Cookie`, `Referer`, ...) from the response-header view, so
+// header-dependent filtering on `onHeadersReceived` (e.g. `removeheader=`
+// against request-derived context) silently misses. The
+// `requestHeadersManager` above it in the same file already asks for
+// `extraHeaders` on Chromium exactly this way; this brings the response
+// listener in line. Mirrors what r58Playz/uBlock-mv3 ships and what MV2
+// desktop uBO's effective behavior is; upstream master has not picked it up.
+//
+// The anchor is the `onHeadersReceived` registration in `webRequest.start()`;
+// drift in it fails the build rather than silently shipping the narrower
+// listener (verified below by tools/verify-mv3-package.mjs).
+{
+    const rel = 'js/traffic.js';
+    const abs = path.join(pkgDir, rel);
+    const marker = 'uBO MV3 onHeadersReceived extraHeaders';
+    if ( fs.existsSync(abs) === false ) {
+        console.error(
+            `*** patch-mv3-modules: ${rel} missing; cannot add extraHeaders ` +
+            `to onHeadersReceived`
+        );
+        process.exit(1);
+    }
+    const src = fs.readFileSync(abs, 'utf8');
+    if ( src.includes(marker) ) {
+        console.log(`*** patch-mv3-modules: ${rel} already requests extraHeaders on onHeadersReceived`);
+    } else {
+        const eol = src.includes('\r\n') ? '\r\n' : '\n';
+        const anchor = [
+            "            vAPI.net.addListener('onHeadersReceived', onHeadersReceived, {",
+            "                urls: [ 'http://*/*', 'https://*/*' ]",
+            "            }, [ 'blocking', 'responseHeaders' ]);",
+        ].join(eol);
+        const replacement = [
+            "            vAPI.net.addListener('onHeadersReceived', onHeadersReceived, {",
+            "                urls: [ 'http://*/*', 'https://*/*' ]",
+            `            }, [ 'blocking', 'responseHeaders', /* [${marker}] */ 'extraHeaders' ]);`,
+        ].join(eol);
+        const count = src.split(anchor).length - 1;
+        if ( count !== 1 ) {
+            console.error(
+                `*** patch-mv3-modules: ${rel} contains ${count} ` +
+                `occurrence(s) of the expected onHeadersReceived listener ` +
+                `registration (expected exactly 1):\n` +
+                `${anchor}\n` +
+                `    Reconcile tools/patch-mv3-modules.mjs with the new ` +
+                `upstream shape.`
+            );
+            process.exit(1);
+        }
+        fs.writeFileSync(abs, src.replace(anchor, () => replacement));
+        console.log(
+            `*** patch-mv3-modules: ${rel} requests extraHeaders on onHeadersReceived`
+        );
+    }
+}
+
+/******************************************************************************/
+/******************************************************************************/
 //
 // The WASM flavor of the LZ4 codec locates its .wasm module relative to its
 // own script URL through `document.currentScript.src` -- a concept that does
@@ -1439,9 +1500,28 @@ const generateScriptletLibraries = async ( ) => {
         const readLaunch = world === 'MAIN'
             ? [
                 'self.uBO_mv3Lib = self.uBO_mv3Lib || {};',
-                'self.uBO_mv3Lib.launch = document.documentElement.dataset.uBOmv3Main === undefined',
-                '    ? undefined',
-                '    : JSON.parse(document.documentElement.dataset.uBOmv3Main);',
+                '// Synchronous handshake with the isolated world, which holds',
+                '// the launch record: dispatch a ready event whose detail is a',
+                '// fresh unguessable data-event id; the func (already run,',
+                '// ready-listening) answers during this same dispatch with the',
+                '// record as that event\'s detail. Chromium structured-clones',
+                '// CustomEvent.detail across worlds; the record is plain data.',
+                '// The event globals are captured from the pristine prototypes',
+                '// (Violentmonkey\'s ::safe() pattern, see their',
+                '// src/injected/web/safe-globals.js): this file runs before',
+                '// page scripts on document_start, so the captures cannot be',
+                '// poisoned yet, and a page that later replaces',
+                '// addEventListener/CustomEvent on the global can break',
+                '// scriptlets it dislikes but not the handshake -- the record',
+                '// still arrives, since the dispatch happens right here.',
+                'const SafeCustomEvent = CustomEvent;',
+                'const safeAddEventListener = EventTarget.prototype.addEventListener;',
+                'const safeDispatchEvent = EventTarget.prototype.dispatchEvent;',
+                'const dataId = `uBOmv3MainData${Math.random().toString(36).slice(2, 10)}`;',
+                'safeAddEventListener.call(self, dataId, ev => {',
+                '    self.uBO_mv3Lib.launch = ev.detail;',
+                '}, { once: true, capture: true });',
+                'safeDispatchEvent.call(self, new SafeCustomEvent(\'uBOmv3MainReady\', { detail: dataId }));',
             ]
             : [
                 'self.uBO_mv3Lib = self.uBO_mv3Lib || {};',
@@ -1591,9 +1671,6 @@ const generateScriptletLibraries = async ( ) => {
         {
             const consumeLaunch = world === 'MAIN'
                 ? [
-                    'if ( document.documentElement.dataset.uBOmv3Main !== undefined ) {',
-                    '    delete document.documentElement.dataset.uBOmv3Main;',
-                    '}',
                     'const launch = self.uBO_mv3Lib?.launch;',
                 ]
                 : [

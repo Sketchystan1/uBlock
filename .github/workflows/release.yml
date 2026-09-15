@@ -242,7 +242,7 @@ jobs:
             echo '> [!IMPORTANT]'
             echo '> Under MV3, `webRequestBlocking` is granted only to policy-installed extensions, so network filtering is inert until this is force-installed via enterprise policy.'
             echo '>'
-            echo '> Setup instructions: [docs/mv3-deployment.md](../blob/master/docs/mv3-deployment.md)'
+            echo '> Setup instructions: [docs/mv3-deployment.md](https://github.com/${{ github.repository }}/blob/master/docs/mv3-deployment.md)'
             echo
             echo "Package version (what Chrome compares for updates): \`$(node -p "require('./dist/build/uBlock0.chromium-mv3/manifest.json').version")\`"
             echo

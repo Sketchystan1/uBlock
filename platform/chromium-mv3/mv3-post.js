@@ -347,13 +347,26 @@ const MV3_ISOLATED_ONLY = '\u0000uBO-mv3-isolated-only\u0000';
                 // and awaiting it also closes the base's fire-and-forget
                 // race: the reload can never read a stale compiled entry
                 // back.
-                io.remove(`compiled/${ubo.userFiltersPath}`)
-                    .catch(( ) => { })
-                    .then(( ) => {
-                        if ( ubo.readyToFilter !== true ) { return; }
-                        return ubo.loadFilterLists();
-                    })
-                    .catch(( ) => { });
+                //
+                // Readiness gate: a save landing before `readyToFilter`
+                // (a filter added during boot -- restoreUserData, an eager
+                // element picker, a harness) must NOT be dropped. Defer the
+                // rebuild onto `isReadyPromise` instead of skipping: the
+                // boot's own loadFilterLists would otherwise read the raw
+                // asset through whatever the save race left, and post-boot
+                // saves have nothing waiting for them. Live-reproduced
+                // 2026-09-16: filters added in that window never reached
+                // the engines for the rest of the worker's life, while the
+                // raw and compiled assets both carried them (the compiled
+                // cache made it look like everything worked).
+                const rebuild = ( ) => {
+                    io.remove(`compiled/${ubo.userFiltersPath}`)
+                        .catch(( ) => { })
+                        .then(( ) => ubo.loadFilterLists())
+                        .catch(( ) => { });
+                };
+                if ( ubo.readyToFilter === true ) { return rebuild(); }
+                Promise.resolve(ubo.isReadyPromise).then(rebuild);
             }).catch(( ) => { });
             return result;
         };

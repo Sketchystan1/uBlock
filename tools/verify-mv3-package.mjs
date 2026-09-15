@@ -587,9 +587,10 @@ section('upstream drift');
 // `contentscript.js` and `scriptlets/cosmetic-report.js`). The scriptlets
 // themselves run through the two generated libraries: the isolated-world set
 // from a stash at `self.uBO_mv3IsolatedLaunch`, and the main-world set from a
-// launch record the func writes to `document.documentElement.dataset.uBOmv3Main`
-// -- a data attribute, the only state that crosses from the isolated world
-// into the page. Both libraries are file-class injections, which run
+// launch record the func hands over through a synchronous CustomEvent
+// handshake -- a fixed-name 'uBOmv3MainReady' event whose answer (carrying
+// the record as a structured-cloned detail on an unguessable event id) is
+// the only state that crosses from the isolated world into the page. Both libraries are file-class injections, which run
 // CSP-exempt in their worlds; no `<script>` element is ever created, because
 // every world MV3 offers governs element creation with some CSP (the page's
 // from MAIN, the extension's own from ISOLATED) -- MV2's element exemption
@@ -618,7 +619,8 @@ section('upstream drift');
             [ /new self\.BroadcastChannel\(name\)/, 'the scriptlet->logger relay' ],
             [ /self\.uBO_scriptletsInjected\s*=\s*filters/, 'the uBO_scriptletsInjected marker' ],
             [ /self\.uBO_isolatedScriptlets\s*=\s*'done'/, 'the uBO_isolatedScriptlets marker' ],
-            [ /dataset\.uBOmv3Main\s*=\s*JSON\.stringify\(\{ globals, args, calls: mainCalls \}\)/, 'the DOM launch-record writer for the MAIN-world library' ],
+            [ /addEventListener\('uBOmv3MainReady'/, 'the CustomEvent ready-listener for the MAIN-world library' ],
+            [ /new CustomEvent\(dataId, \{ detail: record \}\)/, 'the MAIN-world launch-record data event' ],
             [ /self\.uBO_mv3IsolatedLaunch\s*=\s*\{ globals, args, calls \}/, 'the isolated-world call stash' ],
         ];
         for ( const [ re, what ] of inFunc ) {
@@ -856,11 +858,17 @@ section('upstream drift');
                 problems.push(`${label}: the shared file no longer declares the per-document scriptletGlobals closure variable`);
             }
             if ( world === 'MAIN' ) {
-                if ( launchSrc.includes('delete document.documentElement.dataset.uBOmv3Main') === false ) {
-                    problems.push('main-world: the launcher no longer deletes the DOM launch record after consuming it');
+                if ( /safeDispatchEvent\.call\(self, new SafeCustomEvent\('uBOmv3MainReady'/.test(sharedSrc) === false ) {
+                    problems.push('main-world: the shared file no longer initiates the launch-record handshake through pristine event globals');
                 }
-                if ( sharedSrc.includes('document.documentElement.dataset.uBOmv3Main') === false ) {
-                    problems.push('main-world: the shared file no longer reads the DOM launch record');
+                if ( /self\.uBO_mv3Lib\.launch = ev\.detail;/.test(sharedSrc) === false ) {
+                    problems.push('main-world: the shared file no longer receives the launch record as a CustomEvent detail');
+                }
+                if ( /SafeCustomEvent = CustomEvent;/.test(sharedSrc) === false ) {
+                    problems.push('main-world: the shared file no longer captures the event globals from the pristine prototypes before page scripts can poison them');
+                }
+                if ( /dataset\.uBOmv3Main/.test(sharedSrc + launchSrc) === true ) {
+                    problems.push('main-world: the DOM dataset launch record survived; the CustomEvent channel replaced it');
                 }
             } else {
                 if ( launchSrc.includes('self.uBO_mv3IsolatedLaunch = undefined;') === false ) {
@@ -1101,6 +1109,24 @@ section('upstream drift');
             'mv3-shims.js captures both as the fallback used when the extension is not policy-installed');
     } else {
         pass('vAPI.Net async-suspension patch still lands where it is aimed');
+    }
+
+    // The onHeadersReceived listener must request 'extraHeaders' on Chromium:
+    // without it the Cookie/Referer class of request-derived headers is hidden
+    // from the response-header view and header-dependent filtering silently
+    // misses. tools/patch-mv3-modules.mjs injects it into the built traffic.js
+    // (upstream registers 'blocking', 'responseHeaders' only); this pins the
+    // injected shape so an upstream registration change fails the build
+    // instead of quietly shipping the narrower listener.
+    {
+        const trafficPkg = readPkg('js/traffic.js');
+        if ( /\[ 'blocking', 'responseHeaders', \/\* \[uBO MV3 onHeadersReceived extraHeaders\] \*\/ 'extraHeaders' \]/.test(trafficPkg) === false ) {
+            fail('onheadersreceived-extraheaders',
+                'the built js/traffic.js registers onHeadersReceived without extraHeaders',
+                'reconcile the transform in tools/patch-mv3-modules.mjs with the new upstream listener registration (src/js/traffic.js, webRequest.start)');
+        } else {
+            pass('onHeadersReceived requests extraHeaders (Cookie/Referer-class headers visible to header filtering)');
+        }
     }
 }
 
@@ -1526,7 +1552,8 @@ section('port self-checks');
             [ /µb\.saveUserFilters = function/, 'the saveUserFilters wrap' ],
             [ /io\.remove\(`compiled\/\$\{ubo\.userFiltersPath\}`\)/, 'the awaited compiled-entry re-removal through io (the removal helper itself returns nothing -- see the round-7 root cause)' ],
             [ /ubo\.loadFilterLists\(\)/, 'the engine rebuild trigger' ],
-            [ /ubo\.readyToFilter !== true/, 'the boot-time guard' ],
+            [ /if \( ubo\.readyToFilter === true \) \{ return rebuild\(\); \}/, 'the ready-now rebuild fast path' ],
+            [ /Promise\.resolve\(ubo\.isReadyPromise\)\.then\(rebuild\)/, 'the boot-time deferral onto isReadyPromise (a save before readyToFilter must not be dropped -- live-reproduced 2026-09-16: filters added during boot never reached the engines for the worker\'s life)' ],
         ];
         for ( const [ re, what ] of pins ) {
             if ( re.test(block) ) { continue; }
