@@ -1,0 +1,66 @@
+name: Build MV3
+
+# Sanity build of the Chromium MV3 package on every push and pull request, so
+# that an upstream merge which breaks the port is caught before release time.
+#
+# The package assertions and the upstream-drift assertions live in
+# tools/verify-mv3-package.mjs, which tools/make-chromium-mv3.sh runs as its last
+# step. They used to be inlined here, which meant the one build that actually
+# shipped -- release.yml -- was the least checked build in the repository.
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dev dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint
+        # Informational only. Upstream's own sources do not currently pass this
+        # config -- `chrome` and `browser` are not declared as globals, which
+        # yields ~130 pre-existing no-undef errors. Gating on it would mean
+        # editing eslint.config.mjs, and this port deliberately modifies no
+        # existing file so that upstream merges cannot conflict.
+        continue-on-error: true
+        run: npm run lint
+
+      - name: Clone uAssets
+        run: bash tools/pull-assets.sh
+
+      - name: Build and verify MV3 package
+        # Invoked through `bash` rather than relying on the executable bit,
+        # which is not preserved when committing from a filesystem without one.
+        # Runs tools/patch-mv3-modules.mjs and then tools/verify-mv3-package.mjs.
+        run: bash tools/make-chromium-mv3.sh
+
+      - name: Upload package
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: uBlock0.chromium-mv3
+          path: dist/build/uBlock0.chromium-mv3
