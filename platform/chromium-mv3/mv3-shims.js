@@ -1125,16 +1125,49 @@ if ( chrome.browserAction === undefined ) {
     throw new Error('mv3-shims: unable to alias chrome.browserAction to chrome.action');
 }
 
-// `setIcon({ path })` is resolved by a `fetch()` inside this worker, not by the
-// browser process, so uBO's root-relative `img/icon_*.png` paths would resolve
-// against `/js/` and fail. See the `rootURL()` note at the top of this file.
-// `chrome.browserAction` and `chrome.action` are the same object here, so this
-// one patch covers both. `vapi-background.js` reaches this through
-// `vAPI.setIcon()` on every toolbar update and `vAPI.setDefaultIcon()` at
-// startup.
+// Chromium validates `tabId` on every `action.*` method as a non-negative
+// integer, and says so with the same message for every value that is not one:
+// a negative id, a fractional one, NaN. MV3's `webNavigation` reports surfaces
+// which have no tab of their own -- the undocked DevTools frontend is the one
+// that fires in practice, on every DevTools open -- using an id that is not a
+// tab id, and uBO's toolbar update path (`vAPI.setIcon()`) then carries it here
+// and throws four TypeErrors per navigation, for an update which has nowhere to
+// land. MV2's `browserAction` was no laxer, but those navigations never reached
+// it: what changed is the surface MV3 reports, not uBO's use of the API.
+//
+// Drop the call rather than the error. It is one logical update -- icon, badge
+// text, badge colour, tooltip -- aimed at a target with no toolbar, and letting
+// it through costs four console errors and changes nothing. An *absent* `tabId`
+// is a different case and must keep working: that is the global default-icon
+// update `vAPI.setDefaultIcon()` issues at startup and on a filtering-mode
+// change, and it is the only way the toolbar gets its non-per-tab state.
+//
+// `console.debug` rather than silence: a *real* tab id arriving malformed is a
+// bug worth seeing, and the offending value is then one verbose-console toggle
+// away instead of invisible.
 {
+    const isValidTabId = tabId => Number.isSafeInteger(tabId) && tabId >= 0;
+    const isNonTabTarget = (method, details) => {
+        if ( details instanceof Object === false ) { return false; }
+        if ( details.tabId === undefined || details.tabId === null ) { return false; }
+        if ( isValidTabId(details.tabId) ) { return false; }
+        console.debug(
+            `uBO: dropped action.${method}() for a target with no tab`,
+            details.tabId
+        );
+        return true;
+    };
+
+    // `setIcon({ path })` is resolved by a `fetch()` inside this worker, not by
+    // the browser process, so uBO's root-relative `img/icon_*.png` paths would
+    // resolve against `/js/` and fail. See the `rootURL()` note at the top of
+    // this file. `chrome.browserAction` and `chrome.action` are the same object
+    // here, so this one patch covers both; `vapi-background.js` reaches it
+    // through `vAPI.setIcon()` on every toolbar update and `vAPI.setDefaultIcon()`
+    // at startup.
     const setIcon = chrome.action.setIcon.bind(chrome.action);
     chrome.action.setIcon = function(details, ...args) {
+        if ( isNonTabTarget('setIcon', details) ) { return Promise.resolve(); }
         if ( details instanceof Object && details.path !== undefined ) {
             details = Object.assign({}, details);
             if ( typeof details.path === 'string' ) {
@@ -1149,6 +1182,18 @@ if ( chrome.browserAction === undefined ) {
         }
         return setIcon(details, ...args);
     };
+
+    // The other three the `vAPI.setIcon()` update is made of. Same guard, no
+    // path rewriting to do.
+    for ( const method of [ 'setBadgeText', 'setBadgeBackgroundColor', 'setTitle' ] ) {
+        const original = chrome.action[method];
+        if ( typeof original !== 'function' ) { continue; }
+        const target = original.bind(chrome.action);
+        chrome.action[method] = function(details, ...args) {
+            if ( isNonTabTarget(method, details) ) { return Promise.resolve(); }
+            return target(details, ...args);
+        };
+    }
 }
 
 // Two manifest keys changed shape in MV3, and uBO reads both:
@@ -1634,12 +1679,23 @@ const libraryFilesFor = (world, calls) => {
 // indistinguishable from the benign case. Surface the reason, rate-limited to
 // once a minute, so a persistent fault is diagnosable without flooding the
 // console on a busy page.
+//
+// The routine half is split out rather than merely rate-limited: it fires on
+// ordinary browsing -- the DevTools frontend page navigates on every DevTools
+// open, and frames are torn down constantly -- and each distinct reason is a
+// dead end for the user, so one a minute is still noise with no signal in it.
+// A reason that matches here says nothing about the extension's configuration
+// by construction; anything else still gets through.
+const routineInjectionErrorRE = /^(?:Cannot access contents of (?:url|the frame) |Frame with ID \d+ was removed|No tab with id: |The frame was removed|Cannot access a (?:chrome|edge|devtools|about|view-source):)/;
+
 let lastInjectionErrorAt = 0;
 const logInjectionError = (where, reason) => {
+    const message = String(reason?.message ?? reason).replace(/^Error:\s*/, '');
+    if ( routineInjectionErrorRE.test(message) ) { return; }
     const now = Date.now();
     if ( now - lastInjectionErrorAt < 60000 ) { return; }
     lastInjectionErrorAt = now;
-    console.error(`uBO: scriptlet injection failed (${where}): ${reason}`);
+    console.error(`uBO: scriptlet injection failed (${where}): ${message}`);
 };
 
 const executeCode = async details => {
