@@ -70,6 +70,16 @@ permission). On branded Google Chrome (not Chromium) the machine-level
 `ExtensionInstallAllowlist` policy must also contain the extension ID, or Chrome disables the
 extension shortly after installation.
 
+> [!NOTE]
+> The CRX also carries a manifest `update_url` (baked in by
+> `tools/make-chromium-mv3-meta.py`: stable builds point at `update.xml`, dev/beta builds at
+> `update-dev.xml`). In browsers that do **not** gate off-store installs — ungoogled-chromium,
+> and Chromium or enterprise configurations that still permit MV2 + `webRequestBlocking` — this
+> makes a hand-installed CRX **self-update** with no registry or policy entry, and blocking
+> works without the registration too. On stable Google Chrome the manifest URL is not enough:
+> Chrome hard-disables off-store extensions regardless, so the registration below is still
+> required, both to keep the extension enabled and to grant `webRequestBlocking`.
+
 Let the release automation host everything (the supported path), or host the `.crx` and an
 `update.xml` yourself on servers reachable over HTTPS. The automation publishes **two update
 manifests** to GitHub Pages, each at a **stable URL** that never changes between releases, both
@@ -317,3 +327,41 @@ The upstream test pages work for this build:
   as user filters, e.g. `ublockorigin.github.io###pcf14:xpath(.//b/../..)`).
 - Additional community tools — <https://github.com/gorhill/uBlock/wiki/Tools>. Note that gorhill
   is no longer actively developing some of these; treat results accordingly.
+
+### Check blocking from the service-worker console
+
+To confirm `webRequestBlocking` is actually granted (not just requested) and to measure whether
+async blocking — holding a request while a promise resolves — works on this install, open
+`chrome://extensions` → uBlock Origin → **Inspect views: service worker**, and paste:
+
+```js
+(async () => {
+  const T = 'https://example.com/';
+  const { permissions } = await chrome.permissions.getAll();
+  let install = 'unknown';
+  try { ({ installType: install } = await chrome.management.getSelf()); } catch {}
+  if (!permissions.includes('webRequestBlocking')) {
+    return console.log(`❌ webRequestBlocking NOT granted (install: ${install}) — MV3 grants it only to a policy/external install.`);
+  }
+  let fired = false, blocked = false;
+  const listener = () => { fired = true; return new Promise(r => setTimeout(() => r({ cancel: true }), 1500)); };
+  chrome.webRequest.onBeforeRequest.addListener(listener, { urls: [T + '*'] }, ['blocking']);
+  const t = performance.now();
+  try { await fetch(T + '?t=' + Date.now(), { cache: 'no-store' }); } catch { blocked = true; }
+  const ms = Math.round(performance.now() - t);
+  chrome.webRequest.onBeforeRequest.removeListener(listener);
+  console.log(
+    !fired               ? `⚠️  webRequestBlocking present but blocking listeners never fire (install: ${install}).`
+    : blocked && ms > 1400 ? `✅  Sync + async blocking work (install: ${install}) — request held ${ms} ms, then cancelled.`
+    : blocked            ? `⚠️  Blocking works but the request wasn't held (${ms} ms) — something cancelled it early.`
+    :                      `✅ sync cancel works · ❌ async off (install: ${install}) — request completed in ${ms} ms; Chromium didn't wait for the promise.`
+  );
+})();
+```
+
+It reports `installType` because async blocking is gated on it: the port only attempts to hold
+requests when `chrome.management.getSelf()` returns `admin` (a policy/force-install), and cancels
+outright otherwise (see `platform/chromium-mv3/mv3-shims.js`). So `❌ async off` on a non-`admin`
+install is expected, not a fault — sync cancel still blocks. The probe installs its own temporary
+listener on `example.com` (not on any filter list) and removes it before logging, so it does not
+disturb uBO's own filtering.

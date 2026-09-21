@@ -121,10 +121,40 @@ for key, value in overlay.items():
 
 manifest['version'] = version
 
+# A dev/beta build carries a four-component version (1.74.1.5); a stable
+# release carries three (1.74.1). This selects both the update channel and the
+# name suffix below.
+is_dev_build = bool(re.search(r'^\d+\.\d+\.\d+\.\d+$', version))
+
+# Self-hosted auto-update. Chrome/Chromium polls this URL (an Omaha update
+# manifest) roughly every five hours and installs a newer CRX when one is
+# advertised -- the same mechanism the Web Store uses, pointed at the same
+# update.xml the external-extensions / policy registration uses (see
+# docs/mv3-deployment.md). Baking it in lets the CRX self-update with no
+# registry or policy entry in browsers that do not gate off-store installs
+# (ungoogled-chromium, and Chromium/enterprise configs that keep MV2 +
+# webRequestBlocking). Stable Google Chrome still hard-disables off-store
+# extensions, so the allowlist/force-install path in docs/mv3-deployment.md
+# remains necessary there; a manifest update_url is inert for unpacked loads
+# and ignored by the Web Store, so it is harmless in every other case.
+#
+# Channel mirrors the two fixed URLs the release automation publishes: a
+# dev/beta build follows update-dev.xml, a stable X.Y.Z build update.xml --
+# the channel a policy install would pick for the same build. The base URL
+# defaults to this fork's GitHub Pages site (as in .github/ublock.reg and the
+# docs) and is overridable via UBLOCK_UPDATE_BASE_URL, which release.yml sets
+# to the deploying repository's Pages URL so forks and renames stay correct.
+update_base = os.environ.get(
+    'UBLOCK_UPDATE_BASE_URL', 'https://sketchystan1.github.io/uBlock',
+).rstrip('/')
+manifest['update_url'] = '{}/{}'.format(
+    update_base, 'update-dev.xml' if is_dev_build else 'update.xml',
+)
+
 # Development build? If so, modify name accordingly. Mirrors
 # tools/make-chromium-meta.py, and sets version_name so that
 # vapi-common.js's devbuild check (/^\d+\.\d+\.\d+\D/) recognizes it.
-if re.search(r'^\d+\.\d+\.\d+\.\d+$', version):
+if is_dev_build:
     manifest['name'] += ' development build'
     manifest['short_name'] += ' dev build'
     manifest['action']['default_title'] += ' dev build'

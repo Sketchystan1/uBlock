@@ -85,7 +85,15 @@ jobs:
         # Invoked through `bash` rather than relying on the executable bit,
         # which is not preserved when committing from a filesystem without one.
         # This also runs tools/verify-mv3-package.mjs.
-        run: bash tools/make-chromium-mv3.sh ${{ steps.meta.outputs.version }}
+        #
+        # UBLOCK_UPDATE_BASE_URL bakes the self-update URL into the manifest
+        # (tools/make-chromium-mv3-meta.py picks the channel). It is the same
+        # GitHub Pages base the release notes below derive for the policy
+        # update_url, so a self-updating CRX and a policy install track the
+        # identical update.xml.
+        run: |
+          export UBLOCK_UPDATE_BASE_URL="https://$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]').github.io/$(basename '${{ github.repository }}')"
+          bash tools/make-chromium-mv3.sh ${{ steps.meta.outputs.version }}
 
       - name: Check the advertised version
         # update.xml's <updatecheck version> is read from the built manifest,
@@ -234,8 +242,18 @@ jobs:
           TAG: ${{ steps.meta.outputs.tag }}
           VERSION: ${{ steps.meta.outputs.version }}
           EXTENSION_ID: ${{ steps.crx.outputs.extension_id }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         run: |
           pages_url="https://$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]').github.io/$(basename '${{ github.repository }}')"
+          # A pre-release (beta/rc) is only ever advertised by the dev channel
+          # (update-dev.xml); update.xml carries stable X.Y.Z releases only, so a
+          # policy pinned to it would never see this build. Point each release at
+          # the manifest that actually contains it.
+          if [ "$PRERELEASE" = 'true' ]; then
+            update_url="${pages_url}/update-dev.xml"; channel='dev channel'
+          else
+            update_url="${pages_url}/update.xml"; channel='stable channel'
+          fi
           {
             echo "Chromium **Manifest V3** build of uBlock Origin \`${VERSION}\`, from upstream tag \`${VERSION}\`."
             echo
@@ -249,7 +267,7 @@ jobs:
             if [ -n "$EXTENSION_ID" ]; then
               echo "Extension ID: \`${EXTENSION_ID}\`"
               echo
-              echo "Policy \`update_url\` (stable across releases): \`${pages_url}/update.xml\`"
+              echo "Policy \`update_url\` (${channel}, fixed across releases): \`${update_url}\`"
               echo
             fi
             echo '### Build inputs'
