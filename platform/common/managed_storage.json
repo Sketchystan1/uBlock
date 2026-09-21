@@ -2,6 +2,11 @@
   "$schema": "http://json-schema.org/draft-03/schema#",
   "type": "object",
   "properties": {
+    "assetsBootstrapLocation": {
+      "title": "URL to a custom 'assets.json' file",
+      "description": "Location of an admin-provided 'assets.json' describing the stock assets and default filter lists to use.",
+      "type": "string"
+    },
     "adminSettings": {
       "title": "A valid JSON string compliant with uBO's backup format",
       "description": "All entries present will overwrite local settings.",
