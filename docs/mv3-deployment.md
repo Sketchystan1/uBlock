@@ -331,11 +331,14 @@ derived from upstream's `dist/version` plus a fork build number in the fork-owne
 - **Upstream beta/rc `X.Y.Zb<n>` / `X.Y.Zrc<n>`** → built unchanged as a **dev** build
   (`update-dev.xml`, "development build" branding), exactly as before.
 
-A four-component version would otherwise trip uBO's own `devbuild` heuristic (which switches it to
-the dev filter-list asset channel and verbose logging). The stable build sets a `version_name` that
-does not match that heuristic, so `X.Y.Z.N` behaves as the stable release it is. To cut another
-stable build of the same upstream `X.Y.Z`, dispatch `sync-upstream.yml` with that upstream tag; it
-builds the next `dist/mv3-build` number.
+A four-component version would otherwise trip uBO's own `devbuild` heuristic (which turns on verbose
+logging and selects the dev filter-list asset channel — the latter a no-op here, since both asset
+manifests are byte-identical in this build). The shipped `manifest.json` deliberately carries **no**
+`version_name`, so Chrome shows the clean `X.Y.Z.N` version; the devbuild heuristic is instead
+neutralised for the service worker in `platform/chromium-mv3/mv3-shims.js`, whose `getManifest()`
+hands uBO a synthetic, non-matching `version_name`. To cut another stable build of the same upstream
+`X.Y.Z`, dispatch `sync-upstream.yml` with that upstream tag; it builds the next `dist/mv3-build`
+number.
 
 To keep a deployment on stable releases only, point its policy `update_url` at the **stable
 channel** (`update.xml`), which only ever advances to a fork `X.Y.Z.N` stable build — this is the

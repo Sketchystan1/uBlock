@@ -206,15 +206,21 @@ if isinstance(manifest.get('action'), dict):
     manifest['action']['default_title'] = FORK_NAME
 
 if is_fork_stable:
-    # A fork stable build carries a four-component version, which uBO's
-    # vapi-common.js would otherwise flag as a "devbuild": its check
-    # (/^\d+\.\d+\.\d+\D/) matches the 4th separator, and a devbuild switches
-    # to the dev filter-list asset channel (assets.dev.json) and verbose
-    # logging (src/js/background.js). uBO reads `version_name || version` for
-    # that test, so set a version_name that does NOT match the regex -- it
-    # starts with a letter -- to make the build behave as the stable release it
-    # is. This is also what Chrome shows as the version string.
-    manifest['version_name'] = 'uBlock Origin {} (Sketchy MV3 fork)'.format(version)
+    # Deliberately NO version_name. Chrome DISPLAYS version_name in place of the
+    # version whenever it is set, so any human-readable string there shows up as
+    # the "version" and reads as noise beside the name. Leaving it unset makes
+    # Chrome show the clean four-component version (e.g. "1.75.0.500").
+    #
+    # The catch a version_name would have solved: a bare four-component version
+    # matches uBO's own devbuild probe (vapi-common.js:
+    # /^\d+\.\d+\.\d+\D/ on version_name || version), which would flag the build
+    # as a devbuild (verbose logging; the dev filter-list asset channel, though
+    # that manifest is byte-identical to the stable one in this build). That is
+    # neutralised in the service worker instead:
+    # platform/chromium-mv3/mv3-shims.js hands uBO's getManifest() a synthetic,
+    # non-matching version_name so the probe is false, while the shipped
+    # manifest.json (and Chrome's UI) keeps none.
+    pass
 elif is_dev_build:
     # Upstream beta/rc: keep the dev branding and the devbuild-triggering
     # version_name (X.Y.Zb<n>), so uBO uses the dev asset channel as upstream

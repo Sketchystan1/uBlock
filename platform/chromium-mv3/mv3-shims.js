@@ -1215,6 +1215,21 @@ if ( chrome.browserAction === undefined ) {
         if ( csp instanceof Object ) {
             manifest.content_security_policy = csp.extension_pages || '';
         }
+        // Keep a fork STABLE build from being treated as a uBO "devbuild".
+        // src/js/vapi-common.js flags one when `version_name || version` matches
+        // /^\d+\.\d+\.\d+\D/ -- which a four-component version like "1.75.0.500"
+        // always does. The shipped manifest deliberately carries no version_name
+        // (so Chrome's UI shows the clean "1.75.0.500"), so hand uBO's own
+        // getManifest() a synthetic, non-matching version_name here instead. A
+        // fork stable build is a 4-component version whose 4th component is >=
+        // 500 (see tools/make-chromium-mv3-meta.py); a beta remap (< 500) keeps
+        // its real, devbuild-matching version_name and is left alone.
+        if ( manifest.version_name === undefined ) {
+            const m = /^\d+\.\d+\.\d+\.(\d+)$/.exec(manifest.version || '');
+            if ( m !== null && Number(m[1]) >= 500 ) {
+                manifest.version_name = 'stable';
+            }
+        }
         normalized = manifest;
         return normalized;
     };

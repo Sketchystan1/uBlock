@@ -251,17 +251,20 @@ const manifestChecks = [
       ( ) => {
           const m = /^\d+\.\d+\.\d+\.(\d+)$/.exec(manifest.version || '');
           if ( m === null ) { return true; }
-          if ( typeof manifest.version_name !== 'string' ) { return false; }
-          const isDevbuildName = /^\d+\.\d+\.\d+\D/.test(manifest.version_name);
-          // A 4th component >= 500 is a fork STABLE build: it must NOT be
-          // flagged devbuild (so it uses the stable filter-list asset channel
-          // and quiet logging), i.e. version_name must NOT match uBO's devbuild
-          // regex. Below 500 is an upstream beta remap, which MUST match so
-          // vapi-common.js's devbuild check fires. See
-          // tools/make-chromium-mv3-meta.py.
-          return Number(m[1]) >= 500 ? isDevbuildName === false : isDevbuildName;
+          // A fork STABLE build (4th component >= 500) must carry NO
+          // version_name: Chrome then shows the clean four-component version,
+          // and the devbuild probe is neutralised for the service worker in
+          // mv3-shims.js (getManifest injects a synthetic non-matching
+          // version_name). An upstream beta remap (4th < 500) must carry a
+          // version_name that DOES match uBO's devbuild regex, as upstream
+          // intends. See tools/make-chromium-mv3-meta.py.
+          if ( Number(m[1]) >= 500 ) {
+              return manifest.version_name === undefined;
+          }
+          return typeof manifest.version_name === 'string' &&
+                 /^\d+\.\d+\.\d+\D/.test(manifest.version_name);
       },
-      'a 4-part version requires version_name: matching /^\\d+\\.\\d+\\.\\d+\\D/ for an upstream beta (4th <500), NOT matching for a fork stable build (4th >=500)' ],
+      'a 4-part version: a fork stable build (4th >=500) must carry NO version_name (Chrome shows the clean version; mv3-shims.js dodges the devbuild probe for the SW); an upstream beta (4th <500) must carry a version_name matching /^\\d+\\.\\d+\\.\\d+\\D/' ],
 ];
 
 for ( const [ name, test, message ] of manifestChecks ) {
@@ -1779,6 +1782,30 @@ section('port self-checks');
             'reconcile platform/chromium-mv3/mv3-popup-banner.js, mv3-shims.js and mv3-post.js with the popup transform in tools/patch-mv3-modules.mjs');
     } else {
         pass('degraded-state UI: status channel, popup banner injection and error badge wired');
+    }
+}
+
+// Fork stable builds ship NO version_name (so Chrome shows the clean
+// four-component version), which would otherwise match uBO's devbuild probe.
+// mv3-shims.js neutralises that for the service worker by injecting a synthetic
+// version_name into getManifest(). Pin both halves so a future edit cannot
+// silently re-enable devbuild behaviour, and so an upstream move of the probe
+// regex fails the build here instead of regressing quietly.
+{
+    const problems = [];
+    const shims = readPkg('js/mv3-shims.js');
+    const vapicommon = readRepo('platform/common/vapi-common.js');
+    if ( shims.includes("manifest.version_name = 'stable'") === false ) {
+        problems.push('js/mv3-shims.js getManifest() no longer injects a synthetic version_name for fork stable builds -- a 4-component stable version would be flagged devbuild');
+    }
+    if ( vapicommon.includes('/^\\d+\\.\\d+\\.\\d+\\D/') === false ) {
+        problems.push('platform/common/vapi-common.js no longer uses the /^\\d+\\.\\d+\\.\\d+\\D/ devbuild probe -- reconcile the version_name handling in tools/make-chromium-mv3-meta.py and mv3-shims.js');
+    }
+    if ( problems.length !== 0 ) {
+        fail('stable-devbuild-dodge', problems.join('\n'),
+            'reconcile platform/chromium-mv3/mv3-shims.js and tools/make-chromium-mv3-meta.py with src/js/vapi-common.js');
+    } else {
+        pass('fork-stable devbuild dodge intact: no shipped version_name, SW getManifest injects a synthetic one');
     }
 }
 
