@@ -383,6 +383,62 @@ for ( const rel of conflicts ) {
 /******************************************************************************/
 /******************************************************************************/
 
+// Add the fork's managed-storage schema entry on the BUILD OUTPUT.
+//
+// The fork documents an admin-provided `assetsBootstrapLocation` key in
+// platform/common/managed_storage.json, but that is an UPSTREAM file: the
+// addition cannot live in the source tree without breaking the "modifies no
+// upstream file" invariant (sync-upstream.yml's altered-file guard refuses to
+// build a release tree when it is violated, and the change would otherwise be
+// silently dropped from releases). Inject it into the packaged copy instead.
+// Idempotent; fails the build if upstream reshapes the schema out from under it.
+{
+    const rel = 'managed_storage.json';
+    const abs = path.join(pkgDir, rel);
+    if ( fs.existsSync(abs) === false ) {
+        console.error(
+            `*** patch-mv3-modules: ${rel} missing; cannot add the ` +
+            `assetsBootstrapLocation managed-storage schema entry`
+        );
+        process.exit(1);
+    }
+    let schema;
+    try {
+        schema = JSON.parse(fs.readFileSync(abs, 'utf8'));
+    } catch (reason) {
+        console.error(`*** patch-mv3-modules: ${rel} is not valid JSON: ${reason}`);
+        process.exit(1);
+    }
+    if ( schema.properties instanceof Object === false ) {
+        console.error(
+            `*** patch-mv3-modules: ${rel} has no "properties" object; the ` +
+            `managed-storage schema shape has drifted -- reconcile ` +
+            `tools/patch-mv3-modules.mjs`
+        );
+        process.exit(1);
+    }
+    if ( Object.hasOwn(schema.properties, 'assetsBootstrapLocation') ) {
+        console.log(`*** patch-mv3-modules: ${rel} already documents assetsBootstrapLocation`);
+    } else {
+        // Placed first, matching where the fork's original source edit put it.
+        schema.properties = Object.assign(
+            {
+                assetsBootstrapLocation: {
+                    title: "URL to a custom 'assets.json' file",
+                    description: "Location of an admin-provided 'assets.json' describing the stock assets and default filter lists to use.",
+                    type: 'string',
+                },
+            },
+            schema.properties
+        );
+        fs.writeFileSync(abs, JSON.stringify(schema, null, 2) + '\n');
+        console.log(`*** patch-mv3-modules: ${rel} documents assetsBootstrapLocation`);
+    }
+}
+
+/******************************************************************************/
+/******************************************************************************/
+
 // Expose the strict-block bypass deadline map on the exported webRequest
 // object. See the header comment (transform 4) for the full rationale; the
 // anchor is the object literal's tail in js/traffic.js, so any drift in it
