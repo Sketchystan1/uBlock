@@ -59,10 +59,20 @@ jobs:
           version="${tag%-mv3}"
           echo "tag=$tag"         >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          # uBO's own convention: a fourth version component, or a b/rc suffix,
-          # means a pre-release.
+          # What counts as a stable (non-prerelease) release:
+          #   X.Y.Z        -> stable (a bare upstream stable tag, legacy)
+          #   X.Y.Z.N      -> stable iff N >= 500 (this fork's stable build;
+          #                   below 500 is an upstream beta remap = prerelease)
+          #   X.Y.Zb/rc<n> -> prerelease
           if echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo 'prerelease=false' >> "$GITHUB_OUTPUT"
+          elif echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            build="${version##*.}"
+            if [ "$build" -ge 500 ]; then
+              echo 'prerelease=false' >> "$GITHUB_OUTPUT"
+            else
+              echo 'prerelease=true'  >> "$GITHUB_OUTPUT"
+            fi
           else
             echo 'prerelease=true'  >> "$GITHUB_OUTPUT"
           fi
@@ -108,18 +118,28 @@ jobs:
         run: |
           manifest_version=$(node -p "require('./dist/build/uBlock0.chromium-mv3/manifest.json').version")
           dist_version=$(cat dist/version)
+          fork_build=$(cat dist/mv3-build 2>/dev/null || echo 500)
           echo "tag version:      $VERSION"
           echo "dist/version:     $dist_version"
+          echo "dist/mv3-build:   $fork_build"
           echo "manifest version: $manifest_version"
-          if [ "$manifest_version" != "$dist_version" ]; then
-            echo "::error::manifest version ($manifest_version) does not match dist/version ($dist_version)"
+          # What version this tree builds, per tools/make-chromium-mv3-meta.py:
+          #   upstream stable X.Y.Z    -> X.Y.Z.<fork_build>   (fork stable)
+          #   upstream beta   X.Y.Z.n  -> X.Y.Z.n              (passthrough)
+          if echo "$dist_version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            built="$dist_version.$fork_build"
+          else
+            built="$dist_version"
+          fi
+          echo "built version:    $built"
+          if [ "$manifest_version" != "$built" ]; then
+            echo "::error::manifest version ($manifest_version) does not match the version this tree builds ($built) from dist/version + dist/mv3-build"
             exit 1
           fi
-          # Upstream's tag -> version mapping is exact, so check it exactly. A
-          # shared X.Y.Z stem is not enough: that is precisely the family this
-          # needs to tell apart, since upstream ships ~6 betas per stable
-          # release and they all share a stem.
+          # The tag must name the version the tree builds. Tag -> version map,
+          # identical to tools/make-update-xml.mjs:
           #   X.Y.Z        -> X.Y.Z
+          #   X.Y.Z.N      -> X.Y.Z.N       (fork stable build, N >= 500)
           #   X.Y.Zb<n>    -> X.Y.Z.<n>
           #   X.Y.Zrc<n>   -> X.Y.Z.10<n>
           case "$VERSION" in
@@ -128,8 +148,8 @@ jobs:
             *)    expected="$VERSION" ;;
           esac
           echo "expected version:  $expected"
-          if [ "$expected" = "$VERSION" ] && echo "$VERSION" | grep -qvE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::tag $VERSION is not a shape this release process understands (expected X.Y.Z, X.Y.Zb<n> or X.Y.Zrc<n>)"
+          if [ "$expected" = "$VERSION" ] && echo "$VERSION" | grep -qvE '^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "::error::tag $VERSION is not a shape this release process understands (expected X.Y.Z, X.Y.Z.N, X.Y.Zb<n> or X.Y.Zrc<n>)"
             exit 1
           fi
           if [ "$manifest_version" != "$expected" ]; then
@@ -254,8 +274,14 @@ jobs:
           else
             update_url="${pages_url}/update.xml"; channel='stable channel'
           fi
+          dist_version=$(cat dist/version)
+          fork_build=$(cat dist/mv3-build 2>/dev/null || echo '')
           {
-            echo "Chromium **Manifest V3** build of uBlock Origin \`${VERSION}\`, from upstream tag \`${VERSION}\`."
+            if echo "$dist_version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' && [ -n "$fork_build" ]; then
+              echo "Chromium **Manifest V3** build \`${VERSION}\` of **uBlock Origin (Sketchy MV3 fork)** — upstream stable \`${dist_version}\` + fork build \`${fork_build}\`."
+            else
+              echo "Chromium **Manifest V3** build of **uBlock Origin (Sketchy MV3 fork)** \`${VERSION}\`, from upstream tag \`${VERSION}\`."
+            fi
             echo
             echo '> [!IMPORTANT]'
             echo '> Under MV3, `webRequestBlocking` is granted only to policy-installed extensions, so network filtering is inert until this is force-installed via enterprise policy.'

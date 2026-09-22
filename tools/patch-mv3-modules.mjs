@@ -333,6 +333,56 @@ for ( const rel of conflicts ) {
 /******************************************************************************/
 /******************************************************************************/
 
+// Load the fork's popup degraded-state banner in the popup page.
+//
+// platform/chromium-mv3/mv3-popup-banner.js is copied into js/ by
+// tools/make-chromium-mv3.sh, but nothing references it. Inject a <script> tag
+// into the built popup-fenix.html so it runs alongside the popup: it asks the
+// service worker (mv3ForkStatus channel in mv3-shims.js) whether network
+// filtering is working and, when it is not, prepends a visible warning banner.
+// Anchored on the popup's own module script; the exact-1 guard fails the build
+// if upstream reshapes the popup's script tags. verify-mv3-package.mjs pins the
+// result.
+{
+    const rel = 'popup-fenix.html';
+    const abs = path.join(pkgDir, rel);
+    const marker = 'uBO MV3 popup status banner';
+    if ( fs.existsSync(abs) === false ) {
+        console.error(
+            `*** patch-mv3-modules: ${rel} missing; cannot inject the popup ` +
+            `status banner`
+        );
+        process.exit(1);
+    }
+    const src = fs.readFileSync(abs, 'utf8');
+    if ( src.includes(marker) ) {
+        console.log(`*** patch-mv3-modules: ${rel} already loads the popup status banner`);
+    } else {
+        const eol = src.includes('\r\n') ? '\r\n' : '\n';
+        const anchor = '<script src="js/popup-fenix.js" type="module"></script>';
+        const replacement = [
+            anchor,
+            `<!-- [${marker}] fork-added; see platform/chromium-mv3/mv3-popup-banner.js -->`,
+            '<script src="js/mv3-popup-banner.js" type="module"></script>',
+        ].join(eol);
+        const count = src.split(anchor).length - 1;
+        if ( count !== 1 ) {
+            console.error(
+                `*** patch-mv3-modules: ${rel} contains ${count} occurrence(s) ` +
+                `of the expected popup module script tag (expected exactly 1):\n` +
+                `${anchor}\n    Reconcile tools/patch-mv3-modules.mjs with the ` +
+                `new upstream popup markup.`
+            );
+            process.exit(1);
+        }
+        fs.writeFileSync(abs, src.replace(anchor, ( ) => replacement));
+        console.log(`*** patch-mv3-modules: ${rel} loads js/mv3-popup-banner.js`);
+    }
+}
+
+/******************************************************************************/
+/******************************************************************************/
+
 // Expose the strict-block bypass deadline map on the exported webRequest
 // object. See the header comment (transform 4) for the full rationale; the
 // anchor is the object literal's tail in js/traffic.js, so any drift in it

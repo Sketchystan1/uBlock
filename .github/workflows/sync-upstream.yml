@@ -294,18 +294,53 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
+          FORK_BUILD=$(cat dist/mv3-build 2>/dev/null || echo 500)
+
+          # The fork's release tag for an upstream tag. A stable X.Y.Z gets this
+          # fork's build number appended (X.Y.Z.<build>-mv3, a STABLE release);
+          # a beta/rc keeps the 1:1 mapping (X.Y.Zb<n>-mv3, dev channel). See
+          # tools/make-chromium-mv3-meta.py and docs/mv3-deployment.md.
+          fork_tag_for() {
+            case "$1" in
+              *b*|*rc*) echo "$1-mv3" ;;
+              *)        echo "$1.$FORK_BUILD-mv3" ;;
+            esac
+          }
+          # Existing fork tags for an upstream tag, newest-version-first. For a
+          # stable X.Y.Z that is every X.Y.Z.N-mv3 already pushed (this fork can
+          # cut more than one build of the same upstream stable); for a beta/rc
+          # it is the single 1:1 tag if present.
+          fork_tags_for() {
+            case "$1" in
+              *b*|*rc*)
+                git rev-parse -q --verify "refs/tags/$1-mv3" >/dev/null && echo "$1-mv3" || true
+                ;;
+              *)
+                esc=$(printf '%s' "$1" | sed 's/[.]/\\./g')
+                git for-each-ref --format='%(refname:strip=2)' 'refs/tags/*-mv3' \
+                  | { grep -E "^${esc}\.[0-9]+-mv3$" || true; } | sort -rV
+                ;;
+            esac
+          }
+
           if [ -n "$INPUT_TAG" ]; then
             # Explicit dispatch: release whatever was asked for, released or not,
-            # so a botched release can be redone.
+            # so a botched release can be redone. INPUT_TAG is the UPSTREAM tag.
             if git rev-parse -q --verify "refs/upstream-tags/$INPUT_TAG" >/dev/null; then
-              echo "Dispatched tag: $INPUT_TAG"
+              fork_tag=$(fork_tag_for "$INPUT_TAG")
+              echo "Dispatched upstream tag: $INPUT_TAG -> fork tag $fork_tag"
               echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+              echo "fork_tag=$fork_tag" >> "$GITHUB_OUTPUT"
               echo 'release=true' >> "$GITHUB_OUTPUT"
+              case "$INPUT_TAG" in
+                *b*|*rc*) : ;;
+                *) echo 'is_stable=true' >> "$GITHUB_OUTPUT" ;;
+              esac
               # actions/checkout with fetch-depth 0 fetches tags too, so an
-              # already-released tag is present locally and a plain `git tag`
+              # already-pushed fork tag is present locally and a plain `git tag`
               # would abort. Flag the redo so "Tag release" moves it instead.
-              if git rev-parse -q --verify "refs/tags/$INPUT_TAG-mv3" >/dev/null; then
-                echo "$INPUT_TAG-mv3 already exists; this run will MOVE it."
+              if git rev-parse -q --verify "refs/tags/$fork_tag" >/dev/null; then
+                echo "$fork_tag already exists; this run will MOVE it."
                 echo 'redo=true' >> "$GITHUB_OUTPUT"
               fi
             else
@@ -329,12 +364,12 @@ jobs:
           # docs/mv3-deployment.md). The Pages update manifests are written
           # only by a signed run, so their absence marks that state.
           release_state() {
-            # $1 = upstream tag; echoes one of: ok, missing, draft, no-crx
-            if ! gh release view "$1-mv3" --json isDraft >/dev/null 2>&1; then
+            # $1 = FORK tag (with -mv3); echoes one of: ok, missing, draft, no-crx
+            if ! gh release view "$1" --json isDraft >/dev/null 2>&1; then
               echo missing
-            elif [ "$(gh release view "$1-mv3" --json isDraft --jq .isDraft)" = true ]; then
+            elif [ "$(gh release view "$1" --json isDraft --jq .isDraft)" = true ]; then
               echo draft
-            elif gh release view "$1-mv3" --json assets \
+            elif gh release view "$1" --json assets \
                 --jq '[.assets[].name|test("^uBlock0_.*\\.chromium-mv3\\.crx$")]|any' \
                 | grep -qx true; then
               echo ok
@@ -348,13 +383,16 @@ jobs:
               || curl -fsSL --max-time 20 "$pages_base/update.xml" 2>/dev/null | grep -q 'appid='
           }
           tag_is_released() {
-            # $1 = upstream tag
-            git rev-parse -q --verify "refs/tags/$1-mv3" >/dev/null || return 1
-            state=$(release_state "$1")
-            if [ "$state" = no-crx ] && ! signed_releases_exist; then
-              return 0  # bootstrap state: zip-only releases are expected
-            fi
-            [ "$state" = ok ]
+            # $1 = UPSTREAM tag; released iff any of its fork tags has a healthy
+            # (or documented bootstrap zip-only) release.
+            for ft in $(fork_tags_for "$1"); do
+              state=$(release_state "$ft")
+              if [ "$state" = ok ]; then return 0; fi
+              if [ "$state" = no-crx ] && ! signed_releases_exist; then
+                return 0  # bootstrap state: zip-only releases are expected
+              fi
+            done
+            return 1
           }
 
           # Only ever the single newest release-shaped tag. Considering the whole
@@ -374,23 +412,28 @@ jobs:
             exit 0
           fi
 
-          if git rev-parse -q --verify "refs/tags/$newest-mv3" >/dev/null; then
-            state=$(release_state "$newest")
+          # Has the newest upstream tag been released (any fork build, for a
+          # stable)? The newest existing fork tag drives the repair path.
+          fork_tags=$(fork_tags_for "$newest")
+          if [ -n "$fork_tags" ]; then
+            existing_fork_tag=$(printf '%s\n' "$fork_tags" | head -n 1)
+            state=$(release_state "$existing_fork_tag")
             if [ "$state" = ok ]; then
-              echo "Newest upstream tag $newest is released as $newest-mv3 and healthy; nothing to do."
+              echo "Newest upstream tag $newest is released as $existing_fork_tag and healthy; nothing to do."
               echo 'release=false' >> "$GITHUB_OUTPUT"
               exit 0
             fi
             if [ "$state" = no-crx ] && ! signed_releases_exist; then
-              echo "Newest upstream tag $newest is released as $newest-mv3, zip-only (no CRX_PRIVATE_KEY yet -- the documented bootstrap state); nothing to do."
+              echo "Newest upstream tag $newest is released as $existing_fork_tag, zip-only (no CRX_PRIVATE_KEY yet -- the documented bootstrap state); nothing to do."
               echo 'release=false' >> "$GITHUB_OUTPUT"
               exit 0
             fi
             # missing / draft / no-crx with a signed channel live: the release
-            # build for this tag failed or never fired. "Repair an incomplete
-            # release" below re-dispatches it and files an issue.
-            echo "::warning::tag $newest-mv3 exists but its release is '$state'; the release build must have failed or never fired -- dispatching it again"
+            # build for this fork tag failed or never fired. "Repair an
+            # incomplete release" below re-dispatches THAT tag and files an issue.
+            echo "::warning::fork tag $existing_fork_tag exists but its release is '$state'; the release build must have failed or never fired -- dispatching it again"
             echo "tag=$newest" >> "$GITHUB_OUTPUT"
+            echo "fork_tag=$existing_fork_tag" >> "$GITHUB_OUTPUT"
             echo 'repair=true' >> "$GITHUB_OUTPUT"
             echo 'release=false' >> "$GITHUB_OUTPUT"
             exit 0
@@ -410,8 +453,14 @@ jobs:
             echo "::warning::releasing $newest only; also unreleased in the recent window:$skipped (dispatch this workflow with tag=<name> to release one)"
           fi
 
-          echo "Releasing: $newest"
+          fork_tag=$(fork_tag_for "$newest")
+          echo "Releasing: $newest -> $fork_tag"
           echo "tag=$newest" >> "$GITHUB_OUTPUT"
+          echo "fork_tag=$fork_tag" >> "$GITHUB_OUTPUT"
+          case "$newest" in
+            *b*|*rc*) : ;;
+            *) echo 'is_stable=true' >> "$GITHUB_OUTPUT" ;;
+          esac
           echo 'release=true' >> "$GITHUB_OUTPUT"
 
       - name: Repair an incomplete release
@@ -429,10 +478,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TAG: ${{ steps.upstream.outputs.tag }}
+          FORK_TAG: ${{ steps.upstream.outputs.fork_tag }}
         run: |
-          title="MV3 release for $TAG is incomplete"
+          title="MV3 release for $FORK_TAG is incomplete"
           body=$(printf '%s\n' \
-            "The tag \`$TAG-mv3\` exists on the remote, but it has no published release with a CRX asset, so no update manifest can advertise it. A release build for this tag must have failed or never fired; without the check that filed this issue, the sync would have treated the tag as already released and skipped it forever -- freezing autoupdate for every policy client." \
+            "The tag \`$FORK_TAG\` exists on the remote, but it has no published release with a CRX asset, so no update manifest can advertise it. A release build for this tag must have failed or never fired; without the check that filed this issue, the sync would have treated the tag as already released and skipped it forever -- freezing autoupdate for every policy client." \
             '' \
             "Run: $RUN_URL" \
             '' \
@@ -447,7 +497,7 @@ jobs:
           else
             gh issue create --title "$title" --body "$body"
           fi
-          gh workflow run release.yml -f tag="$TAG-mv3"
+          gh workflow run release.yml -f tag="$FORK_TAG"
 
       # Build the tree we will actually ship: upstream AT THE TAG, plus this
       # fork's added files. Tagging the merge commit instead (what this workflow
@@ -499,20 +549,20 @@ jobs:
       - name: Tag release
         if: steps.upstream.outputs.release == 'true'
         env:
-          TAG: ${{ steps.upstream.outputs.tag }}
+          FORK_TAG: ${{ steps.upstream.outputs.fork_tag }}
           REDO: ${{ steps.upstream.outputs.redo }}
         run: |
           if [ "$REDO" = 'true' ]; then
             # Only reachable from an explicit workflow_dispatch naming a tag that
             # is already released -- a deliberate human "redo this release".
             # A scheduled run can never get here, because it skips any tag that
-            # already has a -mv3 counterpart.
-            echo "::warning::moving the published tag $TAG-mv3 to a rebuilt tree"
-            git tag -f "$TAG-mv3"
-            git push --force origin "refs/tags/$TAG-mv3"
+            # already has a fork -mv3 counterpart.
+            echo "::warning::moving the published tag $FORK_TAG to a rebuilt tree"
+            git tag -f "$FORK_TAG"
+            git push --force origin "refs/tags/$FORK_TAG"
           else
-            git tag "$TAG-mv3"
-            git push origin "refs/tags/$TAG-mv3"
+            git tag "$FORK_TAG"
+            git push origin "refs/tags/$FORK_TAG"
           fi
 
       - name: Trigger release build
@@ -521,11 +571,30 @@ jobs:
         if: steps.upstream.outputs.release == 'true' && steps.pat.outputs.has != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.upstream.outputs.tag }}
+          FORK_TAG: ${{ steps.upstream.outputs.fork_tag }}
         run: |
           # GH_REPO (workflow env) keeps this on the fork; the `upstream` remote
           # added above would otherwise win gh's repository resolution.
-          gh workflow run release.yml -f tag="$TAG-mv3"
+          gh workflow run release.yml -f tag="$FORK_TAG"
+
+      - name: Bump fork build number
+        # After a STABLE fork release, advance dist/mv3-build so the next stable
+        # build takes the next number (1.75.1.500 -> next 1.75.1.501). The tag
+        # just pushed captured the pre-bump number (the release tree was built
+        # from it), so this only affects future builds. dist/mv3-build is a
+        # normal file (not under .github/workflows/), so GITHUB_TOKEN may push
+        # it. Best-effort: if a build failed, the number is simply skipped -- gaps
+        # are fine for Chrome's version comparison, and a repair re-dispatches the
+        # existing fork tag, not a new number.
+        if: steps.upstream.outputs.release == 'true' && steps.upstream.outputs.is_stable == 'true'
+        run: |
+          git checkout master
+          cur=$(cat dist/mv3-build)
+          new=$((cur + 1))
+          echo "$new" > dist/mv3-build
+          git add dist/mv3-build
+          git commit -m "MV3: bump fork build number to $new for the next stable build"
+          git push origin master
 
       - name: Report any other failure
         # Catch-all, so no failure mode is silent. The two specific reporters
@@ -547,6 +616,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TAG: ${{ steps.upstream.outputs.tag }}
+          FORK_TAG: ${{ steps.upstream.outputs.fork_tag }}
           BLOCKED: ${{ steps.pushable.outputs.blocked }}
           PUSHED: ${{ steps.push.outcome }}
         run: |
@@ -574,16 +644,16 @@ jobs:
             else
               echo '### Cause: tagging or dispatching the release failed'
               echo
-              if [ -n "$TAG" ]; then
-                if git ls-remote --exit-code --tags origin "refs/tags/$TAG-mv3" >/dev/null 2>&1; then
-                  echo "The tag \`$TAG-mv3\` **is** on the remote, but no release build ran for it."
+              if [ -n "$FORK_TAG" ]; then
+                if git ls-remote --exit-code --tags origin "refs/tags/$FORK_TAG" >/dev/null 2>&1; then
+                  echo "The tag \`$FORK_TAG\` **is** on the remote, but no release build ran for it."
                   echo
                   echo 'This is self-latching: scheduled runs treat an existing tag as already released and skip it, so the sync will report success while doing nothing. Build it explicitly:'
                   echo '```sh'
-                  echo "gh workflow run release.yml -R $GH_REPO -f tag=$TAG-mv3"
+                  echo "gh workflow run release.yml -R $GH_REPO -f tag=$FORK_TAG"
                   echo '```'
                 else
-                  echo "The tag \`$TAG-mv3\` is **not** on the remote, so nothing is stuck -- the next scheduled run will retry this tag on its own."
+                  echo "The tag \`$FORK_TAG\` is **not** on the remote, so nothing is stuck -- the next scheduled run will retry this tag on its own."
                 fi
               fi
             fi

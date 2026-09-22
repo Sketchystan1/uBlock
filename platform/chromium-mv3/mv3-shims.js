@@ -1289,8 +1289,25 @@ const discardPendingRequests = net => {
     }
 };
 
+// Fork network-filtering status, reported to the popup over the mv3ForkStatus
+// channel (below) and to mv3-post.js (badge) so a degraded install shows a
+// visible error instead of failing console-only. See
+// platform/chromium-mv3/mv3-popup-banner.js. Both fields are filled
+// asynchronously at boot; `forkStatusReady` resolves once both probes have
+// answered, so the reply is always a definite boolean.
+const forkStatus = { webRequestBlocking: undefined, asyncBlocking: undefined };
+let markForkStatusReady;
+const forkStatusReady = new Promise(resolve => { markForkStatusReady = resolve; });
+const settleForkStatus = ( ) => {
+    if ( forkStatus.webRequestBlocking === undefined ) { return; }
+    if ( forkStatus.asyncBlocking === undefined ) { return; }
+    markForkStatusReady();
+};
+
 const setAsyncBlockingAvailable = available => {
     asyncBlockingAvailable = available;
+    forkStatus.asyncBlocking = available;
+    settleForkStatus();
     if ( available ) { return; }
     console.info(
         'uBO: async blocking is unavailable, which normally means this is not ' +
@@ -1308,6 +1325,51 @@ try {
 } catch {
     setAsyncBlockingAvailable(false);
 }
+
+// Probe whether the webRequestBlocking permission is effective. MV3 grants it
+// only to policy-installed extensions (and, for testing, an
+// --allowlisted-extension-id sideload); a plain unpacked/sideload install
+// filters nothing. chrome.permissions needs no manifest permission to call, and
+// reports a restricted, ungranted permission as absent -- which maps 1:1 to
+// "sync blocking works". If a future Chrome ever reports it as held even when
+// inert, switch this to installType-based detection (see docs/mv3-deployment.md).
+const setWebRequestBlockingAvailable = available => {
+    forkStatus.webRequestBlocking = available;
+    settleForkStatus();
+    if ( available ) { return; }
+    console.info(
+        'uBO: webRequest blocking is unavailable, which normally means this ' +
+        'is not a policy install. No network filtering will take effect. See ' +
+        'docs/mv3-deployment.md.'
+    );
+};
+try {
+    chrome.permissions.contains({ permissions: [ 'webRequestBlocking' ] })
+        .then(ok => setWebRequestBlockingAvailable(ok === true))
+        .catch(( ) => setWebRequestBlockingAvailable(false));
+} catch {
+    setWebRequestBlockingAvailable(false);
+}
+
+// Answer the popup's status query (platform/chromium-mv3/mv3-popup-banner.js).
+// A dedicated listener -- the keepalive listener above ignores anything but its
+// own message; returning true keeps the channel open for the async reply, which
+// waits until both probes have settled so the booleans are definite.
+chrome.runtime.onMessage.addListener((message, sender, callback) => {
+    if ( message?.what !== 'mv3ForkStatus' ) { return; }
+    forkStatusReady.then(( ) => {
+        callback({
+            webRequestBlocking: forkStatus.webRequestBlocking === true,
+            asyncBlocking: forkStatus.asyncBlocking === true,
+        });
+    });
+    return true;
+});
+
+// Consumed by platform/chromium-mv3/mv3-post.js to set the toolbar error badge
+// once the probes settle. `forkStatus` is mutated in place, so the imported
+// reference reads the live values after `mv3ForkStatusReady` resolves.
+export { forkStatus as mv3ForkStatus, forkStatusReady as mv3ForkStatusReady };
 
 // Maps each patched method back to the one it replaced, so that patching a
 // subclass finds the *original* implementation rather than the patch installed

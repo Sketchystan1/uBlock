@@ -42,6 +42,38 @@ with open(os.path.join(proj_dir, 'platform', 'chromium-mv3', 'manifest.overlay.j
 with open(os.path.join(proj_dir, 'dist', 'version'), encoding='utf-8') as f:
     version = f.read().strip()
 
+# Fork identity and version scheme.
+#
+# This fork ships its own version line on top of upstream, without modifying
+# upstream's dist/version (which the release tree keeps for the tag): the fork
+# build number lives in the fork-added file dist/mv3-build, and the shipped
+# version is derived from upstream's dist/version plus that number.
+#
+#   upstream stable  X.Y.Z      -> fork STABLE  X.Y.Z.<build>   (build >= 500)
+#   upstream beta    X.Y.Z.<n>  -> passthrough  X.Y.Z.<n>       (n < 500, dev)
+#
+# A 4th component >= FORK_BUILD_FLOOR marks a fork stable build: it is strictly
+# greater than the upstream stable X.Y.Z (== X.Y.Z.0 to Chrome), and never
+# collides with upstream betas (.1..~99) or rcs (.10<n>). See
+# docs/mv3-deployment.md.
+FORK_NAME = 'uBlock Origin (Sketchy MV3 fork)'
+FORK_SHORT_NAME = 'uBO Sketchy'
+FORK_BUILD_FLOOR = 500
+
+try:
+    with open(os.path.join(proj_dir, 'dist', 'mv3-build'), encoding='utf-8') as f:
+        fork_build = int(f.read().strip())
+except FileNotFoundError:
+    fork_build = FORK_BUILD_FLOOR
+except ValueError:
+    raise SystemExit('dist/mv3-build must contain a single integer')
+if fork_build < FORK_BUILD_FLOOR or fork_build > 65535:
+    raise SystemExit(
+        'dist/mv3-build ({}) must be an integer in [{}, 65535]'.format(
+            fork_build, FORK_BUILD_FLOOR
+        )
+    )
+
 manifest['manifest_version'] = 3
 
 # browser_action -> action
@@ -119,12 +151,25 @@ for key, value in overlay.items():
     else:
         manifest[key] = value
 
+# Derive the fork version from upstream's dist/version (see the scheme note
+# where FORK_BUILD_FLOOR is defined). An upstream stable X.Y.Z becomes the fork
+# stable build X.Y.Z.<build>; an upstream beta remap (X.Y.Z.<n>, n < 500) and
+# any other non-stable shape pass through unchanged as a dev build.
+is_upstream_stable = re.fullmatch(r'\d+\.\d+\.\d+', version) is not None
+if is_upstream_stable:
+    version = '{}.{}'.format(version, fork_build)
+    is_fork_stable = True
+else:
+    is_fork_stable = False
+
 manifest['version'] = version
 
-# A dev/beta build carries a four-component version (1.74.1.5); a stable
-# release carries three (1.74.1). This selects both the update channel and the
-# name suffix below.
-is_dev_build = bool(re.search(r'^\d+\.\d+\.\d+\.\d+$', version))
+# A dev/beta build carries a four-component version whose 4th component is an
+# upstream beta/rc remap (< 500); a fork stable build also has four components
+# but its 4th is the fork build number (>= 500) and is NOT a dev build. This
+# selects both the update channel and the name/version_name rules below.
+is_dev_build = is_fork_stable is False and \
+    bool(re.search(r'^\d+\.\d+\.\d+\.\d+$', version))
 
 # Self-hosted auto-update. Chrome/Chromium polls this URL (an Omaha update
 # manifest) roughly every five hours and installs a newer CRX when one is
@@ -151,13 +196,33 @@ manifest['update_url'] = '{}/{}'.format(
     update_base, 'update-dev.xml' if is_dev_build else 'update.xml',
 )
 
-# Development build? If so, modify name accordingly. Mirrors
-# tools/make-chromium-meta.py, and sets version_name so that
-# vapi-common.js's devbuild check (/^\d+\.\d+\.\d+\D/) recognizes it.
-if is_dev_build:
+# Fork identity, applied to every build. Upstream's manifest.json and its
+# localized description are left untouched (so the unattended merge cannot
+# conflict and verify-mv3-package.mjs's KNOWN_MV2_KEYS check is unaffected);
+# the rename happens here, on the generated MV3 manifest.
+manifest['name'] = FORK_NAME
+manifest['short_name'] = FORK_SHORT_NAME
+if isinstance(manifest.get('action'), dict):
+    manifest['action']['default_title'] = FORK_NAME
+
+if is_fork_stable:
+    # A fork stable build carries a four-component version, which uBO's
+    # vapi-common.js would otherwise flag as a "devbuild": its check
+    # (/^\d+\.\d+\.\d+\D/) matches the 4th separator, and a devbuild switches
+    # to the dev filter-list asset channel (assets.dev.json) and verbose
+    # logging (src/js/background.js). uBO reads `version_name || version` for
+    # that test, so set a version_name that does NOT match the regex -- it
+    # starts with a letter -- to make the build behave as the stable release it
+    # is. This is also what Chrome shows as the version string.
+    manifest['version_name'] = 'uBlock Origin {} (Sketchy MV3 fork)'.format(version)
+elif is_dev_build:
+    # Upstream beta/rc: keep the dev branding and the devbuild-triggering
+    # version_name (X.Y.Zb<n>), so uBO uses the dev asset channel as upstream
+    # intends for a beta tag. Mirrors tools/make-chromium-meta.py.
     manifest['name'] += ' development build'
     manifest['short_name'] += ' dev build'
-    manifest['action']['default_title'] += ' dev build'
+    if isinstance(manifest.get('action'), dict):
+        manifest['action']['default_title'] += ' dev build'
     manifest['version_name'] = re.sub(r'\.(\d+)$', r'b\1', version)
 
 with open(os.path.join(build_dir, 'manifest.json'), 'w', encoding='utf-8') as f:

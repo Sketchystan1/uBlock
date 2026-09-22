@@ -146,6 +146,7 @@ const REQUIRED_FILES = [
     'js/sw.js',
     'js/mv3-shims.js',
     'js/mv3-post.js',
+    'js/mv3-popup-banner.js',
     'js/mv3-scriptlet-marker.js',
     'js/mv3-scriptlet-shards.js',
     'js/mv3-scriptlet-shared.js',
@@ -248,13 +249,19 @@ const manifestChecks = [
       'web_accessible_resources is not in MV3 object form' ],
     [ 'devbuild-version-name',
       ( ) => {
-          if ( /^\d+\.\d+\.\d+\.\d+$/.test(manifest.version) ) {
-              return typeof manifest.version_name === 'string' &&
-                     /^\d+\.\d+\.\d+\D/.test(manifest.version_name);
-          }
-          return true;
+          const m = /^\d+\.\d+\.\d+\.(\d+)$/.exec(manifest.version || '');
+          if ( m === null ) { return true; }
+          if ( typeof manifest.version_name !== 'string' ) { return false; }
+          const isDevbuildName = /^\d+\.\d+\.\d+\D/.test(manifest.version_name);
+          // A 4th component >= 500 is a fork STABLE build: it must NOT be
+          // flagged devbuild (so it uses the stable filter-list asset channel
+          // and quiet logging), i.e. version_name must NOT match uBO's devbuild
+          // regex. Below 500 is an upstream beta remap, which MUST match so
+          // vapi-common.js's devbuild check fires. See
+          // tools/make-chromium-mv3-meta.py.
+          return Number(m[1]) >= 500 ? isDevbuildName === false : isDevbuildName;
       },
-      'dev builds (4-part version) require version_name matching /^\\d+\\.\\d+\\.\\d+\\D/ so vapi-common.js devbuild check succeeds' ],
+      'a 4-part version requires version_name: matching /^\\d+\\.\\d+\\.\\d+\\D/ for an upstream beta (4th <500), NOT matching for a fork stable build (4th >=500)' ],
 ];
 
 for ( const [ name, test, message ] of manifestChecks ) {
@@ -1251,6 +1258,7 @@ section('port self-checks');
         [ 'js/sw.js', 'mjs' ],
         [ 'js/mv3-shims.js', 'mjs' ],
         [ 'js/mv3-post.js', 'mjs' ],
+        [ 'js/mv3-popup-banner.js', 'mjs' ],
         [ 'js/mv3-scriptlet-marker.js', 'mjs' ],
         // Generated: the shard manifest (an ES module) and the fixed
         // library files. The shard files are discovered through the
@@ -1733,6 +1741,44 @@ section('port self-checks');
             'see the session-state section of platform/chromium-mv3/mv3-post.js');
     } else {
         pass('session rules, page stores and strict-block bypasses survive service worker deaths');
+    }
+}
+
+// Degraded-state UI. When network filtering is inert -- webRequest blocking
+// not working (not policy-installed) or async blocking off (installType !=
+// admin) -- the fork surfaces it visibly instead of only in the console: the
+// service worker answers a `mv3ForkStatus` message, the popup banner script
+// queries it and prepends a warning, and mv3-post.js sets an error badge. Break
+// one and a non-filtering install fails silently again.
+{
+    const problems = [];
+    const banner = existsPkg('js/mv3-popup-banner.js')
+        ? readPkg('js/mv3-popup-banner.js')
+        : '';
+    const shims = readPkg('js/mv3-shims.js');
+    const post = readPkg('js/mv3-post.js');
+    const popup = existsPkg('popup-fenix.html') ? readPkg('popup-fenix.html') : '';
+    if ( banner === '' ) {
+        problems.push('js/mv3-popup-banner.js is missing from the package');
+    } else if ( banner.includes('mv3ForkStatus') === false ) {
+        problems.push('js/mv3-popup-banner.js no longer queries the mv3ForkStatus channel');
+    }
+    if ( popup === '' ) {
+        problems.push('popup-fenix.html is missing from the package');
+    } else if ( /<script[^>]+src="js\/mv3-popup-banner\.js"/.test(popup) === false ) {
+        problems.push('popup-fenix.html does not load js/mv3-popup-banner.js (tools/patch-mv3-modules.mjs must inject it)');
+    }
+    if ( shims.includes('mv3ForkStatus') === false ) {
+        problems.push('js/mv3-shims.js no longer answers the mv3ForkStatus message, so the popup banner cannot learn the blocking status');
+    }
+    if ( /setBadgeText/.test(post) === false ) {
+        problems.push('js/mv3-post.js no longer sets the degraded-state error badge');
+    }
+    if ( problems.length !== 0 ) {
+        fail('degraded-state-ui', problems.join('\n'),
+            'reconcile platform/chromium-mv3/mv3-popup-banner.js, mv3-shims.js and mv3-post.js with the popup transform in tools/patch-mv3-modules.mjs');
+    } else {
+        pass('degraded-state UI: status channel, popup banner injection and error badge wired');
     }
 }
 

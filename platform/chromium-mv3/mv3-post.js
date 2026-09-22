@@ -73,7 +73,7 @@ import {
 import { ScriptletFilteringEngine } from './scriptlet-filtering-core.js';
 import { encodeScriptletMarker } from './mv3-scriptlet-marker.js';
 import io from './assets.js';
-import { mv3EarlyEvents } from './mv3-shims.js';
+import { mv3EarlyEvents, mv3ForkStatus, mv3ForkStatusReady } from './mv3-shims.js';
 import scriptletFilteringEngine from './scriptlet-filtering.js';
 import staticNetFilteringEngine from './static-net-filtering.js';
 import webRequest from './traffic.js';
@@ -90,6 +90,53 @@ self.uBO_registerStaticModules({
     // dependency tree; it pulls its benchmark dataset only when run.
     '/js/benchmarks.js': benchmarks,
 });
+
+/******************************************************************************/
+
+// Visible degraded-state indicator on the toolbar icon.
+//
+// When network filtering is inert -- webRequest blocking not working (not
+// policy-installed) or async blocking off (installType != 'admin') -- set a red
+// "!" badge so the failure is visible, not console-only. The popup banner
+// (platform/chromium-mv3/mv3-popup-banner.js) carries the detail; this is the
+// attention-grabber. The status is probed in mv3-shims.js and settles shortly
+// after boot.
+//
+// While degraded, uBO's own per-tab badge updates (block counts, the "off"
+// state) are overridden to keep the indicator visible: a build that is not
+// filtering has no meaningful per-tab counts, so forcing the error badge over
+// them is the right trade. Both action methods are already wrapped by
+// mv3-shims.js (tabId validation); this wraps those wrappers.
+mv3ForkStatusReady.then(( ) => {
+    const degraded =
+        mv3ForkStatus.webRequestBlocking === false ||
+        mv3ForkStatus.asyncBlocking === false;
+    if ( degraded === false ) { return; }
+    const ERROR_TEXT = '!';
+    const ERROR_COLOR = '#b00000';
+    if ( chrome.action instanceof Object === false ) { return; }
+    const setBadgeText = chrome.action.setBadgeText?.bind(chrome.action);
+    const setBadgeColor = chrome.action.setBadgeBackgroundColor?.bind(chrome.action);
+    if ( typeof setBadgeText !== 'function' ) { return; }
+    chrome.action.setBadgeText = function(details, ...args) {
+        const forced = Object.assign({}, details, { text: ERROR_TEXT });
+        return setBadgeText(forced, ...args);
+    };
+    if ( typeof setBadgeColor === 'function' ) {
+        chrome.action.setBadgeBackgroundColor = function(details, ...args) {
+            const forced = Object.assign({}, details, { color: ERROR_COLOR });
+            return setBadgeColor(forced, ...args);
+        };
+    }
+    // Seed the default (no-tab) badge now, so tabs uBO has not touched yet also
+    // show it; navigations re-assert it through the wraps above.
+    try {
+        chrome.action.setBadgeText({ text: ERROR_TEXT });
+        if ( typeof setBadgeColor === 'function' ) {
+            chrome.action.setBadgeBackgroundColor({ color: ERROR_COLOR });
+        }
+    } catch { }
+}).catch(( ) => { });
 
 /******************************************************************************/
 

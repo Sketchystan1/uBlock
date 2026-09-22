@@ -81,10 +81,17 @@ const tagVersion = rawTag.replace(/-mv3$/, '');
 // mapping tools/release.yml applies in its "Check the advertised version" step,
 // kept here as the single source of truth:
 //   X.Y.Z      -> X.Y.Z
+//   X.Y.Z.N    -> X.Y.Z.N     (fork stable build, N >= 500 -- itself)
 //   X.Y.Zb<n>  -> X.Y.Z.<n>
 //   X.Y.Zrc<n> -> X.Y.Z.10<n>
 function chromeVersionFromTag(v) {
     let m = /^(\d+\.\d+\.\d+)$/.exec(v);
+    if ( m ) { return m[1]; }
+    // Fork stable build: the tag already carries the Chrome-comparable
+    // 4-component version (X.Y.Z.N, N >= 500). Upstream never tags a bare
+    // 4-component version -- its betas are X.Y.Zb<n> -- so this branch only
+    // ever matches this fork's own tags. See tools/make-chromium-mv3-meta.py.
+    m = /^(\d+\.\d+\.\d+\.\d+)$/.exec(v);
     if ( m ) { return m[1]; }
     m = /^(\d+\.\d+\.\d+)b(\d+)$/.exec(v);
     if ( m ) { return `${m[1]}.${m[2]}`; }

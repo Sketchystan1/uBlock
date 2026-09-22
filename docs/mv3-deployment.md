@@ -86,10 +86,11 @@ manifests** to GitHub Pages, each at a **stable URL** that never changes between
 signed with one key (so both advertise the same extension id — a device follows whichever one URL
 it names; it cannot run both side by side):
 
-- **Stable** — `https://<owner>.github.io/<repo>/update.xml` — only ever advances to a stable
-  `X.Y.Z` release.
+- **Stable** — `https://<owner>.github.io/<repo>/update.xml` — only ever advances to a fork
+  **stable** build, versioned `X.Y.Z.N` (the upstream stable `X.Y.Z` it was built from, plus this
+  fork's build number `N` ≥ 500 — see *Fork version scheme and name* below).
 - **Dev** — `https://<owner>.github.io/<repo>/update-dev.xml` — tracks the newest build of any
-  kind, betas and rcs included.
+  kind, upstream betas and rcs included.
 
 A fixed URL matters because the external-extensions registration takes one update URL and
 Chrome polls it forever; a per-release asset URL would pin a client to a single version and
@@ -97,9 +98,10 @@ never update it again.
 
 > [!NOTE]
 > Do not use `https://github.com/<owner>/<repo>/releases/latest/download/update.xml`. GitHub
-> resolves `/releases/latest` to the newest **non-prerelease** release, and this fork marks every
-> non-`X.Y.Z` build as a prerelease. Policy clients would silently stop at the last stable build.
-> The stable channel URL above already gives you "newest stable" through a genuinely fixed URL.
+> resolves `/releases/latest` to the newest **non-prerelease** release, and this fork marks upstream
+> betas/rcs as prereleases (its own `X.Y.Z.N` stable builds are full releases), so it can drift or
+> skip depending on release timing. The stable channel URL above already gives you "newest stable"
+> through a genuinely fixed URL.
 
 Then, replacing `EXTENSION_ID` with the value `make-crx.mjs` printed (the examples use the
 stable channel; substitute `update-dev.xml` to follow the dev channel):
@@ -311,12 +313,44 @@ One-time repository setup:
    authenticated with `GITHUB_TOKEN` do not trigger other workflows; the sync's explicit
    dispatch fallback does work, the token just removes a moving part).
 
-Releases are cut for every release-shaped upstream tag, betas and rcs included. Upstream ships
-roughly six betas per stable release, and a beta's four-component `dist/version` makes it build
-as "uBlock Origin development build" against the dev filter-list channel — which is upstream's
-own intent for a beta tag, not a defect. To keep a deployment on stable releases only, point its
-policy `update_url` at the **stable channel** (`update.xml`), which never advances past an
-`X.Y.Z` release — this is the intended mechanism and needs no workflow change.
+Releases are cut for every release-shaped upstream tag, betas and rcs included, plus this fork's
+own stable builds.
+
+### Fork version scheme and name
+
+This fork ships under the name **uBlock Origin (Sketchy MV3 fork)** (set in
+`tools/make-chromium-mv3-meta.py`, so upstream's `manifest.json` is never touched). Its version is
+derived from upstream's `dist/version` plus a fork build number in the fork-owned file
+`dist/mv3-build` (starts at `500`):
+
+- **Upstream stable `X.Y.Z`** → fork **stable** build **`X.Y.Z.N`** (`N` = `dist/mv3-build`, ≥ 500),
+  published to the **stable** channel (`update.xml`). `X.Y.Z.500` is strictly greater than the
+  upstream `X.Y.Z` (`= X.Y.Z.0` to Chrome) and never collides with an upstream beta (`X.Y.Zb<n>` →
+  `X.Y.Z.<n>`, the `.1..` range) or rc (`.10<n>`). `sync-upstream.yml` tags it `X.Y.Z.N-mv3` and then
+  bumps `dist/mv3-build`, so the next stable build is `X.Y.Z.501`, and so on.
+- **Upstream beta/rc `X.Y.Zb<n>` / `X.Y.Zrc<n>`** → built unchanged as a **dev** build
+  (`update-dev.xml`, "development build" branding), exactly as before.
+
+A four-component version would otherwise trip uBO's own `devbuild` heuristic (which switches it to
+the dev filter-list asset channel and verbose logging). The stable build sets a `version_name` that
+does not match that heuristic, so `X.Y.Z.N` behaves as the stable release it is. To cut another
+stable build of the same upstream `X.Y.Z`, dispatch `sync-upstream.yml` with that upstream tag; it
+builds the next `dist/mv3-build` number.
+
+To keep a deployment on stable releases only, point its policy `update_url` at the **stable
+channel** (`update.xml`), which only ever advances to a fork `X.Y.Z.N` stable build — this is the
+intended mechanism and needs no workflow change.
+
+### Visible "filtering not working" errors
+
+Because MV3 grants `webRequestBlocking` only to policy installs, a build loaded any other way
+filters nothing, and async request-holding needs a policy (`installType === 'admin'`) install on
+top of that. The fork surfaces both failures instead of only logging them: the toolbar icon shows a
+red `!` badge, and the popup panel prepends a warning banner naming which capability is inactive
+(*webRequest blocking not working* and/or *async blocking not working*). Both clear once the
+extension is force-installed by policy. The status is probed in
+`platform/chromium-mv3/mv3-shims.js` (`mv3ForkStatus`) and rendered by
+`platform/chromium-mv3/mv3-popup-banner.js`.
 
 ## Testing your install
 
