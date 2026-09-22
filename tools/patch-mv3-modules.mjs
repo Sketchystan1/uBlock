@@ -1094,6 +1094,65 @@ for ( const rel of conflicts ) {
                 },
             ],
         },
+        {
+            // js/start.js -- guard uBO's first-install self-restart
+            // (uBlock-issues #1547) against a reload loop. onVersionReady()'s
+            // version write is fire-and-forget; on a fresh install the reload
+            // preempts it before storage.local is even created, so
+            // `lastVersionInt` reads 0 on every boot and the extension reloads
+            // forever -- Chrome/Edge then disable it with "This extension
+            // reloaded itself too frequently" (confirmed: the per-extension
+            // Local Extension Settings directory is never created). Persist the
+            // version durably first (awaited raw set, which resolves only once
+            // the write is committed) and gate the reload on a storage.local
+            // marker so a write which never lands can trigger at most one
+            // reload, never a loop; on the already-restarted / write-failed
+            // path the boot simply continues.
+            rel: 'js/start.js',
+            probe: 'mv3FirstInstallRestarted',
+            edits: [
+                {
+                    anchor: [
+                        '    // https://github.com/uBlockOrigin/uBlock-issues/issues/1547',
+                        '    if ( lastVersionInt === 0 && vAPI.webextFlavor.soup.has(\'chromium\') ) {',
+                        '        vAPI.app.restart();',
+                        '        return;',
+                        '    }',
+                    ],
+                    replacement: [
+                        '    // https://github.com/uBlockOrigin/uBlock-issues/issues/1547',
+                        '    if ( lastVersionInt === 0 && vAPI.webextFlavor.soup.has(\'chromium\') ) {',
+                        '        // Fork hardening (tools/patch-mv3-modules.mjs): the version',
+                        '        // write in onVersionReady() above is fire-and-forget; on a',
+                        '        // fresh install the reload below preempts it before',
+                        '        // storage.local is created, so lastVersionInt reads 0 on every',
+                        '        // boot and the extension reloads forever. Persist the version',
+                        '        // durably first (awaited raw set, which resolves only once the',
+                        '        // write is committed) and gate the reload on a storage.local',
+                        '        // marker so a write which never lands can trigger at most one',
+                        '        // reload, never a loop.',
+                        '        const firstInstallMarker = \'mv3FirstInstallRestarted\';',
+                        '        const markerBin = await vAPI.storage.get(firstInstallMarker);',
+                        '        const alreadyRestarted =',
+                        '            markerBin === null || markerBin[firstInstallMarker] === true;',
+                        '        if ( alreadyRestarted === false ) {',
+                        '            try {',
+                        '                await chrome.storage.local.set({',
+                        '                    version: vAPI.app.version,',
+                        '                    versionUpdateTime: Date.now(),',
+                        '                    [firstInstallMarker]: true,',
+                        '                });',
+                        '                vAPI.app.restart();',
+                        '                return;',
+                        '            } catch (reason) {',
+                        '                console.error(`uBO: first-install restart aborted (${reason})`);',
+                        '            }',
+                        '        }',
+                        '    }',
+                    ],
+                },
+            ],
+        },
     ];
 
     for ( const { rel, probe, edits } of RUNTIME_HARDENING ) {

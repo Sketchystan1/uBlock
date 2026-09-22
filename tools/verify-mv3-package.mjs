@@ -1541,6 +1541,40 @@ section('port self-checks');
     }
 }
 
+// The first-install restart guard (patch-mv3-modules.mjs, js/start.js entry)
+// makes uBO's #1547 first-install self-restart durable and once-only. Without
+// it, a fresh install whose fire-and-forget version write loses the race with
+// the reload reads `lastVersionInt === 0` on every boot and reloads forever
+// ("This extension reloaded itself too frequently").
+{
+    const problems = [];
+    const pkg = readPkg('js/start.js');
+    const pins = [
+        [ 'mv3FirstInstallRestarted', 'the first-install once-marker' ],
+        [ 'await chrome.storage.local.set({', 'the awaited durable version write' ],
+        [ 'const alreadyRestarted =', 'the once-guard' ],
+    ];
+    for ( const [ needle, what ] of pins ) {
+        if ( pkg.includes(needle) ) { continue; }
+        problems.push(`js/start.js first-install restart guard: ${what} is gone`);
+    }
+    // The unguarded upstream restart -- a bare restart right after the block
+    // open -- must not survive into the package: that is the reload-loop hazard.
+    if ( pkg.includes('soup.has(\'chromium\') ) {\n        vAPI.app.restart();') ) {
+        problems.push('js/start.js still has the unguarded #1547 first-install restart in the package');
+    }
+    // Upstream anchor the transform rewrites.
+    if ( readRepo('src/js/start.js').includes('if ( lastVersionInt === 0 && vAPI.webextFlavor.soup.has(\'chromium\') ) {') === false ) {
+        problems.push('src/js/start.js no longer has the #1547 first-install restart block the guard transform rewrites');
+    }
+    if ( problems.length !== 0 ) {
+        fail('first-install restart guard', problems.join('\n'),
+            'reconcile tools/patch-mv3-modules.mjs (js/start.js entry) with the upstream #1547 restart shape');
+    } else {
+        pass('first-install restart guard intact: once-marker, awaited durable write, no unguarded restart in package');
+    }
+}
+
 // The user-filter staleness fix (mv3-post.js) wraps `µb.saveUserFilters` so a
 // raw-asset change also rebuilds the engines, and wraps the scriptlet
 // engine's retrieve so its payload cache invalidates on a user-filters
