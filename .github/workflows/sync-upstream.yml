@@ -46,13 +46,15 @@ env:
   # on gorhill/uBlock.
   GH_REPO: ${{ github.repository }}
 
-  # Which upstream tags are releases. Excludes `npm_*` (one dead tag from 2021)
-  # and anything else non-version-shaped. Betas and rcs are included on purpose:
-  # upstream ships roughly six betas per stable release, and this fork tracks
-  # them. A four-component dist/version makes those build as "uBlock Origin
-  # development build" against the dev filter-list channel, which is upstream's
-  # own intent for a beta tag.
-  TAG_PATTERN: '^[0-9]+\.[0-9]+\.[0-9]+((b|rc)[0-9]+)?$'
+  # Which upstream tags the SCHEDULED sync releases. Excludes `npm_*` (one dead
+  # tag from 2021) and anything else non-version-shaped. Stable X.Y.Z ONLY:
+  # beta/rc dev releases are PAUSED -- restore the `((b|rc)[0-9]+)?` group to
+  # resume tracking upstream betas on the dev channel. Upstream ships roughly
+  # six betas per stable release; the fork built those as "uBlock Origin
+  # development build" against the dev filter-list channel. This gate affects
+  # only the scheduled path -- a manual workflow_dispatch naming a beta tag
+  # still builds and publishes it (an explicit human override).
+  TAG_PATTERN: '^[0-9]+\.[0-9]+\.[0-9]+$'
 
 jobs:
   sync:
