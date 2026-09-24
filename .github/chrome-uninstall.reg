@@ -1,12 +1,9 @@
 Windows Registry Editor Version 5.00
 
-; Uninstall — removes the uBlock Origin force-install policy for Chrome.
-; Double-click (elevated), then restart Chrome; it drops the extension.
-; Deletes only uBO's entry, so any other ExtensionSettings policies stay intact.
-; Also cleans up the OLD ExtensionInstallAllowlist install (earlier README versions):
-; the HKCU external-update_url key and the allowlist value "1".
-; Does NOT undo the managed-device step — run fake-mdm-undo.reg for that (if nothing
-; else needs it), or remove the browser from Chrome Enterprise Core.
+; Uninstall — removes the uBO force-install policy for Chrome. Run elevated, restart Chrome.
+; Deletes only uBO's entry; other ExtensionSettings policies stay.
+; Managed-device step is separate — run fake-mdm-undo.reg to undo that.
+; Also cleans up the OLD ExtensionInstallAllowlist install (no-op if you never used it).
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome\ExtensionSettings]
 "cbmpaamhmhdhnkofemgdlnbdadbpmjkn"=-
@@ -14,7 +11,7 @@ Windows Registry Editor Version 5.00
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome]
 "DeveloperToolsAvailability"=-
 
-; --- old ExtensionInstallAllowlist install cleanup (no-op if you never used it) ---
+; --- old ExtensionInstallAllowlist cleanup ---
 [-HKEY_CURRENT_USER\SOFTWARE\Google\Chrome\Extensions\cbmpaamhmhdhnkofemgdlnbdadbpmjkn]
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome\ExtensionInstallAllowlist]

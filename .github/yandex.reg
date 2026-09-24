@@ -1,13 +1,9 @@
 Windows Registry Editor Version 5.00
 
 ; Yandex Browser — off-store force-install via ExtensionSettings.
-; Yandex Browser supports Chromium group policies (unlike Opera / Opera GX, which support none).
-; Policy root is the standard Yandex ADMX namespace — verify at browser://policy after applying.
-; 1. Replace the ID with your 32-char ID (chars a-p only).
-; 2. Replace the update_url with your own update manifest.
-; 3. Use ExtensionSettings OR ExtensionInstallForcelist, never both (they double-deliver).
-; 4. 32-bit browser? Also add the same keys under ...\SOFTWARE\WOW6432Node\Policies\YandexBrowser.
-; Off-store force-install may also need the device to look managed (fake-mdm.reg), same as Chrome.
+; Replace the ID (32 chars, a-p) and update_url with your own. Don't also use
+; ExtensionInstallForcelist (double-delivers). 32-bit: add under WOW6432Node too.
+; May also need the device to look managed (fake-mdm.reg). Verify at browser://policy — no [BLOCKED].
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\YandexBrowser\ExtensionSettings]
 "cbmpaamhmhdhnkofemgdlnbdadbpmjkn"="{\"installation_mode\":\"force_installed\",\"update_url\":\"https://sketchystan1.github.io/uBlock/update.xml\"}"

@@ -1,38 +1,10 @@
 Windows Registry Editor Version 5.00
 
-; Edge (and any Chromium browser) — fake MDM enrollment so the device reports as
-; "managed by your organization", which makes off-store ExtensionInstallForcelist /
-; ExtensionSettings policies be HONORED instead of shown as [BLOCKED].
-;
-; WHY THIS INSTEAD OF version.dll FOR EDGE:
-;   msedge.exe hardens its DLL search path (SetDefaultDllDirectories +
-;   PreferSystem32 mitigation) before any delay-load resolves, so a version.dll
-;   proxy placed next to msedge.exe is never loaded into the browser process.
-;   The only DLL that loads app-relative is msedge_elf.dll, which lives in the
-;   per-version subfolder that is deleted on every update. So for Edge we change
-;   the OS management signal that the browser reads normally, in-process.
-;
-; HOW IT WORKS (from Chromium source, which Edge is built on):
-;   base/enterprise_util_win.cc:  IsManagedDevice()
-;       = base::win::IsEnrolledToDomain() || base::win::IsDeviceRegisteredWithManagement()
-;   base/win/win_util.cc:         IsDeviceRegisteredWithManagement()
-;       -> Win32 IsDeviceRegisteredWithManagement() in MDMRegistration.dll,
-;          which returns TRUE when a valid MDM enrollment exists in the registry.
-;   The two keys below synthesize that enrollment. No real MDM server is contacted.
-;
-; REQUIREMENTS / SCOPE:
-;   - Run elevated (writes HKLM). One-time; survives Edge updates.
-;   - Windows Pro/Enterprise/Education. On Windows HOME the Chromium check is
-;     skipped (SUITE_HOME), so this has no effect there.
-;   - Machine-wide: every Chromium browser now sees the device as managed, and
-;     Windows Settings may show "managed by your organization". Reversible with
-;     edge-fake-mdm-undo.reg. Windows may attempt MDM sync and silently fail
-;     (there is no real server URL) — harmless.
-;
-; VERIFY: restart Edge, open edge://policy — the ExtensionSettings/Forcelist entry
-;   should appear WITHOUT the [BLOCKED] prefix; edge://management reflects managed.
-;
-; The all-F GUID is an obvious placeholder for easy removal; any GUID works.
+; Fake MDM enrollment — makes the device report as "managed by your organization" so
+; off-store ExtensionSettings/Forcelist policies are HONORED instead of shown as [BLOCKED].
+; Run elevated. Windows Pro/Enterprise/Education only (no-op on Home — SUITE_HOME skips the check).
+; Machine-wide and reversible with fake-mdm-undo.reg. Verify at browser://policy — entry has no [BLOCKED].
+; The all-F GUID is a placeholder for easy removal; any GUID works. No real MDM server is contacted.
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Enrollments\FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF]
 "EnrollmentState"=dword:00000001
