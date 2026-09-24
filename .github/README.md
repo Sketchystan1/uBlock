@@ -22,7 +22,9 @@ Know another option? Share it in [Discussions](https://github.com/Sketchystan1/u
 
 ## Windows - choose only one!
 
-### Fake MDM 
+GitHub shows `.reg` files as text, not a download. Right-click the link → **Save link as**, and keep the `.reg` ending — not `.reg.txt`.
+
+### Fake MDM
 
 Not working in Windows Home.
 
@@ -41,8 +43,7 @@ Not working in Edge.
 
 ## Chrome Enterprise Core - Windows, macOS
 
-1. Sign up for [Chrome Enterprise Core](https://enterprise.google.com/signup/chrome-browser/email?origin=cbcm&source=browsermgmt) 
-
+1. [Sign up](https://enterprise.google.com/signup/chrome-browser/email?origin=cbcm&source=browsermgmt) 
 2. Get a token: [Google Admin console](https://admin.google.com) → **Devices → Chrome → Managed browsers → Enroll**.
 3. Add token to system
    ```powershell
@@ -53,8 +54,8 @@ Not working in Edge.
    # macOS
    sudo mkdir -p /Library/Google/Chrome && echo "<YOUR_TOKEN>" | sudo tee /Library/Google/Chrome/CloudManagementEnrollmentToken
    ```
-4. Restart the browser. Open `chrome://management`. It should say managed.
-5. Force install uBO: push it from the Admin console or locally run on Windows: [chrome.reg](chrome.reg), [edge.reg](edge.reg), [vivaldi.reg](vivaldi.reg), [chromium.reg](chromium.reg), [yandex.reg](yandex.reg).
+4. Restart the browser.
+5. Force install uBO: [push it from the Admin console](https://www.androidenterprise.community/best-practices-with-chrome-enterprise-46/managing-extensions-via-chrome-enterprise-core-2662) or locally run on Windows: [chrome.reg](chrome.reg), [edge.reg](edge.reg), [vivaldi.reg](vivaldi.reg), [chromium.reg](chromium.reg), [yandex.reg](yandex.reg).
    ```sh
    # macOS
    defaults write com.google.Chrome ExtensionSettings -dict cbmpaamhmhdhnkofemgdlnbdadbpmjkn '{ installation_mode = force_installed; update_url = "https://sketchystan1.github.io/uBlock/update.xml"; }'
