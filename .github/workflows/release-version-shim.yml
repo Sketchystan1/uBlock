@@ -82,7 +82,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.meta.outputs.tag }}
         run: |
-          notes='`version.dll` domain-join shim: makes a Chromium browser accept an off-store force-install. Chrome/Chromium only, NOT Edge. Download the zip for your browser architecture and extract `version.dll` next to the browser exe. For a machine you own; see the README.'
+          # A one-liner rather than an empty body on purpose: GitHub falls back
+          # to showing the tagged commit's message subject when a release has no
+          # description, which for this master-tracking tag leaks the latest
+          # commit message onto the release page. Any real body text suppresses
+          # that (whitespace-only is trimmed back to empty, so it must be visible).
+          notes='version.dll domain-join shim.'
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --notes "$notes" --latest=false --draft=false
           else

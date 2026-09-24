@@ -238,75 +238,32 @@ jobs:
           fi
           echo 'Extension id is stable across releases.'
 
-      - name: Checksums
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          cd dist/build
-          sha256sum uBlock0_${VERSION}.chromium-mv3.* > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
       - name: Attest build provenance
         if: steps.key.outputs.signed == 'true'
         # Deliberately non-blocking, and deliberately BEFORE publication.
         # Provenance is a bonus -- the CRX is already signed with the release key
-        # and SHA256SUMS is published -- so it must never be the reason a release
-        # fails.
+        # -- so it must never be the reason a release fails.
         continue-on-error: true
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: ${{ steps.crx.outputs.crx }}
 
       - name: Assemble release notes
+        # A minimal one-liner on purpose (see the shim release for the same
+        # treatment). The Extension ID, policy update_url, build inputs and
+        # upstream changelog are intentionally omitted -- the operational bits
+        # live in docs/mv3-deployment.md, and Chrome reads the version/id from
+        # the CRX and update.xml, not from these notes.
         env:
-          TAG: ${{ steps.meta.outputs.tag }}
           VERSION: ${{ steps.meta.outputs.version }}
-          EXTENSION_ID: ${{ steps.crx.outputs.extension_id }}
-          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         run: |
-          pages_url="https://$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]').github.io/$(basename '${{ github.repository }}')"
-          # A pre-release (beta/rc) is only ever advertised by the dev channel
-          # (update-dev.xml); update.xml carries stable X.Y.Z releases only, so a
-          # policy pinned to it would never see this build. Point each release at
-          # the manifest that actually contains it.
-          if [ "$PRERELEASE" = 'true' ]; then
-            update_url="${pages_url}/update-dev.xml"; channel='dev channel'
-          else
-            update_url="${pages_url}/update.xml"; channel='stable channel'
-          fi
           dist_version=$(cat dist/version)
           fork_build=$(cat dist/mv3-build 2>/dev/null || echo '')
-          {
-            if echo "$dist_version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' && [ -n "$fork_build" ]; then
-              echo "Chromium **Manifest V3** build \`${VERSION}\` of **uBlock Origin (Sketchy MV3 fork)** — upstream stable \`${dist_version}\` + fork build \`${fork_build}\`."
-            else
-              echo "Chromium **Manifest V3** build of **uBlock Origin (Sketchy MV3 fork)** \`${VERSION}\`, from upstream tag \`${VERSION}\`."
-            fi
-            echo
-            echo '> [!IMPORTANT]'
-            echo '> Under MV3, `webRequestBlocking` is granted only to policy-installed extensions, so network filtering is inert until this is force-installed via enterprise policy.'
-            echo '>'
-            echo '> Setup instructions: [docs/mv3-deployment.md](https://github.com/${{ github.repository }}/blob/master/docs/mv3-deployment.md)'
-            echo
-            echo "Package version (what Chrome compares for updates): \`$(node -p "require('./dist/build/uBlock0.chromium-mv3/manifest.json').version")\`"
-            echo
-            if [ -n "$EXTENSION_ID" ]; then
-              echo "Extension ID: \`${EXTENSION_ID}\`"
-              echo
-              echo "Policy \`update_url\` (${channel}, fixed across releases): \`${update_url}\`"
-              echo
-            fi
-            echo '### Build inputs'
-            echo
-            echo 'Filter lists are cloned at build time, so record what went in:'
-            echo '```json'
-            cat dist/build/uBlock0.chromium-mv3/build-info.json
-            echo '```'
-            echo
-            echo '### Upstream changelog'
-            echo
-            grep -m1 -B10000 -- '----------' CHANGELOG.md || true
-          } > release.body.md
+          if echo "$dist_version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' && [ -n "$fork_build" ]; then
+            echo "Chromium **Manifest V3** build \`${VERSION}\` of **uBlock Origin (Sketchy MV3 fork)** — upstream stable \`${dist_version}\` + fork build \`${fork_build}\`." > release.body.md
+          else
+            echo "Chromium **Manifest V3** build of **uBlock Origin (Sketchy MV3 fork)** \`${VERSION}\`, from upstream tag \`${VERSION}\`." > release.body.md
+          fi
 
       - name: Create GitHub release
         env:
@@ -326,13 +283,18 @@ jobs:
             fi
             gh release create "$TAG" "${args[@]}"
           fi
-          assets=("dist/build/uBlock0_${VERSION}.chromium-mv3.zip" dist/build/SHA256SUMS.txt)
+          # The release carries the signed CRX only. The zip, a SHA256SUMS.txt
+          # and a per-release update.xml are deliberately NOT shipped: policy
+          # clients poll the fixed Pages update.xml (deployed below) and fetch
+          # the CRX from the URL it advertises, so those extra assets are unused
+          # noise -- and a per-release update.xml would pin to this one version,
+          # inviting a frozen update_url. The one exception is the unsigned
+          # bootstrap state (no CRX_PRIVATE_KEY yet, see docs/mv3-deployment.md):
+          # with no CRX to ship, publish the zip so the release is not empty.
           if [ '${{ steps.key.outputs.signed }}' = 'true' ]; then
-            # update.xml is intentionally NOT shipped as a release asset: policy
-            # clients poll the fixed Pages URL (deployed below), and a per-release
-            # update.xml pins to this one version, so publishing it only invites a
-            # frozen update_url. The CRX is what the release must carry.
-            assets+=("dist/build/uBlock0_${VERSION}.chromium-mv3.crx")
+            assets=("dist/build/uBlock0_${VERSION}.chromium-mv3.crx")
+          else
+            assets=("dist/build/uBlock0_${VERSION}.chromium-mv3.zip")
           fi
           gh release upload "$TAG" "${assets[@]}" --clobber
           # A draft release would make the codebase URL inside update.xml 404.

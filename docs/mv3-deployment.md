@@ -137,16 +137,74 @@ Then restart Chrome and check `chrome://policy` (the allowlist should be listed 
 
 ### Quick install for this fork's published build
 
-The sections above are for someone signing and hosting their own build. If you are deploying
-**this fork's published extension** (id `cbmpaamhmhdhnkofemgdlnbdadbpmjkn`, stable channel), the
-[project README](https://github.com/Sketchystan1/uBlock/blob/master/.github/README.md) has the
-one-command and double-click installers for every platform, kept current there so they do not
-drift from this doc. On Windows that is [`fake-mdm.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/fake-mdm.reg)
-(marks the device managed) plus a per-browser force-install file
-([`chrome.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/chrome.reg),
-`edge.reg`, `vivaldi.reg`, `chromium.reg`) — `ExtensionSettings` force-install, not
-`ExtensionInstallAllowlist`, because on branded Chrome the allowlist route installs the
-extension but does not grant `webRequestBlocking`.
+The sections above are for someone signing and hosting their own build. To deploy **this
+fork's published extension** (id `cbmpaamhmhdhnkofemgdlnbdadbpmjkn`, stable channel
+`https://sketchystan1.github.io/uBlock/update.xml`) you sign nothing — you only satisfy MV3's
+two conditions: the system must look **managed**, and the extension must be **force-installed**.
+The ready-made installers are double-click `.reg` files kept in the [project
+README](https://github.com/Sketchystan1/uBlock/blob/master/.github/README.md) and reproduced
+here so this path is self-contained; the files there remain the source of truth.
+
+**1 — Make the system look managed** (Windows only — Linux needs no managed device, skip to
+step 2). Pick exactly one:
+
+- **Fake MDM** — run [`fake-mdm.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/fake-mdm.reg).
+  Fakes mobile-device management. Not available on Windows Home.
+- **Fake domain-join** — download [`version.dll`](https://github.com/Sketchystan1/uBlock/releases/tag/shim-latest)
+  (or build it with [`version-shim/build.bat`](https://github.com/Sketchystan1/uBlock/blob/master/.github/version-shim/build.bat))
+  and drop it next to the browser exe, e.g. `C:\Program Files\Google\Chrome\Application\version.dll`.
+  Chrome/Chromium only — **not Edge**.
+- **Chrome Enterprise Core** — real Google-hosted management, and the only managed path on
+  **macOS**. Sign up for [Chrome Enterprise Core](https://enterprise.google.com/signup/chrome-browser/email?origin=cbcm&source=browsermgmt),
+  enroll a token from the [Admin console](https://admin.google.com) (**Devices → Chrome →
+  Managed browsers → Enroll**), then set it — Windows [`cbcm-enroll.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/cbcm-enroll.reg)
+  (paste your token in first) or PowerShell, macOS a file:
+  ```powershell
+  # Windows
+  Set-ItemProperty "HKLM:\SOFTWARE\Policies\Google\Chrome" CloudManagementEnrollmentToken "<TOKEN>"
+  ```
+  ```sh
+  # macOS
+  sudo mkdir -p /Library/Google/Chrome && echo "<TOKEN>" | sudo tee /Library/Google/Chrome/CloudManagementEnrollmentToken
+  ```
+  Restart the browser; `chrome://management` should report it as managed.
+
+**2 — Force-install the extension.** This uses `ExtensionSettings` force-install, **not**
+`ExtensionInstallAllowlist`: on branded Chrome the allowlist route installs the extension but
+does not grant `webRequestBlocking`.
+
+- **Windows** — run the file for your browser:
+  [`chrome.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/chrome.reg),
+  [`edge.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/edge.reg),
+  [`vivaldi.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/vivaldi.reg),
+  [`chromium.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/chromium.reg),
+  [`yandex.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/yandex.reg). Under
+  Enterprise Core you can instead push it from the Admin console.
+- **macOS**:
+  ```sh
+  defaults write com.google.Chrome ExtensionSettings -dict cbmpaamhmhdhnkofemgdlnbdadbpmjkn \
+    '{ installation_mode = force_installed; update_url = "https://sketchystan1.github.io/uBlock/update.xml"; }'
+  # Other browser? Swap com.google.Chrome for com.microsoft.Edge / com.vivaldi.Vivaldi / org.chromium.Chromium.
+  ```
+- **Linux** — no managed device required, only a policy file:
+  ```sh
+  ID=cbmpaamhmhdhnkofemgdlnbdadbpmjkn; U=https://sketchystan1.github.io/uBlock/update.xml
+  sudo mkdir -p /etc/opt/chrome/policies/managed
+  echo "{\"ExtensionSettings\":{\"$ID\":{\"installation_mode\":\"force_installed\",\"update_url\":\"$U\"}}}" \
+    | sudo tee /etc/opt/chrome/policies/managed/ublock.json
+  ```
+
+Restart the browser, then check `chrome://policy` and `chrome://extensions` (installed from your
+update URL, no `webRequestBlocking` warning).
+
+**Uninstall.** Windows: run the matching uninstaller —
+[`chrome-uninstall.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/chrome-uninstall.reg),
+`edge-uninstall.reg`, `vivaldi-uninstall.reg`, `chromium-uninstall.reg`, `yandex-uninstall.reg` —
+and [`fake-mdm-undo.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/fake-mdm-undo.reg)
+to drop the managed flag (or remove the browser in the Admin console under Enterprise Core).
+macOS: `defaults delete com.google.Chrome ExtensionSettings` then `sudo rm -f
+/Library/Google/Chrome/CloudManagementEnrollmentToken`. Linux: `sudo rm -f
+/etc/opt/chrome/policies/managed/ublock.json`.
 
 ## 4. Optional: reduce how often a cold start happens
 
