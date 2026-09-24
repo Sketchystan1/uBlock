@@ -1,0 +1,91 @@
+name: Release version.dll shim
+
+# Builds the version.dll domain-join shim and publishes it as its OWN release,
+# under a `shim-*` tag kept separate from uBO's `*-mv3` release tags. The release
+# is created with --latest=false so it never becomes the repo's "Latest release":
+# the main page keeps showing the uBO build, not this helper DLL.
+#
+# Trigger: push a `shim-*` tag, or dispatch with a tag (default shim-latest, a
+# rolling tag whose assets are re-uploaded each run so the download URL is stable).
+
+on:
+  push:
+    tags:
+      - 'shim-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. shim-latest or shim-v2)'
+        required: true
+        default: 'shim-latest'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-shim-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # Pin gh to this fork rather than letting it infer from git remotes.
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  release:
+    name: Build and publish version.dll
+    runs-on: windows-latest
+    permissions:
+      contents: write   # create the release
+    steps:
+      - name: Resolve tag
+        id: meta
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: echo "tag=${INPUT_TAG:-${GITHUB_REF#refs/tags/}}" >> "$GITHUB_OUTPUT"
+
+      - name: Clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build version.dll (x64/x86/arm64)
+        shell: cmd
+        working-directory: .github/version-shim
+        run: build.bat all
+
+      - name: Package DLLs
+        # One asset per architecture, each a zip whose single entry is named
+        # version.dll -- release assets must have unique names, but the file the
+        # user drops next to the browser exe must be exactly version.dll, so ship
+        # per-arch zips rather than renaming the DLL itself.
+        shell: pwsh
+        working-directory: .github/version-shim
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $any = $false
+          foreach ($arch in 'x64','x86','arm64') {
+            $dll = "build/$arch/version.dll"
+            if (Test-Path $dll) {
+              Compress-Archive -Path $dll -DestinationPath "dist/version-$arch.zip" -Force
+              $any = $true
+            }
+          }
+          if (-not $any) { Write-Error 'no version.dll built'; exit 1 }
+          Get-ChildItem dist/version-*.zip | Select-Object Name
+
+      - name: Publish release (not marked latest)
+        shell: bash
+        working-directory: .github/version-shim
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          notes='`version.dll` domain-join shim: makes a Chromium browser accept an off-store force-install. Chrome/Chromium only, NOT Edge. Download the zip for your browser architecture and extract `version.dll` next to the browser exe. For a machine you own; see the README.'
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes "$notes" --latest=false --draft=false
+          else
+            gh release create "$TAG" --title "$TAG" --notes "$notes" --latest=false
+          fi
+          gh release upload "$TAG" dist/version-*.zip --clobber

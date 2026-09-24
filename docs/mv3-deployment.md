@@ -139,31 +139,14 @@ Then restart Chrome and check `chrome://policy` (the allowlist should be listed 
 
 The sections above are for someone signing and hosting their own build. If you are deploying
 **this fork's published extension** (id `cbmpaamhmhdhnkofemgdlnbdadbpmjkn`, stable channel), the
-[project README](https://github.com/Sketchystan1/uBlock/blob/master/.github/README.md) ships
-the same registration-plus-allowlist as one-command installs, and
-[`ublock.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/ublock.reg) for
-double-click install on Windows:
-
-**Windows** (PowerShell as admin):
-
-```powershell
-$ID="cbmpaamhmhdhnkofemgdlnbdadbpmjkn"; $U="https://sketchystan1.github.io/uBlock/update.xml"; New-Item -Force "HKCU:\SOFTWARE\Google\Chrome\Extensions\$ID" | Out-Null; Set-ItemProperty "HKCU:\SOFTWARE\Google\Chrome\Extensions\$ID" update_url $U; New-Item -Force "HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallAllowlist" | Out-Null; Set-ItemProperty "HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallAllowlist" 1 $ID
-```
-
-**Linux**:
-
-```sh
-ID=cbmpaamhmhdhnkofemgdlnbdadbpmjkn && sudo mkdir -p /opt/google/chrome/extensions /etc/opt/chrome/policies/managed && echo "{\"external_update_url\":\"https://sketchystan1.github.io/uBlock/update.xml\"}" | sudo tee /opt/google/chrome/extensions/$ID.json && echo "{\"ExtensionInstallAllowlist\":[\"$ID\"]}" | sudo tee /etc/opt/chrome/policies/managed/ublock.json
-```
-
-**macOS**:
-
-```sh
-ID=cbmpaamhmhdhnkofemgdlnbdadbpmjkn && sudo mkdir -p "/Library/Application Support/Google/Chrome/External Extensions" "/Library/Managed Preferences" && echo "{\"external_update_url\":\"https://sketchystan1.github.io/uBlock/update.xml\"}" | sudo tee "/Library/Application Support/Google/Chrome/External Extensions/$ID.json" && sudo defaults write "/Library/Managed Preferences/com.google.Chrome" ExtensionInstallAllowlist -array $ID
-```
-
-Chrome installs uBO from the update URL and keeps it updated automatically. Uninstall is the
-reverse (delete the registry key / JSON files / profile key); see the README's uninstall section.
+[project README](https://github.com/Sketchystan1/uBlock/blob/master/.github/README.md) has the
+one-command and double-click installers for every platform, kept current there so they do not
+drift from this doc. On Windows that is [`fake-mdm.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/fake-mdm.reg)
+(marks the device managed) plus a per-browser force-install file
+([`chrome.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/chrome.reg),
+`edge.reg`, `vivaldi.reg`, `chromium.reg`) — `ExtensionSettings` force-install, not
+`ExtensionInstallAllowlist`, because on branded Chrome the allowlist route installs the
+extension but does not grant `webRequestBlocking`.
 
 ## 4. Optional: reduce how often a cold start happens
 

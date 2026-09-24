@@ -328,7 +328,11 @@ jobs:
           fi
           assets=("dist/build/uBlock0_${VERSION}.chromium-mv3.zip" dist/build/SHA256SUMS.txt)
           if [ '${{ steps.key.outputs.signed }}' = 'true' ]; then
-            assets+=("dist/build/uBlock0_${VERSION}.chromium-mv3.crx" dist/build/update.xml)
+            # update.xml is intentionally NOT shipped as a release asset: policy
+            # clients poll the fixed Pages URL (deployed below), and a per-release
+            # update.xml pins to this one version, so publishing it only invites a
+            # frozen update_url. The CRX is what the release must carry.
+            assets+=("dist/build/uBlock0_${VERSION}.chromium-mv3.crx")
           fi
           gh release upload "$TAG" "${assets[@]}" --clobber
           # A draft release would make the codebase URL inside update.xml 404.

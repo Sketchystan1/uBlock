@@ -1,58 +1,97 @@
-# uBlock Origin (MV3 build)
+# uBlock Origin (Sketchy MV3 Fork)
 
-The real uBlock Origin, with the full engine, rebuilt for Manifest V3 so it still works on Chrome 139+ after the old MV2 version stopped working.
+Full uBlock Origin, rebuilt for Manifest V3.  
+ID: `cbmpaamhmhdhnkofemgdlnbdadbpmjkn`  
 
-Just a fork. All credit to [gorhill/uBlock](https://github.com/gorhill/uBlock).
+Just a fork. All credit to original [gorhill/uBlock](https://github.com/gorhill/uBlock).
 
-## Install
+## Why
 
-Chrome removed [webRequestBlocking](https://developer.chrome.com/docs/extensions/reference/api/webRequest). The only way to get it back is to install the extension through enterprise policy. Other Chromium-based browsers probably use similar methods. Point Chrome to the update URL and allowlist the extension ID. This installs uBO and keeps it updated automatically. 
+Chrome dropped Manifest V2, so the old uBO stopped working. This fork is MV3.
 
-ID: `cbmpaamhmhdhnkofemgdlnbdadbpmjkn`.
-Update URL: `https://sketchystan1.github.io/uBlock/update.xml` (use `update-dev.xml` for beta builds).
+Under MV3 the blocking APIs still exist: `webRequestBlocking` (cancel a request) and `asyncBlocking` (hold a request until the filters decide). But Chrome now only hands them to an extension that is force-installed by policy on enterprise managed system.
 
-### Windows
-Download [ublock.reg](ublock.reg) and double-click, or use script:
+# Install
 
-```powershell
-$ID="cbmpaamhmhdhnkofemgdlnbdadbpmjkn"; $U="https://sketchystan1.github.io/uBlock/update.xml"; New-Item -Force "HKCU:\SOFTWARE\Google\Chrome\Extensions\$ID" | Out-Null; Set-ItemProperty "HKCU:\SOFTWARE\Google\Chrome\Extensions\$ID" update_url $U; New-Item -Force "HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallAllowlist" | Out-Null; Set-ItemProperty "HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallAllowlist" 1 $ID
-```
+Extension must be **force-installed** by policy and system look **managed** for browser. Ways to do this: 
+- **fake-mdm.reg** - fake mobile device management.
+- **version.dll** - fake domain-joined management.
+- **Chrome Enterprise Core** - real browser management.
 
-### Linux
+Know another option? Share it in [Discussions](https://github.com/Sketchystan1/uBlock/discussions).
+
+## Windows - choose only one!
+
+### Fake MDM 
+
+Not working in Windows Home.
+
+1. Run [fake-mdm.reg](fake-mdm.reg)
+2. Run force install uBO: [chrome.reg](chrome.reg), [edge.reg](edge.reg), [vivaldi.reg](vivaldi.reg), [chromium.reg](chromium.reg), [yandex.reg](yandex.reg).
+3. Restart the browser.
+
+### Fake Domain-joined
+
+Not working in Edge.
+
+1. Download [version.dll](https://github.com/Sketchystan1/uBlock/releases/tag/shim-latest) or [build it](version-shim/build.bat).
+2. Copy it next to the browser exe, e.g. `C:\Program Files\Google\Chrome\Application\version.dll`.
+3. Run force install uBO: [chrome.reg](chrome.reg), [edge.reg](edge.reg), [vivaldi.reg](vivaldi.reg), [chromium.reg](chromium.reg), [yandex.reg](yandex.reg).
+4. Restart the browser.
+
+## Chrome Enterprise Core - Windows, macOS
+
+1. Sign up for [Chrome Enterprise Core](https://enterprise.google.com/signup/chrome-browser/email?origin=cbcm&source=browsermgmt) 
+
+2. Get a token: [Google Admin console](https://admin.google.com) → **Devices → Chrome → Managed browsers → Enroll**.
+3. Add token to system
+   ```powershell
+   # Windows
+   Set-ItemProperty "HKLM:\SOFTWARE\Policies\Google\Chrome" CloudManagementEnrollmentToken "<YOUR_TOKEN>"
+   ```
+   ```sh
+   # macOS
+   sudo mkdir -p /Library/Google/Chrome && echo "<YOUR_TOKEN>" | sudo tee /Library/Google/Chrome/CloudManagementEnrollmentToken
+   ```
+4. Restart the browser. Open `chrome://management`. It should say managed.
+5. Force install uBO: push it from the Admin console or locally run on Windows: [chrome.reg](chrome.reg), [edge.reg](edge.reg), [vivaldi.reg](vivaldi.reg), [chromium.reg](chromium.reg), [yandex.reg](yandex.reg).
+   ```sh
+   # macOS
+   defaults write com.google.Chrome ExtensionSettings -dict cbmpaamhmhdhnkofemgdlnbdadbpmjkn '{ installation_mode = force_installed; update_url = "https://sketchystan1.github.io/uBlock/update.xml"; }'
+   # Not Chrome? Swap `com.google.Chrome`, `com.microsoft.Edge`, `com.vivaldi.Vivaldi`, `org.chromium.Chromium` `YandexBrowser`.
+   ```
+   
+6. Restart the browser.
+
+## Linux
+
+No managed device required, only a policy file:
 
 ```sh
-ID=cbmpaamhmhdhnkofemgdlnbdadbpmjkn && sudo mkdir -p /opt/google/chrome/extensions /etc/opt/chrome/policies/managed && echo "{\"external_update_url\":\"https://sketchystan1.github.io/uBlock/update.xml\"}" | sudo tee /opt/google/chrome/extensions/$ID.json && echo "{\"ExtensionInstallAllowlist\":[\"$ID\"]}" | sudo tee /etc/opt/chrome/policies/managed/ublock.json
+ID=cbmpaamhmhdhnkofemgdlnbdadbpmjkn && U=https://sketchystan1.github.io/uBlock/update.xml && sudo mkdir -p /etc/opt/chrome/policies/managed && echo "{\"ExtensionSettings\":{\"$ID\":{\"installation_mode\":\"force_installed\",\"update_url\":\"$U\"}}}" | sudo tee /etc/opt/chrome/policies/managed/ublock.json
 ```
+Restart the browser.
 
-### macOS
-
-```sh
-ID=cbmpaamhmhdhnkofemgdlnbdadbpmjkn && sudo mkdir -p "/Library/Application Support/Google/Chrome/External Extensions" "/Library/Managed Preferences" && echo "{\"external_update_url\":\"https://sketchystan1.github.io/uBlock/update.xml\"}" | sudo tee "/Library/Application Support/Google/Chrome/External Extensions/$ID.json" && sudo defaults write "/Library/Managed Preferences/com.google.Chrome" ExtensionInstallAllowlist -array $ID
-```
-
-## Uninstall
+# Uninstall
 <details>
-<summary>Details</summary>
+<summary>How</summary>
 
-**Windows**
+**Windows**: double-click the one for your browser: [chrome-uninstall.reg](chrome-uninstall.reg), [edge-uninstall.reg](edge-uninstall.reg), [vivaldi-uninstall.reg](vivaldi-uninstall.reg), [chromium-uninstall.reg](chromium-uninstall.reg), [yandex-uninstall.reg](yandex-uninstall.reg).
 
-```powershell
-$ID="cbmpaamhmhdhnkofemgdlnbdadbpmjkn"; Remove-Item "HKCU:\SOFTWARE\Google\Chrome\Extensions\$ID" -Recurse; Remove-ItemProperty "HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallAllowlist" 1
+To undo the managed part too: run [fake-mdm-undo.reg](fake-mdm-undo.reg), or (Enterprise Core) remove the browser in the Admin console.
+
+**macOS** (Enterprise Core): drop the force-install policy, then the enrollment token:
+```sh
+defaults delete com.google.Chrome ExtensionSettings; sudo rm -f /Library/Google/Chrome/CloudManagementEnrollmentToken
 ```
+Restart the browser. (Other browser? Swap `com.google.Chrome` for yours — see the install note.)
 
 **Linux**
-
 ```sh
-ID=cbmpaamhmhdhnkofemgdlnbdadbpmjkn && sudo rm -f /opt/google/chrome/extensions/$ID.json /etc/opt/chrome/policies/managed/ublock.json
+sudo rm -f /etc/opt/chrome/policies/managed/ublock.json /opt/google/chrome/extensions/cbmpaamhmhdhnkofemgdlnbdadbpmjkn.json
 ```
 
-**macOS**
-
-```sh
-ID=cbmpaamhmhdhnkofemgdlnbdadbpmjkn && sudo rm "/Library/Application Support/Google/Chrome/External Extensions/$ID.json" && sudo defaults delete "/Library/Managed Preferences/com.google.Chrome" ExtensionInstallAllowlist
-```
-
-Chrome removes uBO on next restart.
+Chrome drops uBO on next restart.
 
 </details>
 
@@ -60,4 +99,3 @@ Chrome removes uBO on next restart.
 
 USDT (TRC20): TDAr6Lu2sYtArJYAgUpyfuk6rKNvvyMA87  
 USDC (Base): 0x762712dcC8e3E757Cf3FC077AeF0b4EDa8692b7B
-

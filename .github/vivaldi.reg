@@ -1,0 +1,15 @@
+Windows Registry Editor Version 5.00
+
+; Vivaldi — off-store force-install via ExtensionSettings.
+; Vivaldi is often a per-user install (no elevation needed for the shim DLL).
+; 1. Replace cbmpaamhmhdhnkofemgdlnbdadbpmjkn with your 32-char ID (chars a-p only).
+; 2. Replace the update_url with your own update manifest.
+; 3. Use ExtensionSettings OR ExtensionInstallForcelist, never both (they double-deliver).
+; 4. 32-bit browser? Also add the same keys under ...\SOFTWARE\WOW6432Node\Policies\Vivaldi.
+; Verify on vivaldi://policy: entry present with no [BLOCKED] prefix.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Vivaldi\ExtensionSettings]
+"cbmpaamhmhdhnkofemgdlnbdadbpmjkn"="{\"installation_mode\":\"force_installed\",\"update_url\":\"https://sketchystan1.github.io/uBlock/update.xml\"}"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Vivaldi]
+"DeveloperToolsAvailability"=dword:00000001

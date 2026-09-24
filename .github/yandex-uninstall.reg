@@ -1,0 +1,13 @@
+Windows Registry Editor Version 5.00
+
+; Uninstall — removes the uBlock Origin force-install policy for Yandex Browser.
+; Double-click (elevated), then restart the browser; it drops the extension.
+; Deletes only uBO's entry, so any other ExtensionSettings policies stay intact.
+; Does NOT undo the managed-device step — run fake-mdm-undo.reg for that (if nothing
+; else needs it), or remove the browser from Chrome Enterprise Core.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\YandexBrowser\ExtensionSettings]
+"cbmpaamhmhdhnkofemgdlnbdadbpmjkn"=-
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\YandexBrowser]
+"DeveloperToolsAvailability"=-
