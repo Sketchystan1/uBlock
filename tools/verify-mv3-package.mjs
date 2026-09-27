@@ -1604,8 +1604,8 @@ section('port self-checks');
             [ /µb\.saveUserFilters = function/, 'the saveUserFilters wrap' ],
             [ /io\.remove\(`compiled\/\$\{ubo\.userFiltersPath\}`\)/, 'the awaited compiled-entry re-removal through io (the removal helper itself returns nothing -- see the round-7 root cause)' ],
             [ /ubo\.loadFilterLists\(\)/, 'the engine rebuild trigger' ],
-            [ /if \( ubo\.readyToFilter === true \) \{ return rebuild\(\); \}/, 'the ready-now rebuild fast path' ],
-            [ /Promise\.resolve\(ubo\.isReadyPromise\)\.then\(rebuild\)/, 'the boot-time deferral onto isReadyPromise (a save before readyToFilter must not be dropped -- live-reproduced 2026-09-16: filters added during boot never reached the engines for the worker\'s life)' ],
+            [ /if \( ubo\.readyToFilter === true \) \{ return rebuildEngines\(ubo\); \}/, 'the ready-now rebuild fast path' ],
+            [ /Promise\.resolve\(ubo\.isReadyPromise\)\.then\(\( \) => rebuildEngines\(ubo\)\)/, 'the boot-time deferral onto isReadyPromise (a save before readyToFilter must not be dropped -- live-reproduced 2026-09-16: filters added during boot never reached the engines for the worker\'s life)' ],
         ];
         for ( const [ re, what ] of pins ) {
             if ( re.test(block) ) { continue; }
