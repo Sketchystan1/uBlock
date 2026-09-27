@@ -1763,7 +1763,7 @@ const libraryFilesFor = (world, calls) => {
 // dead end for the user, so one a minute is still noise with no signal in it.
 // A reason that matches here says nothing about the extension's configuration
 // by construction; anything else still gets through.
-const routineInjectionErrorRE = /^(?:Cannot access contents of (?:url|the frame) |Frame with ID \d+ (?:was removed|is not ready)|No frame with id \d+ in tab with id \d+|No tab with id: |The frame was removed|Cannot access a (?:chrome-extension|chrome|edge|devtools|about|view-source):)/;
+const routineInjectionErrorRE = /^(?:Cannot access contents of (?:url|the frame) |Frame with ID \d+ (?:was removed|is not ready|is showing error page)|No (?:frame with id \d+|document with id [0-9A-Fa-f]+) in tab with id \d+|No tab with id: |The frame was removed|Cannot access a (?:chrome-extension|chrome|edge|devtools|about|view-source):)/;
 
 let lastInjectionErrorAt = 0;
 const logInjectionError = (where, reason) => {
