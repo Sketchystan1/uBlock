@@ -559,7 +559,18 @@ jobs:
             # is already released -- a deliberate human "redo this release".
             # A scheduled run can never get here, because it skips any tag that
             # already has a fork -mv3 counterpart.
-            echo "::warning::moving the published tag $FORK_TAG to a rebuilt tree"
+            #
+            # Moving a published tag does NOT let you reship different bytes
+            # under the same version: release.yml refuses to overwrite an
+            # existing release asset whose bytes differ (a client that already
+            # fetched this version would never re-download the new bytes). So a
+            # redo only succeeds if the rebuilt tree is byte-identical -- use it
+            # to re-fire a release whose upload/publish step failed, not to ship
+            # a changed build. To ship changed bytes, cut a NEW build number:
+            # for a stable tag dist/mv3-build has already advanced, so a plain
+            # re-dispatch produces X.Y.Z.<N+1>-mv3 rather than a redo; bump
+            # dist/mv3-build by hand first if you need to force a fresh number.
+            echo "::warning::moving the published tag $FORK_TAG to a rebuilt tree (release.yml will reject the upload if the bytes differ from what is already published)"
             git tag -f "$FORK_TAG"
             git push --force origin "refs/tags/$FORK_TAG"
           else

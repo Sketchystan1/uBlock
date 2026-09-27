@@ -296,7 +296,29 @@ jobs:
           else
             assets=("dist/build/uBlock0_${VERSION}.chromium-mv3.zip")
           fi
-          gh release upload "$TAG" "${assets[@]}" --clobber
+          asset=$(basename "${assets[0]}")
+          # Never reship DIFFERENT bytes under a version that already carries an
+          # asset: a client that already fetched this version will not
+          # re-download, so part of the fleet would silently keep the old bytes.
+          # Re-uploading byte-identical output (an idempotent CI re-run) is fine;
+          # anything else must be cut as a NEW build number (bump
+          # dist/mv3-build) rather than clobbered onto this tag. This replaces a
+          # blind `--clobber`, which let a re-run -- whose fresh uAssets clone
+          # can differ -- overwrite the published bytes in place.
+          if gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null | grep -qx "$asset"; then
+            tmp=$(mktemp -d)
+            gh release download "$TAG" --pattern "$asset" --dir "$tmp"
+            if cmp -s "$tmp/$asset" "${assets[0]}"; then
+              echo "Asset $asset already published for $TAG with identical bytes; skipping upload."
+            else
+              echo "::error::$asset already exists on $TAG with DIFFERENT bytes. Refusing to reship different bytes under one version -- cut a new build number (bump dist/mv3-build) instead of moving/clobbering the tag."
+              rm -rf "$tmp"
+              exit 1
+            fi
+            rm -rf "$tmp"
+          else
+            gh release upload "$TAG" "${assets[@]}"
+          fi
           # A draft release would make the codebase URL inside update.xml 404.
           if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = 'true' ]; then
             echo '::error::release is still a draft; the CRX URL in update.xml would 404 for Chrome'

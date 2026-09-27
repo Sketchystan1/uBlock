@@ -3,19 +3,25 @@
 This fork adds a Chromium **Manifest V3** build of the full uBlock Origin — the real
 filtering engine, not the declarativeNetRequest-based uBO Lite that lives in `platform/mv3/`.
 
-One capability is gated under MV3: blocking `webRequest` needs the extension to come from an
-**update URL** rather than the Web Store, plus an `ExtensionInstallAllowlist` entry so Chrome
-does not disable it — and **network filtering does nothing until you complete step 3**.
+One capability is gated under MV3: blocking `webRequest` is granted only to an extension
+**force-installed by enterprise policy** — `ExtensionSettings` with `installation_mode:
+force_installed` (or `ExtensionInstallForcelist`). Chromium marks `webRequestBlocking` as
+requiring the `policy` install location, so an ordinary external install (`external_update_url`)
+or an `ExtensionInstallAllowlist` entry keeps the extension *enabled* off-store but does **not**
+grant blocking on branded Chrome — and **network filtering does nothing until it is
+force-installed** (see [step 3](#3-force-install-from-your-update-url)).
 Everything else — cosmetic filtering, the element picker and zapper, scriptlet filters
 (`+js(...)`), the logger, and the dashboard — works without the gate. Scriptlets deliver
 on strict-CSP pages exactly as under MV2, because they run as CSP-exempt
 extension-injected function calls and never create a `<script>` element.
 
 > [!NOTE]
-> An install from an `external_update_url` is an *external* install, not a *policy force-install*.
-> That distinction matters in one place: only a policy force-install gets the cold-start
-> request-holding described in [step 4](#4-optional-reduce-how-often-a-cold-start-happens).
-> Everything else — including `webRequestBlocking` — behaves identically.
+> Two things need a **policy force-install**, not merely an external install: branded Chrome
+> grants `webRequestBlocking` only to the `policy` install location, and only a policy
+> force-install gets the cold-start request-holding described in
+> [step 4](#4-optional-reduce-how-often-a-cold-start-happens). An `external_update_url`
+> registration keeps the extension enabled off-store and self-updating, but on branded Chrome it
+> filters nothing until it is force-installed.
 
 ## Why MV2 is not an option
 
@@ -58,17 +64,18 @@ node tools/make-crx.mjs \
 To have releases signed automatically, add the PEM contents as a repository secret named
 `CRX_PRIVATE_KEY`. Without it, `release.yml` publishes only the zip and logs a warning.
 
-## 3. Install from your update URL
+## 3. Force-install from your update URL
 
-`webRequestBlocking` is granted only when the extension comes from an update URL Chrome is
-told about — registered as an external extension via `external_update_url`. Loading the
-unpacked directory, or dragging the CRX in, does **not** qualify — Chrome will show a manifest
-warning that `webRequestBlocking` requires a policy install, and blocking listeners silently do
-nothing (the warning text says "policy" because a policy install is one way to register the
-update URL; the external-extensions registration below is the other, and grants the same
-permission). On branded Google Chrome (not Chromium) the machine-level
-`ExtensionInstallAllowlist` policy must also contain the extension ID, or Chrome disables the
-extension shortly after installation.
+`webRequestBlocking` is granted only to a **policy force-install** — Chrome's manifest warning
+that it "requires a policy install" is literal. Loading the unpacked directory, dragging the CRX
+in, or registering it as an external extension via `external_update_url` does **not** qualify:
+an external install keeps the extension enabled and self-updating, but its blocking listeners
+silently do nothing. To grant blocking, force-install it by policy — `ExtensionSettings` with
+`installation_mode: force_installed`, pointing at your update URL. On branded Google Chrome (not
+Chromium) the machine must also look **managed** (the same requirement the
+[Quick install](#quick-install-for-this-forks-published-build) below covers in its managed-state
+step); `ExtensionInstallAllowlist` alone only keeps an off-store extension enabled, it does not
+grant blocking.
 
 > [!NOTE]
 > The CRX also carries a manifest `update_url` (baked in by
@@ -77,8 +84,9 @@ extension shortly after installation.
 > and Chromium or enterprise configurations that still permit MV2 + `webRequestBlocking` — this
 > makes a hand-installed CRX **self-update** with no registry or policy entry, and blocking
 > works without the registration too. On stable Google Chrome the manifest URL is not enough:
-> Chrome hard-disables off-store extensions regardless, so the registration below is still
-> required, both to keep the extension enabled and to grant `webRequestBlocking`.
+> Chrome hard-disables off-store extensions regardless, so it must be **force-installed by
+> policy** (the `ExtensionSettings` entry below), which both keeps the extension enabled and
+> grants `webRequestBlocking`.
 
 Let the release automation host everything (the supported path), or host the `.crx` and an
 `update.xml` yourself on servers reachable over HTTPS. The automation publishes **two update
@@ -92,9 +100,9 @@ it names; it cannot run both side by side):
 - **Dev** — `https://<owner>.github.io/<repo>/update-dev.xml` — tracks the newest build of any
   kind, upstream betas and rcs included.
 
-A fixed URL matters because the external-extensions registration takes one update URL and
-Chrome polls it forever; a per-release asset URL would pin a client to a single version and
-never update it again.
+A fixed URL matters because the force-install policy takes one `update_url` and Chrome polls it
+forever; a per-release asset URL would pin a client to a single version and never update it
+again.
 
 > [!NOTE]
 > Do not use `https://github.com/<owner>/<repo>/releases/latest/download/update.xml`. GitHub
@@ -103,37 +111,29 @@ never update it again.
 > skip depending on release timing. The stable channel URL above already gives you "newest stable"
 > through a genuinely fixed URL.
 
-Then, replacing `EXTENSION_ID` with the value `make-crx.mjs` printed (the examples use the
-stable channel; substitute `update-dev.xml` to follow the dev channel):
+Then, replacing `EXTENSION_ID` with the value `make-crx.mjs` printed and `UPDATE_URL` with your
+stable-channel `update.xml` (substitute `update-dev.xml` to follow the dev channel):
 
 **Windows** (registry):
 
 ```
-[HKEY_CURRENT_USER\SOFTWARE\Google\Chrome\Extensions\EXTENSION_ID]
-"update_url"="https://sketchystan1.github.io/uBlock/update.xml"
-
-[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome\ExtensionInstallAllowlist]
-"1"="EXTENSION_ID"
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome\ExtensionSettings]
+"EXTENSION_ID"="{\"installation_mode\":\"force_installed\",\"update_url\":\"UPDATE_URL\"}"
 ```
 
-**Linux** (`/opt/google/chrome/extensions/EXTENSION_ID.json` +
-`/etc/opt/chrome/policies/managed/ublock.json`):
+**Linux** (`/etc/opt/chrome/policies/managed/ublock.json` — no managed device required):
 
 ```json
-// /opt/google/chrome/extensions/EXTENSION_ID.json
-{ "external_update_url": "https://sketchystan1.github.io/uBlock/update.xml" }
-
-// /etc/opt/chrome/policies/managed/ublock.json
-{ "ExtensionInstallAllowlist": [ "EXTENSION_ID" ] }
+{ "ExtensionSettings": { "EXTENSION_ID": { "installation_mode": "force_installed", "update_url": "UPDATE_URL" } } }
 ```
 
-**macOS** — `/Library/Application Support/Google/Chrome/External Extensions/EXTENSION_ID.json`
-with the same `external_update_url` object, plus `ExtensionInstallAllowlist` in a
-configuration profile for `com.google.Chrome`.
+**macOS** — set the same `ExtensionSettings` force-install entry for `com.google.Chrome`
+(`defaults write com.google.Chrome ExtensionSettings ...`, or a configuration profile), plus a
+managed state via Chrome Enterprise Core (see the Quick install section).
 
-Then restart Chrome and check `chrome://policy` (the allowlist should be listed and applied) and
-`chrome://extensions` (the extension should be installed from your update URL, with no
-`webRequestBlocking` warning).
+Then restart Chrome and check `chrome://policy` (the `ExtensionSettings` force-install entry
+should be listed and applied) and `chrome://extensions` (the extension should be installed from
+your update URL, with no `webRequestBlocking` warning).
 
 ### Quick install for this fork's published build
 
@@ -150,10 +150,14 @@ step 2). Pick exactly one:
 
 - **Fake MDM** — run [`fake-mdm.reg`](https://github.com/Sketchystan1/uBlock/blob/master/.github/fake-mdm.reg).
   Fakes mobile-device management. Not available on Windows Home.
-- **Fake domain-join** — download [`version.dll`](https://github.com/Sketchystan1/uBlock/releases/tag/shim-latest)
-  (or build it with [`version-shim/build.bat`](https://github.com/Sketchystan1/uBlock/blob/master/.github/version-shim/build.bat))
-  and drop it next to the browser exe, e.g. `C:\Program Files\Google\Chrome\Application\version.dll`.
-  Chrome/Chromium only — **not Edge**.
+- **Fake domain-join** — ⚠️ **experimental, weakens browser security; not part of the
+  recommended path.** The [`version.dll`](https://github.com/Sketchystan1/uBlock/releases/tag/shim-latest)
+  shim (or build it with [`version-shim/build.bat`](https://github.com/Sketchystan1/uBlock/blob/master/.github/version-shim/build.bat))
+  is loaded by the browser at startup and disables the child-process mitigation that blocks
+  unsigned / non-Microsoft DLLs from loading into the browser — so any DLL dropped next to the
+  exe can then load into it. Drop it next to the browser exe, e.g.
+  `C:\Program Files\Google\Chrome\Application\version.dll`. Chrome/Chromium only — **not Edge**.
+  Prefer Fake MDM or Enterprise Core; use this only if neither fits, and delete the DLL when done.
 - **Chrome Enterprise Core** — real Google-hosted management, and the only managed path on
   **macOS**. Sign up for [Chrome Enterprise Core](https://enterprise.google.com/signup/chrome-browser/email?origin=cbcm&source=browsermgmt),
   enroll a token from the [Admin console](https://admin.google.com) (**Devices → Chrome →

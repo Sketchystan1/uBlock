@@ -649,6 +649,13 @@ section('upstream drift');
     if ( /libraryFilesFor/.test(shims) === false ) {
         problems.push('mv3-shims.js no longer computes a per-navigation shard file set (libraryFilesFor)');
     }
+    // The library injection must bind to the prepared DOCUMENT (documentId),
+    // not the frame -- a frame can navigate between the two chrome.scripting
+    // round trips, and a frameId would then target the new page. This is a
+    // wiring check: it pins the code shape, not the runtime behavior.
+    if ( /documentIds/.test(shims) === false ) {
+        problems.push('mv3-shims.js no longer targets the scriptlet library injection by documentIds: a frame navigating between the prepare and library round trips could receive the injection into the wrong document');
+    }
     if ( /createElement\('script'\)/.test(shims) ) {
         problems.push("mv3-shims.js creates a <script> element: element creation is CSP-governed in every MV3 world, and MV2's element exemption died with tabs.executeScript -- launch the libraries through DOM data instead");
     }
@@ -1773,11 +1780,27 @@ section('port self-checks');
     if ( /getBytesInUse/.test(post) === false ) {
         problems.push('mv3-post.js no longer measures storage.session usage before writing page-store snapshots');
     }
+    // Pin the SHAPE of the correctness fixes so a regression trips the build.
+    // These are wiring checks: they prove the fix is present in the shipped
+    // code, not that its runtime behavior is correct.
+    if ( /enforcementReady/.test(post) === false ) {
+        problems.push('mv3-post.js no longer gates request release on the enforcement-restore promise: a cold-start request could be decided against startup rules instead of the restored session rules');
+    }
+    if ( /isKnown/.test(post) === false ) {
+        problems.push('mv3-post.js snapshot-flush admission no longer exempts already-known tabs from the tab cap: at the cap, updating a live tab would delete its snapshot');
+    }
+    if ( /allowLargeMediaElementsRegex[\s\S]{0,80}source/.test(post) === false ) {
+        problems.push('mv3-post.js no longer serializes allowLargeMediaElementsRegex as { source, flags }: a RegExp does not survive storage.session, so the exemption would be silently lost on restore');
+    }
     if ( problems.length !== 0 ) {
         fail('session-state', problems.join('\n'),
             'see the session-state section of platform/chromium-mv3/mv3-post.js');
     } else {
-        pass('session rules, page stores and strict-block bypasses survive service worker deaths');
+        // Honest scope: this proves the persistence machinery is WIRED UP (the
+        // symbols and code shapes are present), NOT that state actually
+        // survives a worker death -- a structural grep can pass while the logic
+        // is wrong.
+        pass('session-state persistence is wired up (rules, page stores, strict-block bypasses); this is a structural check, not a behavioral guarantee');
     }
 }
 

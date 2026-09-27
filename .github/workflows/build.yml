@@ -50,6 +50,20 @@ jobs:
         continue-on-error: true
         run: npm run lint
 
+      - name: Fork lint
+        # GATED (no continue-on-error). Lints ONLY the fork's own files with a
+        # fork-owned ESLint config (tools/eslint.fork.config.mjs) that declares
+        # the extension globals. It touches no upstream file, so it can gate
+        # without reopening the merge-conflict surface the informational lint
+        # above avoids -- a real error in a fork file (undefined variable,
+        # duplicate key, unreachable code) fails the build.
+        run: >-
+          npx --no-install eslint --no-config-lookup -c tools/eslint.fork.config.mjs
+          "platform/chromium-mv3/*.js"
+          "tools/patch-mv3-modules.mjs"
+          "tools/verify-mv3-package.mjs"
+          "tools/make-crx.mjs"
+
       - name: Clone uAssets
         run: bash tools/pull-assets.sh
 

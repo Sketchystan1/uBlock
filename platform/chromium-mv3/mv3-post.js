@@ -373,47 +373,62 @@ const MV3_ISOLATED_ONLY = '\u0000uBO-mv3-isolated-only\u0000';
             return baseEngineRetrieve.apply(this, args);
         };
 
+        // Coalesce rapid successive saves into a single engine rebuild. Each
+        // save bumps the generation; a rebuild records the generation it
+        // covered and, on completion, runs exactly once more if newer saves
+        // arrived while it was in flight. The pre-coalesce wrapper reloaded all
+        // lists once per save -- N full reloads for N quick saves (a batch
+        // import, or repeated dashboard saves); this does one. The staleness
+        // fix is untouched: every save still drops the compiled user-filters
+        // entry and rebuilds before the raw asset can be read stale.
+        //
+        // The rebuild awaits `io.remove()` directly rather than the base's own
+        // `removeCompiledFilterList()`, which returns NOTHING (it fires
+        // `io.remove()` without returning it) -- chaining off its result threw
+        // a swallowed TypeError, so the reload never ran and stale engines (and
+        // the selfie made from them) lived on. Awaiting the real promise also
+        // closes the base's fire-and-forget race so the reload cannot read a
+        // stale compiled entry back.
+        let saveGeneration = 0;
+        let rebuildSatisfied = 0;
+        let rebuildInFlight = false;
+        const rebuildEngines = ubo => {
+            if ( rebuildInFlight ) { return; }
+            const generation = saveGeneration;
+            rebuildInFlight = true;
+            io.remove(`compiled/${ubo.userFiltersPath}`)
+                .catch(( ) => { })
+                .then(( ) => ubo.loadFilterLists())
+                .catch(( ) => { })
+                .then(( ) => {
+                    rebuildInFlight = false;
+                    rebuildSatisfied = generation;
+                    // A save that landed mid-rebuild bumped the generation past
+                    // the one this rebuild covered -- run once more for it.
+                    if ( saveGeneration !== rebuildSatisfied ) {
+                        rebuildEngines(ubo);
+                    }
+                });
+        };
+
         µb.saveUserFilters = function(...args) {
             const result = baseSaveUserFilters.apply(this, args);
             const ubo = this;
             Promise.resolve(result).then(( ) => {
-                // `+ 1` so a cache reset happening in the same millisecond
-                // as this save still counts as pre-save state (a save and a
-                // reset can share a timestamp; the stale check is strict
-                // less-than).
+                // `+ 1` so a cache reset happening in the same millisecond as
+                // this save still counts as pre-save state (a save and a reset
+                // can share a timestamp; the stale check is strict less-than).
                 userFiltersModifyTime = Date.now() + 1;
-                // Remove the compiled user-filters entry again, and this
-                // time await it. Round 6 got this wrong twice over: the
-                // base's own `removeCompiledFilterList()` helper returns
-                // NOTHING (it fires `io.remove()` without returning it), so
-                // chaining `.catch()` off its result threw a TypeError the
-                // moment the chain was entered -- silently swallowed by the
-                // outer catch, so the reload below never ran and the stale
-                // engines (and the selfie they got snapshotted into) lived
-                // on. Calling `io.remove()` directly returns a real promise,
-                // and awaiting it also closes the base's fire-and-forget
-                // race: the reload can never read a stale compiled entry
-                // back.
-                //
-                // Readiness gate: a save landing before `readyToFilter`
-                // (a filter added during boot -- restoreUserData, an eager
-                // element picker, a harness) must NOT be dropped. Defer the
-                // rebuild onto `isReadyPromise` instead of skipping: the
-                // boot's own loadFilterLists would otherwise read the raw
-                // asset through whatever the save race left, and post-boot
-                // saves have nothing waiting for them. Live-reproduced
-                // 2026-09-16: filters added in that window never reached
-                // the engines for the rest of the worker's life, while the
-                // raw and compiled assets both carried them (the compiled
-                // cache made it look like everything worked).
-                const rebuild = ( ) => {
-                    io.remove(`compiled/${ubo.userFiltersPath}`)
-                        .catch(( ) => { })
-                        .then(( ) => ubo.loadFilterLists())
-                        .catch(( ) => { });
-                };
-                if ( ubo.readyToFilter === true ) { return rebuild(); }
-                Promise.resolve(ubo.isReadyPromise).then(rebuild);
+                saveGeneration += 1;
+                // Readiness gate: a save landing before `readyToFilter` (a
+                // filter added during boot -- restoreUserData, an eager element
+                // picker, a harness) must NOT be dropped. Defer the rebuild
+                // onto `isReadyPromise` instead of skipping, or the filters
+                // never reach the engines for the rest of the worker's life
+                // (live-reproduced 2026-09-16) while the raw/compiled assets
+                // both carry them, so the compiled cache makes it look fine.
+                if ( ubo.readyToFilter === true ) { return rebuildEngines(ubo); }
+                Promise.resolve(ubo.isReadyPromise).then(( ) => rebuildEngines(ubo));
             }).catch(( ) => { });
             return result;
         };
@@ -699,6 +714,11 @@ const PS_KEY_PREFIX = 'uBOMv3PS:';
 const MAX_HOSTNAMES_PER_TAB = 100;
 const MAX_SNAPSHOTTED_TABS = 500;
 
+// How many consecutive flush write-failures to retry before abandoning the
+// episode (self-heals on the next successful write). Bounds a persistently
+// broken storage.session from respinning the flush timer forever.
+const MAX_FLUSH_RETRIES = 5;
+
 // `chrome.storage.session` has a hard quota (10 MB as of Chrome 138) and
 // writes past it fail *silently* -- at 500 tabs x 100 hostnames the
 // snapshots alone could reach ~7.5 MB. Budget total session usage at 4 MB
@@ -712,9 +732,16 @@ const bootState = {
     fetched: undefined,   // Promise
     bin: undefined,       // what storage.session held at service worker start
     applied: false,       // restore has been driven (webRequest.start wrap)
+    enforcementReady: undefined, // Promise: session rules + strict bypasses restored
     restored: false,      // page-store directory has been read back (see applyBootState)
     sessionRulesActive: false, // persist-on-mutation armed
 };
+
+// Enforcement state must be restored before parked requests are released, but
+// a wedged storage.session read must never park traffic forever: bound the
+// wait, then release with whatever restored in time. Generous enough that the
+// timeout effectively never fires in practice.
+const ENFORCEMENT_RESTORE_TIMEOUT_MS = 5000;
 
 const fetchBootState = ( ) => {
     if ( bootState.fetched !== undefined ) { return bootState.fetched; }
@@ -883,6 +910,8 @@ const pageStores = {
     dir: [],             // tab ids with snapshots, as persisted
     dirDirty: false,
     timer: 0,
+    flushing: false,     // a flush is awaiting its writes (serialize the next)
+    flushFailures: 0,    // consecutive write-failure count (bounded retries)
     keyBytes: new Map(), // PS key -> estimated bytes of the last value written
     budgetWarned: false, // one log per degradation episode
 };
@@ -917,8 +946,14 @@ const snapshotPageStore = pageStore => {
             pageStore.allowLargeMediaElementsUntil;
     }
     if ( pageStore.allowLargeMediaElementsRegex instanceof RegExp ) {
-        entry.allowLargeMediaElementsRegex =
-            pageStore.allowLargeMediaElementsRegex;
+        // storage.session serializes a RegExp to `{}` (structured clone drops
+        // it; JSON would give "{}" too) -- either way the `instanceof RegExp`
+        // check on restore never matches and the exemption is silently lost.
+        // Persist the parts and rebuild the RegExp on restore.
+        entry.allowLargeMediaElementsRegex = {
+            source: pageStore.allowLargeMediaElementsRegex.source,
+            flags: pageStore.allowLargeMediaElementsRegex.flags,
+        };
     }
     let n = 0;
     for ( const details of pageStore.hostnameDetailsMap.values() ) {
@@ -933,13 +968,17 @@ const snapshotPageStore = pageStore => {
         n += 1;
     }
     // Nothing a fresh page store would not have anyway -- do not spend
-    // storage on it.
+    // storage on it. A pending media-elements exemption (set just above) is
+    // NOT such a default, so preserve the entry when one is present even if
+    // every counter is still zero.
     if (
         entry.counts.every(v => v === 0) &&
         entry.hosts.length === 0 &&
         entry.popupBlockedCount === 0 &&
         entry.largeMediaCount === 0 &&
-        entry.remoteFontCount === 0
+        entry.remoteFontCount === 0 &&
+        entry.allowLargeMediaElementsUntil === undefined &&
+        entry.allowLargeMediaElementsRegex === undefined
     ) {
         return undefined;
     }
@@ -956,9 +995,17 @@ const flushPageStoreSnapshots = async ( ) => {
         pageStores.timer = setTimeout(flushPageStoreSnapshots, 1000);
         return;
     }
+    // This function now awaits its storage writes, so a flush can be in flight
+    // when the next one is triggered. Serialize them: the second reschedules
+    // rather than mutating `dir`/`dirty` concurrently with the first.
+    if ( pageStores.flushing ) {
+        pageStores.timer = setTimeout(flushPageStoreSnapshots, 1000);
+        return;
+    }
+    pageStores.flushing = true;
     pageStores.timer = 0;
     const dirty = pageStores.dirty;
-    if ( dirty.size === 0 ) { return; }
+    if ( dirty.size === 0 ) { pageStores.flushing = false; return; }
     // Candidates in oldest-dirtied-first order -- the byte budget below
     // drops entries in this order when it must, on the grounds that the
     // least recently dirtied tab matters least, and a live tab re-dirties
@@ -972,26 +1019,44 @@ const flushPageStoreSnapshots = async ( ) => {
     const toRemove = [];
     const dir = pageStores.dir;
     const entries = new Map(); // PS key -> tabId, for the budget ladder
-    for ( const tabId of candidates ) {
-        const pageStore = µb.pageStores.get(tabId);
-        const entry = pageStore === undefined
-            ? undefined
-            : snapshotPageStore(pageStore);
-        if ( entry !== undefined && dir.length < MAX_SNAPSHOTTED_TABS ) {
-            bin[PS_KEY_PREFIX + tabId] = entry;
-            entries.set(PS_KEY_PREFIX + tabId, tabId);
-            if ( dir.includes(tabId) === false ) {
-                dir.push(tabId);
+    // This synchronous section runs BEFORE the persist try/finally below, which
+    // is what normally clears `flushing`. A throw here (e.g. snapshotPageStore)
+    // would otherwise leave `flushing` stuck true and wedge every future flush
+    // for the worker's lifetime. Guard it: reset the flag and bail. The tabs
+    // this flush would have covered were already cleared from `dirty` above, so
+    // one flush's counters are lost -- exactly the pre-serialization behavior --
+    // but the next markTabDirty reschedules and recovers.
+    try {
+        for ( const tabId of candidates ) {
+            const pageStore = µb.pageStores.get(tabId);
+            const entry = pageStore === undefined
+                ? undefined
+                : snapshotPageStore(pageStore);
+            // The cap bounds how many DISTINCT tabs hold snapshots; it must not
+            // block an update to a tab already in the directory, or a full
+            // directory would drop live tabs' fresh counts (reproduced: updating
+            // tab 1 at 500 entries deleted its snapshot).
+            const isKnown = dir.includes(tabId);
+            if ( entry !== undefined && (isKnown || dir.length < MAX_SNAPSHOTTED_TABS) ) {
+                bin[PS_KEY_PREFIX + tabId] = entry;
+                entries.set(PS_KEY_PREFIX + tabId, tabId);
+                if ( isKnown === false ) {
+                    dir.push(tabId);
+                    pageStores.dirDirty = true;
+                }
+                continue;
+            }
+            toRemove.push(PS_KEY_PREFIX + tabId);
+            const pos = dir.indexOf(tabId);
+            if ( pos !== -1 ) {
+                dir.splice(pos, 1);
                 pageStores.dirDirty = true;
             }
-            continue;
         }
-        toRemove.push(PS_KEY_PREFIX + tabId);
-        const pos = dir.indexOf(tabId);
-        if ( pos !== -1 ) {
-            dir.splice(pos, 1);
-            pageStores.dirDirty = true;
-        }
+    } catch (reason) {
+        pageStores.flushing = false;
+        console.error(`uBO: page-store snapshot build failed: ${reason}`);
+        return;
     }
     // The byte budget. Best-effort by design: `getBytesInUse()` reports the
     // whole store, and per-key sizes are only known for what this service
@@ -1084,24 +1149,55 @@ const flushPageStoreSnapshots = async ( ) => {
     } else if ( degraded === false && pageStores.budgetWarned ) {
         pageStores.budgetWarned = false;
     }
-    const writes = [];
-    if ( Object.keys(bin).length !== 0 ) {
-        for ( const [ key, entry ] of Object.entries(bin) ) {
-            pageStores.keyBytes.set(key, key.length + JSON.stringify(entry).length);
+    // Persist. Await each write so a rejection is observed rather than
+    // dropped, and requeue the affected tabs on failure (bounded) so a
+    // transient storage.session error is retried on the next flush instead of
+    // silently losing a snapshot. The directory write in particular must land,
+    // or the next boot reads a directory out of sync with the per-tab keys.
+    // keyBytes is updated only after a write actually succeeds, so the byte
+    // budget never credits bytes that were never stored.
+    try {
+        if ( Object.keys(bin).length !== 0 ) {
+            await vAPI.sessionStorage.set(bin);
+            for ( const [ key, entry ] of Object.entries(bin) ) {
+                pageStores.keyBytes.set(key, key.length + JSON.stringify(entry).length);
+            }
         }
-        writes.push(vAPI.sessionStorage.set(bin));
+        if ( toRemove.length !== 0 ) {
+            await vAPI.sessionStorage.remove(toRemove);
+            for ( const key of toRemove ) {
+                pageStores.keyBytes.delete(key);
+            }
+        }
+        if ( pageStores.dirDirty ) {
+            await vAPI.sessionStorage.set({ [PS_DIR_KEY]: dir });
+            pageStores.dirDirty = false;
+        }
+        pageStores.flushFailures = 0;
+    } catch (reason) {
+        pageStores.flushFailures = (pageStores.flushFailures || 0) + 1;
+        if ( pageStores.flushFailures <= MAX_FLUSH_RETRIES ) {
+            // Re-dirty the tabs this flush tried to snapshot so the next flush
+            // retries them; `dirDirty` stays set (never cleared above on this
+            // path) if the directory write did not land.
+            for ( const tabId of entries.values() ) {
+                if ( pageStores.dirty.has(tabId) ) { continue; }
+                pageStores.dirty.add(tabId);
+                pageStores.dirtyAt.set(tabId, Date.now());
+            }
+            if ( pageStores.timer === 0 ) {
+                pageStores.timer = setTimeout(flushPageStoreSnapshots, 1000);
+            }
+        } else {
+            console.error(
+                `uBO: page-store snapshot flush failed ${pageStores.flushFailures} ` +
+                `times; abandoning this episode until a write succeeds. See ` +
+                `platform/chromium-mv3/mv3-post.js. ${reason}`
+            );
+        }
+    } finally {
+        pageStores.flushing = false;
     }
-    for ( const key of toRemove ) {
-        pageStores.keyBytes.delete(key);
-    }
-    if ( pageStores.dirDirty ) {
-        pageStores.dirDirty = false;
-        writes.push(vAPI.sessionStorage.set({ [PS_DIR_KEY]: dir }));
-    }
-    if ( toRemove.length !== 0 ) {
-        writes.push(vAPI.sessionStorage.remove(toRemove));
-    }
-    for ( const write of writes ) { write.catch(( ) => { }); }
 };
 
 const restorePageStore = (pageStore, entry) => {
@@ -1125,9 +1221,18 @@ const restorePageStore = (pageStore, entry) => {
         pageStore.allowLargeMediaElementsUntil =
             entry.allowLargeMediaElementsUntil;
     }
-    if ( entry.allowLargeMediaElementsRegex instanceof RegExp ) {
-        pageStore.allowLargeMediaElementsRegex =
-            entry.allowLargeMediaElementsRegex;
+    // Rebuilt from the { source, flags } persisted by snapshotPageStore -- a
+    // RegExp does not survive storage.session as itself.
+    const reSpec = entry.allowLargeMediaElementsRegex;
+    if ( reSpec instanceof Object && typeof reSpec.source === 'string' ) {
+        try {
+            pageStore.allowLargeMediaElementsRegex = new RegExp(
+                reSpec.source,
+                typeof reSpec.flags === 'string' ? reSpec.flags : ''
+            );
+        } catch (reason) {
+            console.error(`uBO: could not restore allowLargeMediaElementsRegex: ${reason}`);
+        }
     }
     const hosts = Array.isArray(entry.hosts) ? entry.hosts : [];
     // The live engine's journalProcess() calls `hnDetails.counts.inc(...)` on
@@ -1239,20 +1344,30 @@ const applyPageStores = ( ) => {
 /*** The restore itself ***********************************************/
 
 const applyBootState = ( ) => {
-    if ( bootState.applied ) { return; }
+    if ( bootState.applied ) { return bootState.enforcementReady; }
     bootState.applied = true;
-    fetchBootState().then(( ) => {
+    // Enforcement state -- session dynamic rules and strict-block bypasses --
+    // gates request release: a queued decision must not fall back to startup
+    // permanent rules. Resolve as soon as it is restored, but never later than
+    // the timeout, so a wedged storage read cannot hold traffic indefinitely.
+    const enforcement = fetchBootState().then(( ) => {
         if ( bootState.bin === undefined ) { return; }
         applySessionRules();
         applyStrictBlockBypasses();
+    }).catch(( ) => { });
+    const timeout = new Promise(resolve => {
+        setTimeout(resolve, ENFORCEMENT_RESTORE_TIMEOUT_MS);
+    });
+    bootState.enforcementReady = Promise.race([ enforcement, timeout ]);
+    // Page stores are display-only counters, not enforcement -- restore them
+    // off the release path so they never delay traffic. `restored` flips only
+    // once the persisted directory has actually been read into pageStores.dir,
+    // which the flush and unbind paths gate on. Wait on the real fetch (not the
+    // enforcement race, which may have resolved via timeout) before reading it.
+    enforcement.then(fetchBootState).then(( ) => {
+        if ( bootState.bin === undefined ) { return; }
         return applyPageStores();
     }).then(( ) => {
-        // `applied` (set synchronously above) means only "restore started",
-        // which is all the session-rule and strict-bypass paths need. The
-        // page-store directory, though, is not read into pageStores.dir until
-        // applyPageStores() has resolved -- so gate the flush and unbind paths
-        // on this later flag, or they would overwrite the persisted directory
-        // / splice a directory not yet loaded during the restore window.
         bootState.restored = true;
     }).catch(( ) => {
         // Each restore step swallows its own failures, so this chain settles
@@ -1260,6 +1375,7 @@ const applyBootState = ( ) => {
         // does not respin forever with the gate shut.
         bootState.restored = true;
     });
+    return bootState.enforcementReady;
 };
 
 {
@@ -1271,10 +1387,18 @@ const applyBootState = ( ) => {
         );
     } else {
         webRequest.start = function(...args) {
-            applyBootState();
-            // After the state restore, so the requests un-parked by the
-            // original start() are filtered with the restored rules.
-            return start.apply(this, args);
+            // The request-parking listener is installed synchronously by
+            // `new vAPI.Net()` at module eval, so no startup request is missed
+            // while this waits. The original start() both installs the real
+            // suspendable listener AND unsuspends -- releasing parked requests
+            // through it -- so defer the whole call behind enforcement restore.
+            // start.js is an upstream file the port must not edit, so the
+            // gating lives entirely here: chaining start() off the enforcement
+            // promise means the unsuspend cannot run before the session rules
+            // and strict-block bypasses are back, whether or not the caller
+            // awaits the returned promise. Return it anyway, so a caller that
+            // does await observes "requests released".
+            return applyBootState().then(( ) => start.apply(this, args));
         };
     }
 }

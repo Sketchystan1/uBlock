@@ -1775,6 +1775,28 @@ const logInjectionError = (where, reason) => {
     console.error(`uBO: scriptlet injection failed (${where}): ${message}`);
 };
 
+// Inject one world's library files, retrying a bounded number of times on a
+// non-routine failure. The retry cannot double-run scriptlets: a rejected
+// executeScript({files}) means the files did not run, so a re-attempt either
+// delivers them once or fails again. A routine teardown error (the frame or
+// document is gone) is not retried -- there is nothing left to deliver to, and
+// with a documentId target a navigated-away document reports exactly that.
+// Returns the InjectionResult array on success, or null once it gives up.
+const LIBRARY_INJECT_RETRIES = 1;
+const injectLibraryFiles = async (where, options) => {
+    for ( let attempt = 0; ; attempt += 1 ) {
+        try {
+            return await chrome.scripting.executeScript(options);
+        } catch (reason) {
+            const message = String(reason?.message ?? reason).replace(/^Error:\s*/, '');
+            if ( attempt >= LIBRARY_INJECT_RETRIES || routineInjectionErrorRE.test(message) ) {
+                logInjectionError(where, reason);
+                return null;
+            }
+        }
+    }
+};
+
 const executeCode = async details => {
     const target = targetFromDetails(details);
     const injectImmediately = details.runAt === 'document_start';
@@ -1857,16 +1879,30 @@ const executeCode = async details => {
             calls,
         ],
     }).catch(reason => { logInjectionError('prepare', reason); return []; });
+    const documentIds = [];
     const frameIds = [];
     if ( Array.isArray(prepared) ) {
         for ( const result of prepared ) {
             if ( result?.result !== true ) { continue; }
-            if ( typeof result.frameId !== 'number' ) { continue; }
-            frameIds.push(result.frameId);
+            // Bind the library injections to the exact DOCUMENT the prepare
+            // step ran in. A frame can navigate between the two round trips,
+            // and a frameId targets whatever document occupies that frame at
+            // injection time -- so a race would deliver the library into the
+            // wrong page. A documentId names one document for its lifetime:
+            // if it navigated away, the injection simply fails with "no such
+            // document" instead of hitting the new page. Fall back to frameId
+            // only if a result somehow lacks a documentId.
+            if ( typeof result.documentId === 'string' ) {
+                documentIds.push(result.documentId);
+            } else if ( typeof result.frameId === 'number' ) {
+                frameIds.push(result.frameId);
+            }
         }
     }
-    if ( frameIds.length === 0 ) { return prepared; }
-    const libraryTarget = { tabId: target.tabId, frameIds };
+    if ( documentIds.length === 0 && frameIds.length === 0 ) { return prepared; }
+    const libraryTarget = documentIds.length !== 0
+        ? { tabId: target.tabId, documentIds }
+        : { tabId: target.tabId, frameIds };
 
     // The sharded library files are extension-injected, so they run
     // CSP-exempt in their worlds -- no `<script>` element is ever created,
@@ -1880,28 +1916,22 @@ const executeCode = async details => {
     if ( mainCalls.length !== 0 ) {
         const files = libraryFilesFor('main', mainCalls);
         if ( files !== undefined ) {
-            injections.push(chrome.scripting.executeScript({
+            injections.push(injectLibraryFiles('main-world library', {
                 target: libraryTarget,
                 injectImmediately,
                 world: 'MAIN',
                 files,
-            }).catch(reason => {
-                logInjectionError('main-world library', reason);
-                return null;
             }));
         }
     }
     if ( calls.length !== 0 ) {
         const files = libraryFilesFor('isolated', calls);
         if ( files !== undefined ) {
-            injections.push(chrome.scripting.executeScript({
+            injections.push(injectLibraryFiles('isolated-world library', {
                 target: libraryTarget,
                 injectImmediately,
                 world: 'ISOLATED',
                 files,
-            }).catch(reason => {
-                logInjectionError('isolated-world library', reason);
-                return null;
             }));
         }
     }
