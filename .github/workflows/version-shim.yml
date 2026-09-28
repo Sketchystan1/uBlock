@@ -1,0 +1,50 @@
+name: Build version.dll shim
+
+# Builds the version.dll domain-join shim in .github/version-shim for x64/x86/arm64
+# and uploads the DLLs as artifacts. Runs when the shim changes, and on demand.
+#
+# Windows-only: the shim links against the Windows SDK and is compiled with MSVC.
+# build.bat locates Visual Studio itself and skips any architecture whose cross
+# toolchain is not installed on the runner (x64 always builds on windows-latest).
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/version-shim/**'
+      - '.github/workflows/version-shim.yml'
+  pull_request:
+    paths:
+      - '.github/version-shim/**'
+      - '.github/workflows/version-shim.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: version-shim-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build version.dll
+    runs-on: windows-latest
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build version.dll (x64/x86/arm64)
+        shell: cmd
+        working-directory: .github/version-shim
+        run: build.bat all
+
+      - name: Upload version.dll artifacts
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: version-shim
+          path: .github/version-shim/build/**/version.dll
+          if-no-files-found: error
