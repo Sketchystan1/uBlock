@@ -365,13 +365,16 @@ let flushDurableSettingsWrites = ( ) => Promise.resolve();
 // IsSyncable() excludes this force-installed off-store build from sync on two
 // counts -- policy/external install location and a non-gallery update URL -- so
 // the feature can never sync cross-device here; it would be a toggle that
-// silently does nothing. Flag it unsupported, which is uBO's own "cloud not
-// available on this platform" state: src/js/settings.js disables (greys) the
-// checkbox, src/js/messaging.js no-ops every cloud handler, and
-// src/js/cloud-ui.js leaves each per-pane cloud widget hidden. One assignment,
-// no upstream edit. chrome.storage.sync is reached only through vAPI.cloud, so
-// nothing else is affected. The Google-Drive-based cross-device sync design (the
-// only viable route) is recorded in docs/mv3-sync.md for later.
+// silently does nothing. Flag it unsupported so the feature is genuinely off:
+// src/js/messaging.js no-ops every cloud handler and src/js/cloud-ui.js leaves
+// each per-pane cloud widget hidden. The Settings checkbox is greyed + unchecked
+// the SAME way "Uncloak canonical names" is: src/js/messaging.js sends
+// `cloudStorageEnabled = undefined` when unsupported, so settings.js takes the
+// generic disabled+unchecked path (disables the .checkbox wrapper, which
+// common.css greys via `.checkbox[disabled]` -- not just the input). One
+// assignment plus that one mirror line; chrome.storage.sync is reached only
+// through vAPI.cloud, so nothing else is affected. The Google-Drive-based
+// cross-device sync design (the only viable route) is recorded in docs/mv3-sync.md.
 µb.cloudStorageSupported = false;
 
 /******************************************************************************/

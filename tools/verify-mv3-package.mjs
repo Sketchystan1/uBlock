@@ -1617,29 +1617,35 @@ section('port self-checks');
 // Cloud storage is greyed out on this build (mv3-post.js sets
 // `µb.cloudStorageSupported = false`), because native chrome.storage.sync cannot
 // sync cross-device for a force-installed off-store extension (IsSyncable:
-// policy location + non-gallery update URL). Pin the override so the greyed-out
-// state cannot silently regress into a toggle that does nothing. The
-// Google-Drive-based re-enable plan lives in docs/mv3-sync.md.
+// policy location + non-gallery update URL). The checkbox is greyed + unchecked
+// the SAME way as "Uncloak canonical names": messaging.js sends
+// `cloudStorageEnabled = undefined` so settings.js takes its generic
+// disabled+unchecked path. Pin the override and both greying paths so the state
+// cannot silently regress. The Google-Drive re-enable plan lives in docs/mv3-sync.md.
 {
     const problems = [];
     const pkg = readPkg('js/mv3-post.js');
     if ( pkg.includes('µb.cloudStorageSupported = false;') === false ) {
         problems.push('js/mv3-post.js no longer forces µb.cloudStorageSupported = false; the non-functional cloud-storage toggle would be enabled again');
     }
-    // The upstream paths the override relies on to grey out the UI and no-op the
-    // handlers -- if any of these drift, the override no longer achieves the
-    // greyed-out state and docs/mv3-sync.md must be reconciled.
-    if ( readRepo('src/js/settings.js').includes("dom.attr('[data-setting-name=\"cloudStorageEnabled\"]', 'disabled', '')") === false ) {
-        problems.push('src/js/settings.js no longer disables the cloud checkbox when cloudStorageSupported is false');
-    }
-    if ( readRepo('src/js/messaging.js').includes('µb.cloudStorageSupported !== true') === false ) {
+    const messaging = readRepo('src/js/messaging.js');
+    if ( messaging.includes('µb.cloudStorageSupported !== true') === false ) {
         problems.push('src/js/messaging.js no longer gates the cloud handlers on cloudStorageSupported');
+    }
+    if ( messaging.includes('response.cloudStorageEnabled = undefined;') === false ) {
+        problems.push('src/js/messaging.js no longer sends cloudStorageEnabled=undefined; the cloud checkbox would not grey out like "Uncloak canonical names"');
+    }
+    // The generic disabled+unchecked path settings.js applies to an
+    // undefined-valued bool setting -- the same one that greys "Uncloak
+    // canonical names". If it drifts, the undefined value no longer greys.
+    if ( readRepo('src/js/settings.js').includes("dom.attr(checkbox.closest('.checkbox'), 'disabled', '')") === false ) {
+        problems.push('src/js/settings.js no longer disables the .checkbox wrapper for undefined-valued bool settings; the cloud checkbox would not visually grey out');
     }
     if ( problems.length !== 0 ) {
         fail('cloud storage greyed out', problems.join('\n'),
             'reconcile the cloudStorageSupported override in platform/chromium-mv3/mv3-post.js with docs/mv3-sync.md');
     } else {
-        pass('cloud storage greyed out: cloudStorageSupported=false pinned, upstream disable/no-op paths intact');
+        pass('cloud storage greyed out: cloudStorageSupported=false pinned, greyed+unchecked like cname-uncloak (messaging undefined + settings generic path)');
     }
 }
 

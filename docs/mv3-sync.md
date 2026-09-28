@@ -1,8 +1,9 @@
 # Cross-device sync via Google Drive (planned — not yet implemented)
 
-**Status:** design only. On this build the "Cloud storage support" feature is **greyed out**
-(`platform/chromium-mv3/mv3-post.js` sets `µb.cloudStorageSupported = false`). This document records
-the only viable way to bring cross-device sync back, so it can be implemented when wanted.
+**Status:** design only. On this build the "Cloud storage support" feature is **greyed out and
+unchecked** (`platform/chromium-mv3/mv3-post.js` sets `µb.cloudStorageSupported = false`), rendered
+the same way as "Uncloak canonical names". This document records the only viable way to bring
+cross-device sync back, so it can be implemented when wanted.
 
 ## Why native Google-account sync is impossible here
 uBO's Cloud storage IS `chrome.storage.sync` — "your browser does this through its sync feature"
@@ -19,11 +20,15 @@ browser-level exclusion; nothing the extension does flips it on stock Chrome. (P
 `IsSyncable` would work only on a custom browser build, not stock Chrome — out of scope here.)
 
 ## Current state on this build
-`mv3-post.js` forces `µb.cloudStorageSupported = false`, which is uBO's own "cloud unavailable"
-state: `src/js/settings.js` disables/greys the checkbox, `src/js/messaging.js` no-ops every cloud
-handler, and `src/js/cloud-ui.js` leaves each per-pane cloud widget hidden. Pinned by
-`tools/verify-mv3-package.mjs` ("cloud storage greyed out"). Local settings persistence is separate
-and unaffected (the IndexedDB `storage.local` mirror in `mv3-post.js`).
+`mv3-post.js` forces `µb.cloudStorageSupported = false`, so the feature is genuinely off:
+`src/js/messaging.js` no-ops every cloud handler and `src/js/cloud-ui.js` leaves each per-pane cloud
+widget hidden. The Settings checkbox is greyed out and unchecked **exactly like "Uncloak canonical
+names"**: `messaging.js` sends `cloudStorageEnabled = undefined` when unsupported (mirroring
+`cnameUncloakEnabled = undefined`), so `settings.js` takes its generic disabled+unchecked path — it
+disables the `.checkbox` wrapper, which `common.css` greys via `.checkbox[disabled]` (greying the
+whole label, not just the input). Pinned by `tools/verify-mv3-package.mjs` ("cloud storage greyed
+out"). Local settings persistence is separate and unaffected (the IndexedDB `storage.local` mirror in
+`mv3-post.js`).
 
 ## Chosen approach: keep uBO's Cloud UI, swap the transport to Google Drive
 Most-similar-to-upstream: keep uBO's Cloud storage feature **unchanged** — the per-pane widget
@@ -42,7 +47,8 @@ implementation with the SAME five methods and signatures the messaging layer cal
 - `pull({datakey, decode})` → read that file, `decode()`, return `{source,tstamp,data}`.
 - `used(datakey)` → file size + a nominal quota so the capacity strip renders.
 - `getOptions`/`setOptions` → device name, persisted via the durable store.
-And undo the grey-out: remove the `µb.cloudStorageSupported = false` line (and its verify pin).
+And undo the grey-out: remove the `µb.cloudStorageSupported = false` line **and** the
+`response.cloudStorageEnabled = undefined` mirror in `src/js/messaging.js` (plus their verify pins).
 
 ## Auth: `chrome.identity.launchWebAuthFlow` + PKCE (NOT `getAuthToken`)
 `chrome.identity.getAuthToken` effectively requires the extension to be published to the Chrome Web
@@ -85,7 +91,8 @@ The OAuth **client id** — a public app identifier like `123456-abc.apps.google
   datakey). Exports `installDriveCloud()` → a `vAPI.cloud`-shaped object, or `undefined` when
   unconfigured.
 - **`mv3-post.js`** — import `js/mv3-oauth-config.js`; if a client id is present, `vAPI.cloud =
-  installDriveCloud()` and DROP the `µb.cloudStorageSupported = false` line so the UI re-appears.
+  installDriveCloud()` and DROP the `µb.cloudStorageSupported = false` line (and the
+  `cloudStorageEnabled = undefined` mirror in `messaging.js`) so the UI re-appears.
 - **Manifest** (`manifest.overlay.json` + `make-chromium-mv3-meta.py`) — add `identity` and host
   permissions `https://www.googleapis.com/*`, `https://oauth2.googleapis.com/*`; teach the meta
   script to union `host_permissions`/`optional_permissions` from the overlay (today only

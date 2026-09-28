@@ -275,11 +275,13 @@ The port aims at MV2 parity; where a difference could be closed it has been. Wha
 - **"Cloud storage support" is greyed out.** uBO's cloud storage is `chrome.storage.sync` (Google-
   account sync), which Chromium's `IsSyncable()` excludes for a force-installed off-store extension
   (policy/external location + non-gallery update URL), so it can never sync cross-device here.
-  `mv3-post.js` forces `µb.cloudStorageSupported = false` (uBO's own "cloud unavailable" state), so
-  the Settings checkbox is disabled and the per-pane cloud widgets stay hidden rather than offering a
-  toggle that does nothing. Local settings still persist via the IndexedDB mirror above. The only
-  viable cross-device route — syncing uBO's export/import blob through **Google Drive** (OAuth) — is
-  designed in [docs/mv3-sync.md](mv3-sync.md), to be implemented when wanted.
+  `mv3-post.js` forces `µb.cloudStorageSupported = false`, so the cloud handlers no-op and the per-pane
+  cloud widgets stay hidden; the Settings checkbox is greyed out and unchecked the same way as
+  "Uncloak canonical names" (`messaging.js` sends `cloudStorageEnabled = undefined`, so `settings.js`
+  disables the `.checkbox` wrapper — greying the whole label — and leaves it unchecked) rather than
+  offering a toggle that does nothing. Local settings still persist via the IndexedDB mirror above.
+  The only viable cross-device route — syncing uBO's export/import blob through **Google Drive**
+  (OAuth) — is designed in [docs/mv3-sync.md](mv3-sync.md), to be implemented when wanted.
 
 Robustness work that is invisible in normal operation, in brief: session-scope state (session
 dynamic rules, per-tab page stores, strict-block bypasses) survives service worker deaths via
