@@ -93,6 +93,289 @@ self.uBO_registerStaticModules({
 
 /******************************************************************************/
 
+// Durable settings storage: mirror chrome.storage.local into IndexedDB.
+//
+// chrome.storage.local does NOT persist across a browser restart for this
+// fork's install type. Confirmed live over CDP (see the first-install restart
+// guard in tools/patch-mv3-modules.mjs): the per-extension "Local Extension
+// Settings" LevelDB is never committed to disk, so every settings write --
+// user settings, the filter-list selection, the trusted-site whitelist, the
+// permanent dynamic rules and hostname switches, hidden settings -- is silently
+// lost on the next launch. IndexedDB, by contrast, DOES persist: it is the
+// backend cacheStorage uses (src/js/cachestorage.js, fastCache = 'indexedDB'),
+// and it is the sole reason "My filters" (stored as the user-filters asset
+// through io.put -> cacheStorage) survives a restart while nothing on the other
+// dashboard tabs does. The whole reported symptom -- "only My filters is
+// restored, everything else is lost after a restart" -- is exactly this backend
+// split.
+//
+// So make uBO's settings store durable by backing vAPI.storage with IndexedDB:
+// write-through on set/remove/clear, read-fallback on get. The mirror is
+// transparent to every uBO caller (they still call vAPI.storage), lives in its
+// own database rather than in cacheStorage -- cache entries are disposable and
+// purged on selfie/format changes, settings must never be -- and degrades to
+// the original local-only behavior if IndexedDB itself is ever unavailable.
+//
+// Installed here, synchronously at mv3-post.js evaluation: sw.js evaluates this
+// module immediately after start.js, whose boot IIFE yields on its first
+// `await` (restoreAdminSettings) before it reads any settings, so the wrapper
+// is in place before the first storage.local read of the boot.
+
+// Assigned by the durable-storage block below; used by the vAPI.app.restart
+// wrapper further down to flush pending durable writes before a reload.
+let flushDurableSettingsWrites = ( ) => Promise.resolve();
+
+{
+    const DB_NAME = 'uBlock0Settings';
+    const STORE_NAME = 'settings';
+    let dbPromise;
+
+    const openDB = ( ) => {
+        if ( dbPromise !== undefined ) { return dbPromise; }
+        dbPromise = new Promise(resolve => {
+            let req;
+            try {
+                req = indexedDB.open(DB_NAME, 1);
+            } catch {
+                return resolve(null);
+            }
+            req.onupgradeneeded = ev => {
+                const db = ev.target.result;
+                if ( db.objectStoreNames.contains(STORE_NAME) === false ) {
+                    db.createObjectStore(STORE_NAME);
+                }
+            };
+            req.onsuccess = ev => { resolve(ev.target.result); };
+            req.onerror = ( ) => {
+                // A wedged open must not poison every later call: re-arm so a
+                // transient failure can be retried on the next access.
+                dbPromise = undefined;
+                resolve(null);
+            };
+        });
+        return dbPromise;
+    };
+    const txStore = async mode => {
+        const db = await openDB();
+        if ( db === null ) { return null; }
+        try {
+            return db.transaction(STORE_NAME, mode).objectStore(STORE_NAME);
+        } catch {
+            return null;
+        }
+    };
+
+    // All idb helpers resolve rather than reject -- a broken mirror must never
+    // wedge a settings read/write, only forgo durability. Missing keys are
+    // simply absent from the returned bin, so callers can test presence.
+    const idbGet = async keys => {
+        const out = {};
+        const store = await txStore('readonly');
+        if ( store === null ) { return out; }
+        await Promise.all(keys.map(key => new Promise(resolve => {
+            const req = store.get(key);
+            req.onsuccess = ( ) => {
+                if ( req.result !== undefined ) { out[key] = req.result; }
+                resolve();
+            };
+            req.onerror = ( ) => resolve();
+        })));
+        return out;
+    };
+
+    const idbGetAll = async ( ) => {
+        const out = {};
+        const store = await txStore('readonly');
+        if ( store === null ) { return out; }
+        return new Promise(resolve => {
+            const req = store.openCursor();
+            req.onsuccess = ev => {
+                const cursor = ev.target.result;
+                if ( cursor === null ) { return resolve(out); }
+                out[cursor.key] = cursor.value;
+                cursor.continue();
+            };
+            req.onerror = ( ) => resolve(out);
+        });
+    };
+
+    const idbSet = async bin => {
+        const store = await txStore('readwrite');
+        if ( store === null ) { return; }
+        await Promise.all(Object.keys(bin).map(key => new Promise(resolve => {
+            const req = store.put(bin[key], key);
+            req.onsuccess = ( ) => resolve();
+            req.onerror = ( ) => resolve();
+        })));
+    };
+    const idbRemove = async keys => {
+        const store = await txStore('readwrite');
+        if ( store === null ) { return; }
+        const list = Array.isArray(keys) ? keys : [ keys ];
+        await Promise.all(list.map(key => new Promise(resolve => {
+            const req = store.delete(key);
+            req.onsuccess = ( ) => resolve();
+            req.onerror = ( ) => resolve();
+        })));
+    };
+
+    const idbClear = async ( ) => {
+        const store = await txStore('readwrite');
+        if ( store === null ) { return; }
+        await new Promise(resolve => {
+            const req = store.clear();
+            req.onsuccess = ( ) => resolve();
+            req.onerror = ( ) => resolve();
+        });
+    };
+
+    // The argument shapes uBO passes to storage.get: a string key, an array of
+    // keys, an object whose keys carry default values, or null/undefined for
+    // "everything". Mirrors src/js/cachestorage.js's keysFromGetArg.
+    const keysFromArg = arg => {
+        if ( arg === null || arg === undefined ) { return null; }
+        if ( typeof arg === 'string' ) { return [ arg ]; }
+        if ( Array.isArray(arg) ) { return arg.slice(); }
+        if ( typeof arg === 'object' ) { return Object.keys(arg); }
+        return [];
+    };
+
+    // Track in-flight durable writes so a restart (backup restore / "reset all
+    // settings") can flush them before the service worker reloads. Without this
+    // the fire-and-forget vAPI.storage.set()s in messaging.js's restoreUserData
+    // race the immediate vAPI.app.restart() and never reach IndexedDB -- which
+    // is exactly why restoring from a backup file "doesn't fully work".
+    const durableWrites = new Set();
+    const trackDurable = promise => {
+        durableWrites.add(promise);
+        promise.finally(( ) => durableWrites.delete(promise));
+        return promise;
+    };
+    flushDurableSettingsWrites = ( ) => Promise.allSettled([ ...durableWrites ]);
+
+    // Best-effort refresh of chrome.storage.local from the durable mirror, so
+    // keys recovered from IndexedDB after a restart are also present in the
+    // (possibly non-persisting) local store for the rest of this session. Never
+    // awaited: a failure changes nothing, the mirror stays authoritative.
+    const backfillLocal = (localSet, bin) => {
+        if ( bin instanceof Object === false ) { return; }
+        if ( Object.keys(bin).length === 0 ) { return; }
+        try { trackDurable(Promise.resolve(localSet(bin)).catch(( ) => {})); } catch {}
+    };
+    const local = vAPI.storage;
+    const localGet = local.get.bind(local);
+    const localSet = local.set.bind(local);
+    const localRemove = local.remove.bind(local);
+    const localClear = local.clear.bind(local);
+
+    vAPI.storage.get = async function(arg, ...args) {
+        const keys = keysFromArg(arg);
+
+        // "Get everything": union of the durable mirror and whatever the local
+        // store still holds, local winning on conflict (write-through keeps the
+        // two equal; local is only ever a same-session subset).
+        if ( keys === null ) {
+            const [ localBin, idbBin ] = await Promise.all([
+                localGet(arg, ...args),
+                idbGetAll(),
+            ]);
+            if ( localBin instanceof Object === false ) {
+                return Object.keys(idbBin).length !== 0 ? idbBin : null;
+            }
+            return Object.assign({}, idbBin, localBin);
+        }
+
+        // Object-with-defaults (createDefaultProps at boot): the result carries,
+        // per key, the stored value if any, else the caller's default -- and is
+        // never null. Probe the local store with the bare key list so a default
+        // cannot masquerade as a stored value, then layer default < mirror <
+        // local.
+        if ( arg instanceof Object && Array.isArray(arg) === false ) {
+            const [ localBin, idbBin ] = await Promise.all([
+                localGet(keys),
+                idbGet(keys),
+            ]);
+            const result = Object.assign({}, arg);
+            const recovered = {};
+            for ( const key of keys ) {
+                if ( localBin instanceof Object && Object.hasOwn(localBin, key) ) {
+                    result[key] = localBin[key];
+                } else if ( Object.hasOwn(idbBin, key) ) {
+                    result[key] = idbBin[key];
+                    recovered[key] = idbBin[key];
+                }
+            }
+            backfillLocal(localSet, recovered);
+            return result;
+        }
+        // String or array of keys: preserve the patched null-on-failure signal
+        // that this module's boot-recovery relies on, but treat storage as
+        // healthy whenever the durable mirror can serve the read.
+        const localBin = await localGet(arg, ...args);
+        if ( localBin instanceof Object === false ) {
+            const idbBin = await idbGet(keys);
+            if ( Object.keys(idbBin).length !== 0 ) {
+                backfillLocal(localSet, idbBin);
+                return idbBin;
+            }
+            return null;
+        }
+        const missing = keys.filter(key => Object.hasOwn(localBin, key) === false);
+        if ( missing.length !== 0 ) {
+            const idbBin = await idbGet(missing);
+            const recovered = {};
+            for ( const key of missing ) {
+                if ( Object.hasOwn(idbBin, key) === false ) { continue; }
+                localBin[key] = idbBin[key];
+                recovered[key] = idbBin[key];
+            }
+            backfillLocal(localSet, recovered);
+        }
+        return localBin;
+    };
+
+    // Write-through. The durable (IndexedDB) write is tracked synchronously at
+    // call time so a restart issued right after a fire-and-forget set() still
+    // flushes it; neither write may reject the caller (uBO's saveUserSettings
+    // et al. do not await).
+    vAPI.storage.set = function(bin, ...args) {
+        const localP = Promise.resolve(localSet(bin, ...args)).catch(( ) => {});
+        const idbP = trackDurable(idbSet(bin instanceof Object ? bin : {}));
+        return Promise.allSettled([ localP, idbP ]).then(( ) => {});
+    };
+
+    vAPI.storage.remove = function(keys, ...args) {
+        const localP = Promise.resolve(localRemove(keys, ...args)).catch(( ) => {});
+        const idbP = trackDurable(idbRemove(keys));
+        return Promise.allSettled([ localP, idbP ]).then(( ) => {});
+    };
+
+    vAPI.storage.clear = function(...args) {
+        const localP = Promise.resolve(localClear(...args)).catch(( ) => {});
+        const idbP = trackDurable(idbClear());
+        return Promise.allSettled([ localP, idbP ]).then(( ) => {});
+    };
+}
+
+/******************************************************************************/
+
+// Grey out "Enable cloud storage support".
+//
+// uBO's cloud storage IS chrome.storage.sync (Google-account sync). Chromium's
+// IsSyncable() excludes this force-installed off-store build from sync on two
+// counts -- policy/external install location and a non-gallery update URL -- so
+// the feature can never sync cross-device here; it would be a toggle that
+// silently does nothing. Flag it unsupported, which is uBO's own "cloud not
+// available on this platform" state: src/js/settings.js disables (greys) the
+// checkbox, src/js/messaging.js no-ops every cloud handler, and
+// src/js/cloud-ui.js leaves each per-pane cloud widget hidden. One assignment,
+// no upstream edit. chrome.storage.sync is reached only through vAPI.cloud, so
+// nothing else is affected. The Google-Drive-based cross-device sync design (the
+// only viable route) is recorded in docs/mv3-sync.md for later.
+µb.cloudStorageSupported = false;
+
+/******************************************************************************/
+
 // Visible degraded-state indicator on the toolbar icon.
 //
 // When network filtering is inert -- webRequest blocking not working (not
@@ -1426,7 +1709,13 @@ const applyBootState = ( ) => {
                 PS_DIR_KEY,
                 ...pageStores.dir.map(tabId => PS_KEY_PREFIX + tabId),
             ]).catch(( ) => { });
-            return restart.apply(this, args);
+            // Flush durable settings writes before the reload. Backup-restore
+            // and "reset all settings" issue fire-and-forget vAPI.storage.set()s
+            // and then restart synchronously; without this the service worker
+            // reloads before those writes reach IndexedDB and the restored
+            // settings are lost -- the reported "restore doesn't fully work".
+            return Promise.resolve(flushDurableSettingsWrites())
+                .then(( ) => restart.apply(this, args));
         };
     }
 }

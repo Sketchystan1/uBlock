@@ -1582,6 +1582,67 @@ section('port self-checks');
     }
 }
 
+// The durable settings storage (mv3-post.js) backs vAPI.storage with a
+// dedicated IndexedDB store, because chrome.storage.local does not persist
+// across a browser restart for this install type (same finding as the
+// first-install restart guard above). Lose it and every dashboard tab except
+// "My filters" -- which is durable only because it rides cacheStorage's own
+// IndexedDB -- reverts to defaults on the next launch, and backup restore
+// "doesn't fully work". Pin the write-through/read-fallback wrapper and the
+// restart flush that keeps backup-restore from racing the reload.
+{
+    const problems = [];
+    const pkg = readPkg('js/mv3-post.js');
+    const pins = [
+        [ 'const DB_NAME = \'uBlock0Settings\';', 'the dedicated durable settings database (must not be cacheStorage\'s)' ],
+        [ 'vAPI.storage.get = async function', 'the read-fallback get wrapper' ],
+        [ 'vAPI.storage.set = function', 'the write-through set wrapper' ],
+        [ 'vAPI.storage.remove = function', 'the write-through remove wrapper' ],
+        [ 'vAPI.storage.clear = function', 'the write-through clear wrapper' ],
+        [ 'flushDurableSettingsWrites', 'the pending-write flush hook' ],
+        [ 'Promise.resolve(flushDurableSettingsWrites())', 'the restart flush that lets backup-restore writes reach IndexedDB before the reload' ],
+    ];
+    for ( const [ needle, what ] of pins ) {
+        if ( pkg.includes(needle) ) { continue; }
+        problems.push(`js/mv3-post.js durable settings storage: ${what} is gone`);
+    }
+    if ( problems.length !== 0 ) {
+        fail('durable settings storage', problems.join('\n'),
+            'reconcile the durable-storage block in platform/chromium-mv3/mv3-post.js with docs/mv3-deployment.md');
+    } else {
+        pass('durable settings storage intact: IndexedDB-backed vAPI.storage, write-through, restart flush');
+    }
+}
+
+// Cloud storage is greyed out on this build (mv3-post.js sets
+// `µb.cloudStorageSupported = false`), because native chrome.storage.sync cannot
+// sync cross-device for a force-installed off-store extension (IsSyncable:
+// policy location + non-gallery update URL). Pin the override so the greyed-out
+// state cannot silently regress into a toggle that does nothing. The
+// Google-Drive-based re-enable plan lives in docs/mv3-sync.md.
+{
+    const problems = [];
+    const pkg = readPkg('js/mv3-post.js');
+    if ( pkg.includes('µb.cloudStorageSupported = false;') === false ) {
+        problems.push('js/mv3-post.js no longer forces µb.cloudStorageSupported = false; the non-functional cloud-storage toggle would be enabled again');
+    }
+    // The upstream paths the override relies on to grey out the UI and no-op the
+    // handlers -- if any of these drift, the override no longer achieves the
+    // greyed-out state and docs/mv3-sync.md must be reconciled.
+    if ( readRepo('src/js/settings.js').includes("dom.attr('[data-setting-name=\"cloudStorageEnabled\"]', 'disabled', '')") === false ) {
+        problems.push('src/js/settings.js no longer disables the cloud checkbox when cloudStorageSupported is false');
+    }
+    if ( readRepo('src/js/messaging.js').includes('µb.cloudStorageSupported !== true') === false ) {
+        problems.push('src/js/messaging.js no longer gates the cloud handlers on cloudStorageSupported');
+    }
+    if ( problems.length !== 0 ) {
+        fail('cloud storage greyed out', problems.join('\n'),
+            'reconcile the cloudStorageSupported override in platform/chromium-mv3/mv3-post.js with docs/mv3-sync.md');
+    } else {
+        pass('cloud storage greyed out: cloudStorageSupported=false pinned, upstream disable/no-op paths intact');
+    }
+}
+
 // The user-filter staleness fix (mv3-post.js) wraps `µb.saveUserFilters` so a
 // raw-asset change also rebuilds the engines, and wraps the scriptlet
 // engine's retrieve so its payload cache invalidates on a user-filters

@@ -272,10 +272,22 @@ The port aims at MV2 parity; where a difference could be closed it has been. Wha
 - **The MV2 `chromium` target still builds** (`tools/make-chromium.sh`) but no longer installs
   in Chrome 139+. It is left untouched on purpose; releases from this fork contain the MV3
   package only.
+- **"Cloud storage support" is greyed out.** uBO's cloud storage is `chrome.storage.sync` (Google-
+  account sync), which Chromium's `IsSyncable()` excludes for a force-installed off-store extension
+  (policy/external location + non-gallery update URL), so it can never sync cross-device here.
+  `mv3-post.js` forces `µb.cloudStorageSupported = false` (uBO's own "cloud unavailable" state), so
+  the Settings checkbox is disabled and the per-pane cloud widgets stay hidden rather than offering a
+  toggle that does nothing. Local settings still persist via the IndexedDB mirror above. The only
+  viable cross-device route — syncing uBO's export/import blob through **Google Drive** (OAuth) — is
+  designed in [docs/mv3-sync.md](mv3-sync.md), to be implemented when wanted.
 
 Robustness work that is invisible in normal operation, in brief: session-scope state (session
 dynamic rules, per-tab page stores, strict-block bypasses) survives service worker deaths via
-`chrome.storage.session` with byte-budgeted degradation; cold-wake events (context menu, update
+`chrome.storage.session` with byte-budgeted degradation; settings that must survive a browser
+restart (user settings, filter-list selection, trusted-site whitelist, permanent dynamic rules
+and switches, hidden settings) are mirrored into IndexedDB, because `chrome.storage.local` does
+not persist across restart for this install type — only "My filters", which rides cacheStorage's
+IndexedDB, would otherwise survive; cold-wake events (context menu, update
 notifications) are buffered and replayed; the offscreen worker relay is epoch-namespaced with a
 watchdog; a failed boot is audited and triggers exactly one extension reload per failure streak;
 and user-filter saves rebuild the engines immediately (deferred onto boot if the save lands
