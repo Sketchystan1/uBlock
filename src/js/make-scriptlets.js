@@ -216,11 +216,11 @@ export function commit(rulesetId, template) {
         );
         content = safeReplace(content,
             'self.$scriptletArglistRefs$',
-            `/* ${hostnames.length} */ ${JSON.stringify(hostnames.map(a => a[1]).join(';'))}`
+            `/* ${hostnames.length} */ ${JSON.stringify(hostnames.map(a => a[1]))}`
         );
         content = safeReplace(content,
             'self.$scriptletArglists$',
-            `/* ${arglists.size} */ ${JSON.stringify(Array.from(arglists.keys()).join(';'))}`
+            `/* ${arglists.size} */ ${JSON.stringify(Array.from(arglists.keys()))}`
         );
         content = safeReplace(content,
             'self.$scriptletArgs$',
@@ -259,15 +259,22 @@ export async function importScriptlet(details) {
         .join('');
     const funcName = `zeta_${digestStr}`;
     const { name } = details;
-    const entry = {
-        name: funcName,
-        code: `function ${funcName}() { // ${name}\n${funcBody}\n}`,
-        world: 'MAIN',
+    const code = /^function\s+[^(]+\(.*?\)\s*\{.*\}$/s.test(funcBody)
+        ? `function ${funcName}(...args) { // ${name}\n(${funcBody})(...args)\n}`
+        : `function ${funcName}() { // ${name}\n${funcBody}\n}`;
+    const entry = { name: funcName, code, world: details.world ?? 'MAIN',
         requiresTrust: details.requiresTrust === true,
     };
+    if ( Array.isArray(details.dependencies) ) {
+        entry.dependencies = [ ...details.dependencies ];
+    }
     resourceDetails.set(funcName, entry);
     resourceAliases.set(name, funcName);
-    if ( typeof details.alias === 'string' ) {
+    if ( Array.isArray(details.aliases) ) {
+        for ( const alias of details.aliases ) {
+            resourceAliases.set(alias, funcName);
+        }
+    } else if ( typeof details.alias === 'string' ) {
         resourceAliases.set(details.alias, funcName);
     } else if ( Array.isArray(details.alias) ) {
         for ( const alias of details.alias ) {
