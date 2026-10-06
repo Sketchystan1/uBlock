@@ -244,12 +244,6 @@ const onMessage = function(request, sender, callback) {
             if ( vAPI.net.canUncloakCnames !== true ) {
                 response.cnameUncloakEnabled = undefined;
             }
-            // Grey out + uncheck "Enable cloud storage support" exactly like
-            // "Uncloak canonical names" above: an undefined value makes
-            // settings.js take its generic disabled+unchecked path.
-            if ( µb.cloudStorageSupported !== true ) {
-                response.cloudStorageEnabled = undefined;
-            }
             response.canLeakLocalIPAddresses =
                 vAPI.browserSettings.canLeakLocalIPAddresses === true;
         }

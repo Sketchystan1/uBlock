@@ -251,6 +251,7 @@ This is belt-and-braces rather than a requirement.
 
 The port aims at MV2 parity; where a difference could be closed it has been. What remains:
 
+- **Scriptlet injection is two-phase and therefore not atomic.** MV2 injected the full scriptlet payload in a single synchronous `tabs.executeScript` call. MV3 `chrome.scripting` has no equivalent: isolated-world and main-world injections are two separate API calls. A page script that runs between them sees neither world's scriptlet state. In practice the window is microseconds (the two calls are dispatched back-to-back from the same `webNavigation.onCommitted` handler), and the earliest possible page script runs after HTML parsing, so the gap is rarely observable — but it is architectural and cannot be closed without a future MV3 API that combines both calls. See `platform/chromium-mv3/mv3-shims.js` (`prepareScriptletInjection`) and `mv3-post.js` (`injectFrameScriptlets`) for the two halves.
 - **`matchAboutBlank` is silently dropped.** MV3's `scripting` API has no equivalent
   (`matchOriginAsFallback` exists only on `registerContentScripts`). The declarative content
   script keeps `match_about_blank: true`, so `contentscript.js` still runs in `about:blank`
@@ -277,8 +278,9 @@ The port aims at MV2 parity; where a difference could be closed it has been. Wha
   (policy/external location + non-gallery update URL), so it can never sync cross-device here.
   `mv3-post.js` forces `µb.cloudStorageSupported = false`, so the cloud handlers no-op and the per-pane
   cloud widgets stay hidden; the Settings checkbox is greyed out and unchecked the same way as
-  "Uncloak canonical names" (`messaging.js` sends `cloudStorageEnabled = undefined`, so `settings.js`
-  disables the `.checkbox` wrapper — greying the whole label — and leaves it unchecked) rather than
+  "Uncloak canonical names" — `mv3-post.js` wraps `vAPI.messaging.defaultHandler` (after `messaging.js`
+  registers it) to send `cloudStorageEnabled = undefined`, so `settings.js` disables the `.checkbox`
+  wrapper — greying the whole label — and leaves it unchecked, rather than
   offering a toggle that does nothing. Local settings still persist via the IndexedDB mirror above.
   The only viable cross-device route — syncing uBO's export/import blob through **Google Drive**
   (OAuth) — is designed in [docs/mv3-sync.md](mv3-sync.md), to be implemented when wanted.
@@ -289,7 +291,11 @@ dynamic rules, per-tab page stores, strict-block bypasses) survives service work
 restart (user settings, filter-list selection, trusted-site whitelist, permanent dynamic rules
 and switches, hidden settings) are mirrored into IndexedDB, because `chrome.storage.local` does
 not persist across restart for this install type — only "My filters", which rides cacheStorage's
-IndexedDB, would otherwise survive; cold-wake events (context menu, update
+IndexedDB, would otherwise survive; if IndexedDB itself becomes unavailable (storage quota
+exhaustion, private-browsing profiles that ban it, or browser corruption), the wrapper degrades
+silently to the original `chrome.storage.local`-only behavior rather than crashing — settings
+are not lost mid-session, they simply do not persist across the next restart (the same state as
+before the mirror was added); cold-wake events (context menu, update
 notifications) are buffered and replayed; the offscreen worker relay is epoch-namespaced with a
 watchdog; a failed boot is audited and triggers exactly one extension reload per failure streak;
 and user-filter saves rebuild the engines immediately (deferred onto boot if the save lands

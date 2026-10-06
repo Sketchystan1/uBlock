@@ -389,6 +389,36 @@ let flushDurableSettingsWrites = ( ) => Promise.resolve();
 // cross-device sync design (the only viable route) is recorded in docs/mv3-sync.md.
 µb.cloudStorageSupported = false;
 
+// Grey out + uncheck "Enable cloud storage support" in Settings, the same way
+// "Uncloak canonical names" is greyed when cname-uncloaking is unavailable.
+// Upstream src/js/messaging.js sends `cloudStorageEnabled = undefined` from
+// within the `userSettings` handler, which makes settings.js take the generic
+// disabled+unchecked path. Rather than patching that upstream file (which
+// reopens the merge-conflict surface), we wrap its already-registered default
+// message handler here: vAPI.messaging.defaultHandler is set by messaging.js's
+// vAPI.messaging.setup() call, which evaluates during start.js, before this
+// module runs. The wrapper intercepts only `userSettings` replies and is
+// otherwise transparent.
+{
+    const origHandler = vAPI.messaging.defaultHandler;
+    if ( typeof origHandler === 'function' ) {
+        vAPI.messaging.defaultHandler = function(request, sender, callback) {
+            if ( request.what !== 'userSettings' ) {
+                return origHandler(request, sender, callback);
+            }
+            return origHandler(request, sender, function(response) {
+                if (
+                    response instanceof Object &&
+                    µb.cloudStorageSupported !== true
+                ) {
+                    response.cloudStorageEnabled = undefined;
+                }
+                callback(response);
+            });
+        };
+    }
+}
+
 /******************************************************************************/
 
 // Visible degraded-state indicator on the toolbar icon.

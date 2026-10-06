@@ -1588,22 +1588,38 @@ section('port self-checks');
 // `µb.cloudStorageSupported = false`), because native chrome.storage.sync cannot
 // sync cross-device for a force-installed off-store extension (IsSyncable:
 // policy location + non-gallery update URL). The checkbox is greyed + unchecked
-// the SAME way as "Uncloak canonical names": messaging.js sends
-// `cloudStorageEnabled = undefined` so settings.js takes its generic
-// disabled+unchecked path. Pin the override and both greying paths so the state
-// cannot silently regress. The Google-Drive re-enable plan lives in docs/mv3-sync.md.
+// the SAME way as "Uncloak canonical names": a `cloudStorageEnabled = undefined`
+// reply makes settings.js take its generic disabled+unchecked path.
+//
+// Rather than patching upstream src/js/messaging.js (which reopens the
+// merge-conflict surface), mv3-post.js wraps vAPI.messaging.defaultHandler after
+// messaging.js registers it, intercepting `userSettings` replies and zeroing
+// cloudStorageEnabled when cloudStorageSupported is false. Pin the override,
+// the wrapper, and the settings.js greying path so the state cannot silently
+// regress. The Google-Drive re-enable plan lives in docs/mv3-sync.md.
 {
     const problems = [];
     const pkg = readPkg('js/mv3-post.js');
     if ( pkg.includes('µb.cloudStorageSupported = false;') === false ) {
         problems.push('js/mv3-post.js no longer forces µb.cloudStorageSupported = false; the non-functional cloud-storage toggle would be enabled again');
     }
-    const messaging = readRepo('src/js/messaging.js');
-    if ( messaging.includes('µb.cloudStorageSupported !== true') === false ) {
-        problems.push('src/js/messaging.js no longer gates the cloud handlers on cloudStorageSupported');
+    if ( pkg.includes('vAPI.messaging.defaultHandler') === false ) {
+        problems.push('js/mv3-post.js no longer wraps vAPI.messaging.defaultHandler to grey out the cloud-storage checkbox; the patch must live here, not in src/js/messaging.js');
     }
-    if ( messaging.includes('response.cloudStorageEnabled = undefined;') === false ) {
-        problems.push('src/js/messaging.js no longer sends cloudStorageEnabled=undefined; the cloud checkbox would not grey out like "Uncloak canonical names"');
+    if ( pkg.includes('response.cloudStorageEnabled = undefined;') === false ) {
+        problems.push('js/mv3-post.js defaultHandler wrapper no longer zeros cloudStorageEnabled; the cloud checkbox would not grey out like "Uncloak canonical names"');
+    }
+    // Assert that messaging.js is unmodified: the greying is now done by the
+    // wrapper above. If the old patch reappears in messaging.js, the two paths
+    // would double-apply (harmless but confusing) and the "port modifies no
+    // upstream file" invariant would be violated again.
+    const messaging = readRepo('src/js/messaging.js');
+    if (
+        messaging.includes('Grey out + uncheck "Enable cloud storage support"') ||
+        (messaging.includes('cloudStorageEnabled = undefined') &&
+         messaging.includes('cloudStorageSupported !== true'))
+    ) {
+        problems.push('src/js/messaging.js still contains the old cloud-storage greying patch; remove it -- the wrapper in mv3-post.js handles this now (upstream file must be unmodified)');
     }
     // The generic disabled+unchecked path settings.js applies to an
     // undefined-valued bool setting -- the same one that greys "Uncloak
@@ -1613,9 +1629,9 @@ section('port self-checks');
     }
     if ( problems.length !== 0 ) {
         fail('cloud storage greyed out', problems.join('\n'),
-            'reconcile the cloudStorageSupported override in platform/chromium-mv3/mv3-post.js with docs/mv3-sync.md');
+            'reconcile the cloudStorageSupported override and defaultHandler wrapper in platform/chromium-mv3/mv3-post.js with docs/mv3-sync.md');
     } else {
-        pass('cloud storage greyed out: cloudStorageSupported=false pinned, greyed+unchecked like cname-uncloak (messaging undefined + settings generic path)');
+        pass('cloud storage greyed out: cloudStorageSupported=false pinned, defaultHandler wrapper in mv3-post.js zeros cloudStorageEnabled, settings.js generic greying path intact');
     }
 }
 

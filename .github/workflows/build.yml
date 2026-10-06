@@ -47,8 +47,19 @@ jobs:
         # yields ~130 pre-existing no-undef errors. Gating on it would mean
         # editing eslint.config.mjs, and this port deliberately modifies no
         # existing file so that upstream merges cannot conflict.
+        # Output is captured as an artifact so regressions are visible without
+        # failing the build.
+        id: upstream-lint
         continue-on-error: true
-        run: npm run lint
+        run: npm run lint 2>&1 | tee /tmp/upstream-lint.txt; exit ${PIPESTATUS[0]}
+
+      - name: Upload upstream lint report
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: upstream-lint-report
+          path: /tmp/upstream-lint.txt
+          if-no-files-found: ignore
 
       - name: Fork lint
         # GATED (no continue-on-error). Lints ONLY the fork's own files with a

@@ -77,8 +77,10 @@ const retireEpoch = epoch => {
     if ( epoch === '' ) { return; }
     retiredEpochs.add(epoch);
     // Bounded: an epoch can never come back, but a document that outlives
-    // many service worker lifetimes must not accumulate them forever.
-    if ( retiredEpochs.size > 16 ) {
+    // many service worker lifetimes must not accumulate them forever. 32 covers
+    // a laptop that rarely reboots cycling through many worker restarts without
+    // leaking retired ids indefinitely.
+    if ( retiredEpochs.size > 32 ) {
         retiredEpochs.delete(retiredEpochs.values().next().value);
     }
 };

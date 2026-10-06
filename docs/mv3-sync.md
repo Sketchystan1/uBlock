@@ -21,14 +21,17 @@ browser-level exclusion; nothing the extension does flips it on stock Chrome. (P
 
 ## Current state on this build
 `mv3-post.js` forces `µb.cloudStorageSupported = false`, so the feature is genuinely off:
-`src/js/messaging.js` no-ops every cloud handler and `src/js/cloud-ui.js` leaves each per-pane cloud
-widget hidden. The Settings checkbox is greyed out and unchecked **exactly like "Uncloak canonical
-names"**: `messaging.js` sends `cloudStorageEnabled = undefined` when unsupported (mirroring
-`cnameUncloakEnabled = undefined`), so `settings.js` takes its generic disabled+unchecked path — it
-disables the `.checkbox` wrapper, which `common.css` greys via `.checkbox[disabled]` (greying the
-whole label, not just the input). Pinned by `tools/verify-mv3-package.mjs` ("cloud storage greyed
-out"). Local settings persistence is separate and unaffected (the IndexedDB `storage.local` mirror in
-`mv3-post.js`).
+`src/js/cloud-ui.js` leaves each per-pane cloud widget hidden. The Settings checkbox is greyed out
+and unchecked **exactly like "Uncloak canonical names"**: `mv3-post.js` wraps
+`vAPI.messaging.defaultHandler` (after `messaging.js` registers it via `vAPI.messaging.setup()`)
+to send `cloudStorageEnabled = undefined` for `userSettings` replies — mirroring the
+`cnameUncloakEnabled = undefined` path for cname-uncloaking — so `settings.js` takes its generic
+disabled+unchecked path: it disables the `.checkbox` wrapper, which `common.css` greys via
+`.checkbox[disabled]` (greying the whole label, not just the input). The wrapper lives in
+`mv3-post.js` rather than in a patch to `src/js/messaging.js`, so upstream's file remains
+unmodified and the "port adds files, modifies none" zero-conflict invariant holds. Pinned by
+`tools/verify-mv3-package.mjs` ("cloud storage greyed out"). Local settings persistence is
+separate and unaffected (the IndexedDB `storage.local` mirror in `mv3-post.js`).
 
 ## Chosen approach: keep uBO's Cloud UI, swap the transport to Google Drive
 Most-similar-to-upstream: keep uBO's Cloud storage feature **unchanged** — the per-pane widget

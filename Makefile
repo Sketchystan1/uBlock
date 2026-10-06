@@ -3,6 +3,7 @@ run_options := $(filter-out $@,$(MAKECMDGOALS))
 
 .PHONY: all clean cleanassets test lint chromium opera firefox npm dig \
 	mv3-chromium mv3-firefox mv3-edge mv3-safari ubol-codemirror \
+	chromium-mv3-fork \
 	compare maxcost medcost mincost modifiers record wasm \
 	publish-chromium publish-edge publish-firefox \
 	publish-dev-chromium publish-dev-firefox \
@@ -89,6 +90,22 @@ dist/build/uBOLite.safari: tools/make-mv3.sh $(mv3-sources) $(mv3-safari-deps) $
 	tools/make-mv3.sh safari
 
 mv3-safari: ubol-codemirror dist/build/uBOLite.safari
+
+fork-mv3-sources := \
+	$(shell find ./src -type f) \
+	$(wildcard platform/chromium/*) \
+	$(wildcard platform/chromium-mv3/*) \
+	$(wildcard platform/common/*) \
+	$(shell find ./tools -name 'make-chromium-mv3*' -o -name 'patch-mv3-modules*' \
+	              -o -name 'verify-mv3-package*' -o -name 'make-crx*' \
+	              -o -name 'copy-common-files*') \
+	dist/version
+
+dist/build/uBlock0.chromium-mv3: tools/make-chromium-mv3.sh $(fork-mv3-sources) $(assets)
+	bash tools/make-chromium-mv3.sh
+
+# Build the full-featured Chromium MV3 extension (this fork's port).
+chromium-mv3-fork: dist/build/uBlock0.chromium-mv3
 
 dist/build/uAssets:
 	tools/pull-assets.sh
