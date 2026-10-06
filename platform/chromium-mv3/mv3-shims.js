@@ -60,9 +60,8 @@
 import '../lib/lz4/lz4-block-codec-js.js';
 import '../lib/lz4/lz4-block-codec-wasm.js';
 
-// Pure modules, safe to import here: neither touches `chrome.*` nor the
-// DOM, so neither can depend on a shim this file has not installed yet.
-import { decodeScriptletMarker } from './mv3-scriptlet-marker.js';
+// Pure module, safe to import here: it touches neither `chrome.*` nor the
+// DOM, so it cannot depend on a shim this file has not installed yet.
 // Generated into the package by tools/patch-mv3-modules.mjs (it does not
 // exist in the source tree): which file of the sharded scriptlet libraries
 // defines each function, per world. See the scriptlet-injection section
@@ -1493,9 +1492,10 @@ const targetFromDetails = details => {
 // Scriptlet injection under MV3 has to reproduce what MV2's scriptlets
 // observably did -- deliver on strict-CSP pages -- and live testing has now
 // mapped the whole mechanism. MV2 never injected into the page's MAIN world:
-// `chrome.tabs.executeScript({code})` ran the wrapper in that API's isolated
-// world, whose element insertions were *exempt from the page's CSP*. That is
-// the only world kind with the exemption, and the API is gone. On MV3:
+// `chrome.tabs.executeScript({code})` ran upstream's program in that API's
+// isolated world, whose element insertions were *exempt from the page's
+// CSP*. That is the only world kind with the exemption, and the API is gone.
+// On MV3:
 // - a `<script>` element created from a static content-script world is
 //   governed by the PAGE's CSP (blocked on `script-src 'self'` pages);
 // - a `<script>` element created from a `chrome.scripting` ISOLATED world is
@@ -1511,23 +1511,21 @@ const targetFromDetails = details => {
 // scriptlet *functions* -- which are static, all of them registered in
 // `js/resources/scriptlets.js` -- ship as generated classic-script files,
 // and the dynamic part (which functions to call, with which arguments) is
-// handed to them out of band. The program `src/js/scriptlet-filtering.js`
-// assembles is demoted from code to data (`mv3-post.js` prefixes it with a
-// marker carrying the parsed calls for both worlds, the per-document
-// scriptlet globals, the filters that fired and the logger channel name --
-// see `./mv3-scriptlet-marker.js`), and `executeCode()` below performs, in
-// MV2's own order -- relay, wrapper, isolated injector -- what MV2's single
-// injection performed:
+// handed to them out of band. Upstream's assembled program is never run
+// (see `./vapi-scripting.js`): `mv3-post.js` resolves each committed
+// frame's scriptlet calls from the engine itself and passes them, with the
+// registered scriptlet globals and the logger channel name, to
+// `injectScriptlets()` below, which performs, in MV2's own order -- relay,
+// guards, main world, isolated world -- what MV2's single injection
+// performed:
 //
 // 1. `ISOLATED`, beside `contentscript.js`: one func which installs the
 //    scriptlet->logger relay -- MV2's `uBO_bcSecret` BroadcastChannel, which
 //    carries log lines from the scriptlets (in the page) to `vAPI.messaging`
-//    (which exists only here) -- applies MV2's once-per-document + hostname
-//    guards, records `self.uBO_scriptletsInjected` where its two readers
-//    (`src/js/contentscript.js`, `src/js/scriptlets/cosmetic-report.js`)
-//    look for it, and hands each world's launch record to its library (see
-//    step 2 for how). Its return value says whether this call won the right
-//    to inject.
+//    (which exists only here) -- applies the once-per-document + hostname
+//    guards upstream's isolated wrapper applies, and hands each world's
+//    launch record to its library (see step 2 for how). Its return value
+//    says whether this call won the right to inject.
 //
 // 2. The generated sharded libraries, injected as FILES (CSP-exempt, no
 //    elements, no eval). One `chrome.scripting` call per world that fired,
@@ -1587,18 +1585,18 @@ const targetFromDetails = details => {
 // Passed to `chrome.scripting.executeScript({ func })`, which stringifies it
 // -- so it must stay free of references to anything in this module's scope.
 //
-// The relay half mirrors `onScriptletMessageInjector` in
-// `src/js/scriptlet-filtering.js`, the guards and markers mirror the
-// Chromium `vAPI.scriptletsInjector` wrapper, and the two launch records
-// stand in for the wrapper's element insertion and the isolated-world
-// injector that ran after it -- so the observable state and the message
-// handling behave exactly as they did under MV2. `name` is empty when the
-// logger is off; MV2 injected no relay in that case either. `mainCalls` and
-// `calls` carry uBOL-style interned arguments: their arg lists are index
-// arrays into `args`, and the libraries resolve them before invoking (the
-// encoding is chosen in `mv3-post.js`, see `internScriptletArgs` there).
+// The relay half mirrors `initCommChannel` in `src/js/scriptlet-filtering.js`,
+// the guards mirror the wrapper `platform/chromium/vapi-scripting.js` runs
+// (`self.vapiScripting`, once per document), and the two launch records
+// stand in for that wrapper's isolated-world code and its element insertion
+// of the main-world code -- so the observable state and the message handling
+// behave as they do under MV2. `name` is empty when the logger is off;
+// upstream sets up no relay in that case either. `mainCalls` and `calls`
+// carry uBOL-style interned arguments: their arg lists are index arrays into
+// `args`, and the libraries resolve them before invoking (the encoding is
+// chosen in `mv3-post.js`, see `internScriptletArgs` there).
 const prepareScriptletInjection = (
-    name, hostname, filters, isolatedOnly, mainCalls, args, globals, calls
+    name, hostname, mainCalls, args, globals, calls
 ) => {
     // Scriptlet -> logger relay. Idempotent, because a frame can be injected
     // into more than once (uBO re-injects when the logger's level changes, for
@@ -1628,37 +1626,30 @@ const prepareScriptletInjection = (
         } catch {
         }
     }
-    // Once-per-document + hostname guards, and the markers they leave behind.
-    // A document with only isolated-world scriptlets never had
-    // `uBO_scriptletsInjected` set under MV2 -- `vAPI.scriptletsInjector` was
-    // not called for it, so the popup panel did not list those filters either
-    // -- so `uBO_isolatedScriptlets` stands in for the same purpose instead.
-    // When both worlds fired, MV2 left both markers; so does this.
-    if ( isolatedOnly === true ) {
-        if ( self.uBO_isolatedScriptlets === 'done' ) { return false; }
-    } else if ( self.uBO_scriptletsInjected !== undefined ) {
-        return false;
-    }
+    // Once-per-document + hostname guards. A frame can be offered the same
+    // injection twice -- the launch-time sweep in `mv3-post.js` races the
+    // navigations it covers -- and scriptlets must never run twice.
+    if ( self.vapiScripting ) { return false; }
     const doc = document;
     const loc = doc.location;
     if ( loc === null ) { return false; }
     if ( loc.hostname !== '' && loc.hostname !== hostname ) { return false; }
-    // The wrapper's half: the main-world launch record. Handed to the
-    // MAIN-world library files through a synchronous CustomEvent handshake
-    // instead of a DOM data attribute: Chromium structured-clones
-    // `CustomEvent.detail` across worlds (expando properties still do not
-    // cross), so the record -- already plain data, it arrives here as
-    // `executeScript` args -- travels as an event payload with no DOM
-    // mutation at all. The MAIN-world shared file dispatches a fixed-name
-    // 'uBOmv3MainReady' event whose detail is a fresh unguessable data-event
-    // id; this listener, registered before that file can possibly run (it
-    // injects in the second executeScript round, below), answers
-    // synchronously with the record as that id's event detail, during the
-    // shared file's own dispatchEvent. The library files are CSP-exempt
+    self.vapiScripting = true;
+    // The main-world launch record. Handed to the MAIN-world library files
+    // through a synchronous CustomEvent handshake instead of a DOM data
+    // attribute: Chromium structured-clones `CustomEvent.detail` across worlds
+    // (expando properties still do not cross), so the record -- already plain
+    // data, it arrives here as `executeScript` args -- travels as an event
+    // payload with no DOM mutation at all. The MAIN-world shared file
+    // dispatches a fixed-name 'uBOmv3MainReady' event whose detail is a fresh
+    // unguessable data-event id; this listener, registered before that file
+    // can possibly run (it injects in the second executeScript round, below),
+    // answers synchronously with the record as that id's event detail, during
+    // the shared file's own dispatchEvent. The library files are CSP-exempt
     // file-class injections, which is what makes scriptlets deliver on
     // strict-CSP pages exactly as MV2 delivered them. Skipped wholesale when
     // there are no main-world calls.
-    if ( isolatedOnly !== true && Array.isArray(mainCalls) && mainCalls.length !== 0 ) {
+    if ( Array.isArray(mainCalls) && mainCalls.length !== 0 ) {
         const record = { globals, args, calls: mainCalls };
         self.addEventListener('uBOmv3MainReady', ev => {
             const dataId = ev.detail;
@@ -1666,34 +1657,25 @@ const prepareScriptletInjection = (
             ev.stopImmediatePropagation();
             self.dispatchEvent(new CustomEvent(dataId, { detail: record }));
         }, { once: true, capture: true });
-        self.uBO_scriptletsInjected = filters;
-    } else if ( isolatedOnly === true ) {
-        self.uBO_isolatedScriptlets = 'done';
     }
-    // The isolated-world injector's half: stash the calls for the library
-    // file to consume. MV2 ran that injector after the wrapper in the same
-    // program; the stash is its stand-in. Same world, so no DOM record is
-    // needed.
+    // The isolated-world launch record: stash the calls for the library file
+    // to consume. Same world, so no DOM record is needed.
     if ( Array.isArray(calls) && calls.length !== 0 ) {
-        self.uBO_isolatedScriptlets = 'done';
         self.uBO_mv3IsolatedLaunch = { globals, args, calls };
     }
     return true;
 };
 
-// Scriptlet code arrives as a string carrying a marker; both are data, and
-// only the func and the generated library files above ever execute.
-//
 // Compute the files array for one world's library injection: the shared
 // file first, the shards holding called functions in name order, and the
 // launcher last (files are injected in array order, and the launcher must
 // run after every shard has registered its functions). Returns `undefined`
 // when a called function cannot be located -- in which case the whole
-// world's call set is dropped rather than running a partial one, the same
-// all-or-nothing rule `parseScriptletCalls()` in `mv3-post.js` applies to
-// the payload itself. `tools/verify-mv3-package.mjs` pins the manifest
-// against the resource table, so this should be unreachable; the error is
-// loud precisely so that it is not silently unreachable.
+// world's call set is dropped rather than running a partial one.
+// `mv3-post.js` only hands over calls whose function is in the manifest, and
+// `tools/verify-mv3-package.mjs` pins the manifest against the resource
+// table, so this should be unreachable; the error is loud precisely so that
+// it is not silently unreachable.
 const libraryFilesFor = (world, calls) => {
     const spec = scriptletShards instanceof Object
         ? scriptletShards[world]
@@ -1797,82 +1779,54 @@ const injectLibraryFiles = async (where, options) => {
     }
 };
 
-const executeCode = async details => {
-    const target = targetFromDetails(details);
-    const injectImmediately = details.runAt === 'document_start';
-
-    let marker;
-    try {
-        marker = decodeScriptletMarker(details.code).details;
-    } catch (reason) {
-        console.error(`uBO: scriptlet filters marker: ${reason}`);
-    }
-    if ( marker === undefined ) {
-        // With `mv3-post.js` in place, every scriptlet injection carries a
-        // marker, including documents where only isolated-world scriptlets
-        // fired. Anything else is not a scriptlet injection, and there is no
-        // code-string API left to run it with -- so refuse rather than guess.
-        console.error('uBO: code injection without a scriptlet marker was not injected');
-        return [];
-    }
-
-    // The `filters` guard is not paranoia about a value uBO always supplies --
-    // it is about what happens if it ever does not. `executeScript` serializes
-    // args as JSON, so an absent `filters` would arrive as `null`, which is
-    // `!== undefined` and so counts as a set marker; then
-    // `cosmetic-report.js` does `matchedSelectors.push(...null)` and throws,
-    // taking the popup's cosmetic report with it. An empty array degrades to
-    // a harmless "no scriptlet filters to report".
-    let filters = [];
-    if ( Array.isArray(marker.filters) ) {
-        filters = marker.filters;
-    } else {
-        console.error(
-            `uBO: scriptlet filters marker carried no filter array: ${JSON.stringify(marker.filters)}`
-        );
-    }
-    const calls = Array.isArray(marker.isolatedCalls)
-        ? marker.isolatedCalls
+// Inject one frame's scriptlets. Called by `mv3-post.js`, which resolves the
+// frame's calls from uBO's engine (see the design note above):
+// - `target`: a `chrome.scripting` InjectionTarget naming exactly one frame
+//   or document;
+// - `hostname`: the hostname the calls were resolved for, which the func
+//   re-checks against the document it lands in;
+// - `bcSecret`: the logger relay's channel name, empty when the logger is off;
+// - `globals`: the registered `scriptletGlobals`;
+// - `args`, `mainCalls`, `isolatedCalls`: the interned call sets.
+const injectScriptlets = async details => {
+    const { target } = details;
+    if ( target instanceof Object === false ) { return []; }
+    const injectImmediately = true;
+    const calls = Array.isArray(details.isolatedCalls)
+        ? details.isolatedCalls
         : [];
-    const mainCalls = Array.isArray(marker.mainCalls)
-        ? marker.mainCalls
+    const mainCalls = Array.isArray(details.mainCalls)
+        ? details.mainCalls
         : [];
     // The interned-argument table both call sets index into (see
     // `internScriptletArgs` in mv3-post.js). Consumers resolve indices
     // before invoking.
-    const args = Array.isArray(marker.args)
-        ? marker.args
+    const args = Array.isArray(details.args)
+        ? details.args
         : [];
-    const globals = marker.scriptletGlobals instanceof Object
-        ? marker.scriptletGlobals
+    const globals = details.globals instanceof Object
+        ? details.globals
         : {};
     if ( mainCalls.length === 0 && calls.length === 0 ) { return []; }
 
     // One func does everything MV2's single injection did, in its order:
-    // relay, guards, the markers, the CustomEvent handshake listener for the
-    // MAIN-world library and the stash for the isolated-world one. Its return value
-    // says which frames won the right to inject -- `src/js/messaging.js`
-    // treats `needScriptlets` (derived from `uBO_scriptletsInjected`) as
-    // "nothing has been injected here yet", and for non-network URIs that
-    // message is the *only* path which injects at all, so the marker must
-    // never land in a frame whose injection then did not happen.
+    // relay, guards, the CustomEvent handshake listener for the MAIN-world
+    // library and the stash for the isolated-world one. Its return value
+    // says which frames won the right to inject.
     // First of two chrome.scripting round trips: this func runs (guards,
-    // markers, the DOM launch record), we await its result, then the library
-    // files inject below. MV2 did both in one synchronous injection; MV3 has
-    // no single call that runs a decision func AND conditionally injects files
-    // from its result, so the split -- and the small window between the two --
-    // is an accepted limitation, not a bug to collapse. See the design note
-    // above.
+    // launch records), we await its result, then the library files inject
+    // below. MV2 did both in one synchronous injection; MV3 has no single
+    // call that runs a decision func AND conditionally injects files from its
+    // result, so the split -- and the small window between the two -- is an
+    // accepted limitation, not a bug to collapse. See the design note above.
     const prepared = await chrome.scripting.executeScript({
         target,
         injectImmediately,
         world: 'ISOLATED',
         func: prepareScriptletInjection,
         args: [
-            typeof marker.bcSecret === 'string' ? marker.bcSecret : '',
-            typeof marker.hostname === 'string' ? marker.hostname : '',
-            filters,
-            marker.isolatedOnly === true,
+            typeof details.bcSecret === 'string' ? details.bcSecret : '',
+            typeof details.hostname === 'string' ? details.hostname : '',
             mainCalls,
             args,
             globals,
@@ -1938,9 +1892,8 @@ const executeCode = async details => {
     if ( injections.length === 0 ) { return prepared; }
     // The two worlds are injected in parallel -- see the design comment
     // above for why cross-world ordering carries no observable semantics.
-    // The return value keeps the old shape: the results of the LAST world
-    // that fired and succeeded (the isolated-world one when both did),
-    // falling back to `prepared`.
+    // The results of the LAST world that fired and succeeded (the
+    // isolated-world one when both did), falling back to `prepared`.
     const results = await Promise.all(injections);
     let lastResults = prepared;
     for ( const result of results ) {
@@ -1949,13 +1902,16 @@ const executeCode = async details => {
     return lastResults;
 };
 
+// Consumed by mv3-post.js.
+export { injectScriptlets as mv3InjectScriptlets };
+
 const executeFile = async details => {
     // uBO passes both `/js/foo.js` and `js/foo.js`; MV2 accepted either.
     // `chrome.scripting` documents paths as relative to the extension root,
     // so normalize to that form. Everything runs in the `ISOLATED` world,
     // alongside `contentscript.js` -- the cross-world state the scriptlet
-    // helpers read (`uBO_bcSecret`, `uBO_scriptletsInjected`) is written
-    // there by `prepareScriptletInjection` above.
+    // helpers read (`uBO_bcSecret`) is written there by
+    // `prepareScriptletInjection` above.
     const file = details.file.replace(/^\/+/, '');
     return chrome.scripting.executeScript({
         files: [ file ],
@@ -1965,11 +1921,15 @@ const executeFile = async details => {
 };
 
 chrome.tabs.executeScript = function(tabId, details, callback) {
-    const injection = Object.assign({ tabId }, details);
-    const promise = typeof details.code === 'string'
-        ? executeCode(injection)
-        : executeFile(injection);
-    promise.then(results => {
+    // Code strings have no MV3 API left to run them with. Upstream's only
+    // Chromium caller is `platform/chromium/vapi-scripting.js`, which this
+    // port replaces; anything else is refused loudly rather than guessed at.
+    if ( typeof details.code === 'string' ) {
+        console.error('uBO: code-string injection is not possible under MV3 and was not injected');
+        callback([]);
+        return;
+    }
+    executeFile(Object.assign({ tabId }, details)).then(results => {
         // MV2 resolved to an array of raw return values, MV3 wraps each one in
         // an InjectionResult. uBO expects the MV2 shape.
         callback(Array.isArray(results) ? results.map(a => a?.result) : []);

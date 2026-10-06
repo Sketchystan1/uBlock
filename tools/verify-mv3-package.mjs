@@ -52,6 +52,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
@@ -147,8 +148,8 @@ const REQUIRED_FILES = [
     'js/mv3-shims.js',
     'js/mv3-post.js',
     'js/mv3-popup-banner.js',
-    'js/mv3-scriptlet-marker.js',
     'js/mv3-scriptlet-shards.js',
+    'js/vapi-scripting.js',
     'js/mv3-scriptlet-shared.js',
     'js/mv3-scriptlet-launch.js',
     'js/mv3-mainworld-shared-core.js',
@@ -592,43 +593,44 @@ section('upstream drift');
 // files), alongside `contentscript.js`. The cross-world state some of them
 // read is written there by the injection func in mv3-shims.js:
 // `self.uBO_bcSecret` by the scriptlet->logger relay (read by
-// `scriptlet-loglevel-*.js`), and `self.uBO_scriptletsInjected` /
-// `self.uBO_isolatedScriptlets` by the once-per-document guard (read by
-// `contentscript.js` and `scriptlets/cosmetic-report.js`). The scriptlets
-// themselves run through the two generated libraries: the isolated-world set
-// from a stash at `self.uBO_mv3IsolatedLaunch`, and the main-world set from a
-// launch record the func hands over through a synchronous CustomEvent
-// handshake -- a fixed-name 'uBOmv3MainReady' event whose answer (carrying
-// the record as a structured-cloned detail on an unguessable event id) is
-// the only state that crosses from the isolated world into the page. Both libraries are file-class injections, which run
+// `scriptlet-loglevel-*.js`), and `self.vapiScripting` by the
+// once-per-document guard, as upstream's Chromium `vapi-scripting.js` wrapper
+// does. The scriptlets themselves run through the two generated libraries:
+// the isolated-world set from a stash at `self.uBO_mv3IsolatedLaunch`, and the
+// main-world set from a launch record the func hands over through a
+// synchronous CustomEvent handshake -- a fixed-name 'uBOmv3MainReady' event
+// whose answer (carrying the record as a structured-cloned detail on an
+// unguessable event id) is the only state that crosses from the isolated world
+// into the page. Both libraries are file-class injections, which run
 // CSP-exempt in their worlds; no `<script>` element is ever created, because
 // every world MV3 offers governs element creation with some CSP (the page's
 // from MAIN, the extension's own from ISOLATED) -- MV2's element exemption
 // died with tabs.executeScript.
 //
-// This check pins that whole shape: the relay, guards, DOM launch-record
-// writer and stash all live inside the single `prepareScriptletInjection`
-// func; mv3-shims.js contains exactly one `world:'MAIN'` occurrence (the
-// mainworld library file call) and no `createElement` at all; both libraries
-// exist, carry their halves of the protocol, and define the dependency every
-// scriptlet shares; and no `chrome.userScripts` call survived anywhere -- the
-// permission is no longer declared, so any surviving call would throw.
+// This check pins that whole shape: the relay, guard, launch-record handshake
+// and stash all live inside the single `prepareScriptletInjection` func;
+// mv3-shims.js contains exactly one `world:'MAIN'` occurrence (the mainworld
+// library file call) and no `createElement` at all; mv3-post.js drives it per
+// committed frame; both libraries exist, carry their halves of the protocol,
+// and define the dependency every scriptlet shares; and no
+// `chrome.userScripts` call survived anywhere -- the permission is no longer
+// declared, so any surviving call would throw.
 {
     const shims = readRepo('platform/chromium-mv3/mv3-shims.js');
     const post = readRepo('platform/chromium-mv3/mv3-post.js');
     const problems = [];
     // The single injection func: everything from its declaration to
-    // `executeCode` is its region, and every world-touching piece must be
+    // `injectScriptlets` is its region, and every world-touching piece must be
     // in it.
-    const funcRegion = /const prepareScriptletInjection = \([\s\S]*?\nconst executeCode/.exec(shims);
+    const funcRegion = /const prepareScriptletInjection = \([\s\S]*?\nconst injectScriptlets/.exec(shims);
     if ( funcRegion === null ) {
         problems.push('mv3-shims.js: cannot locate the prepareScriptletInjection func');
     } else {
         const region = funcRegion[0];
         const inFunc = [
             [ /new self\.BroadcastChannel\(name\)/, 'the scriptlet->logger relay' ],
-            [ /self\.uBO_scriptletsInjected\s*=\s*filters/, 'the uBO_scriptletsInjected marker' ],
-            [ /self\.uBO_isolatedScriptlets\s*=\s*'done'/, 'the uBO_isolatedScriptlets marker' ],
+            [ /if \( self\.vapiScripting \) \{ return false; \}/, 'the once-per-document guard' ],
+            [ /self\.vapiScripting = true;/, 'the once-per-document marker' ],
             [ /addEventListener\('uBOmv3MainReady'/, 'the CustomEvent ready-listener for the MAIN-world library' ],
             [ /new CustomEvent\(dataId, \{ detail: record \}\)/, 'the MAIN-world launch-record data event' ],
             [ /self\.uBO_mv3IsolatedLaunch\s*=\s*\{ globals, args, calls \}/, 'the isolated-world call stash' ],
@@ -670,6 +672,15 @@ section('upstream drift');
     }
     if ( existsPkg('js/mv3-scriptlet-shards.js') === false ) {
         problems.push('js/mv3-scriptlet-shards.js (the shard manifest) is missing from the package');
+    }
+    if ( /export \{ injectScriptlets as mv3InjectScriptlets \}/.test(shims) === false ) {
+        problems.push('mv3-shims.js no longer exports the structured injector mv3-post.js calls');
+    }
+    if ( /mv3InjectScriptlets\(\{/.test(post) === false ) {
+        problems.push('mv3-post.js no longer injects through mv3InjectScriptlets()');
+    }
+    if ( /tabs\.onCommittedHandler = function/.test(post) === false ) {
+        problems.push('mv3-post.js no longer hooks vAPI.tabs.onCommittedHandler, the per-frame injection trigger');
     }
     if ( problems.length !== 0 ) {
         fail('scriptlet-bridge', problems.join('\n'),
@@ -1031,59 +1042,128 @@ section('upstream drift');
     }
 }
 
-// The scriptlet injection (mv3-post.js marker -> mv3-shims.js -> the two
-// injection funcs -> ISOLATED + MAIN worlds) rests on a handful of upstream
-// shapes. Each is cheap to assert and expensive to debug: break one and the
-// popup panel quietly stops listing scriptlet filters, log lines stop
-// reaching the logger, or every `+js()` filter silently does nothing.
+// The scriptlet injection (upstream's registration -> platform/chromium-mv3/
+// vapi-scripting.js -> mv3-post.js per committed frame -> mv3-shims.js -> the
+// ISOLATED + MAIN libraries) rests on a handful of upstream shapes. Each is
+// cheap to assert and expensive to debug: break one and every `+js()` filter
+// silently does nothing, injects where upstream would not (or the reverse),
+// or its log lines stop reaching the logger.
 {
     const checks = [
-        [ 'platform/common/vapi-background.js', /vAPI\.scriptletsInjector\s*=/,
-          'vAPI.scriptletsInjector is no longer the platform hook mv3-post.js wraps' ],
-        [ 'platform/chromium/vapi-background-ext.js', /self\.uBO_scriptletsInjected\s*=\s*details\.filters/,
-          'the Chromium injector no longer records details.filters in self.uBO_scriptletsInjected' ],
-        [ 'src/js/scriptlet-filtering.js', /vAPI\.scriptletsInjector\(\s*hostname\s*,\s*scriptletDetails\s*\)/,
-          'scriptlet-filtering.js no longer calls vAPI.scriptletsInjector(hostname, scriptletDetails)' ],
-        [ 'src/js/scriptlet-filtering.js', /if\s*\(\s*scriptletDetails\.mainWorld\s*\)\s*\{\s*contentScript\.push\(\s*vAPI\.scriptletsInjector/s,
-          'scriptletsInjector is no longer gated on scriptletDetails.mainWorld -- mv3-post.js forces this call with a sentinel for isolated-only documents' ],
-        [ 'src/js/scriptlet-filtering.js', /super\.retrieve\(\s*request,\s*options\s*\)/,
-          'the extended engine no longer calls super.retrieve(), so mv3-post.js can no longer intercept the core result to force the injector call' ],
-        [ 'src/js/scriptlet-filtering.js', /options\.scriptletGlobals\.bcSecret\s*=\s*bcSecret/,
-          'the logger secret is no longer baked into scriptletGlobals, so mv3-post.js can no longer read it back out of the payloads for the relay' ],
+        // The registration API this port's vapi-scripting.js stands in for,
+        // and what it reads out of the registration.
+        [ 'src/js/scriptlet-filtering.js', /import \* as scripting from '\.\/vapi-scripting\.js';/,
+          'scriptlet-filtering.js no longer registers through vapi-scripting.js, which platform/chromium-mv3/vapi-scripting.js replaces' ],
+        [ 'src/js/scriptlet-filtering.js', /return scripting\.registerContentScripts\(options\);/,
+          'scriptlet-filtering.js no longer hands its registration to scripting.registerContentScripts(options)' ],
+        [ 'src/js/scriptlet-filtering.js', /scriptletGlobals: \{\s*warOrigin: this\.warOrigin,\s*warSecret: this\.warSecret,\s*\},/,
+          'the registration no longer carries scriptletGlobals { warOrigin, warSecret }, which vapi-scripting.js keeps for the injection' ],
+        [ 'src/js/scriptlet-filtering.js', /options\.scriptletGlobals\.bcSecret = vAPI\.generateSecret\(3\);/,
+          'the logger secret is no longer carried in scriptletGlobals, so mv3-post.js can no longer hand it to the relay' ],
+        [ 'src/js/scriptlet-filtering.js', /case 'filteringBehaviorChanged':\s*this\.registerContentScripts\(\);/,
+          'the engine no longer re-registers on filteringBehaviorChanged, which is when mv3-post.js re-snapshots the first-party firewall rules' ],
+        // Upstream's early bailouts, which mv3-post.js re-applies: exactly
+        // isTrustedContext (+ the matcher it is handed) and
+        // topFrameRulesMatcher. A third one appearing is a new bailout the
+        // port does not apply.
+        [ 'src/js/scriptlet-filtering.js', /const earlyBailoutCode = \[\s*isTrustedContext\.toString\(\),[^\]]*?trustedSiteMatcher\.match\.toString\(\)/,
+          'the trusted-site early bailout changed shape; reconcile injectFrameScriptlets() in mv3-post.js' ],
+        [ 'src/js/scriptlet-filtering.js', /export1stPartyRules\(\)\.filter\(a =>\s*a\[1\] !== 'behind-the-scene'\s*\)/,
+          'the first-party firewall-rule snapshot changed; reconcile topFrameRulesBailout() in mv3-post.js' ],
+        [ 'src/js/scriptlet-filtering.js', /if \( typeof value === 'boolean' \) \{ return value; \}[\s\S]*?return rules\.get\('\*'\) === true;/,
+          'topFrameRulesMatcher changed its matching rules; reconcile topFrameRulesBailout() in mv3-post.js' ],
+        // The scriptlet->logger relay the ISOLATED-world func mirrors.
         [ 'src/js/scriptlet-filtering.js', /self\.vAPI\s*&&\s*self\.vAPI\.messaging/,
           'the scriptlet->logger relay no longer probes self.vAPI.messaging, which the ISOLATED-world relay in mv3-shims.js mirrors' ],
         [ 'src/js/scriptlet-filtering.js', /vAPI\.messaging\.send\(\s*'contentscript'/,
           'the relay no longer sends on the "contentscript" channel, which the ISOLATED-world relay in mv3-shims.js forwards to' ],
         [ 'src/js/scriptlet-filtering.js', /bcSecret\.postMessage\('iamready!'\)/,
           'the relay handshake changed; the order-proof buffering the ISOLATED-world relay relies on may no longer hold' ],
-        [ 'src/js/scriptlet-filtering-core.js', /export class ScriptletFilteringEngine/,
-          'mv3-post.js imports ScriptletFilteringEngine from scriptlet-filtering-core.js to intercept the core retrieve()' ],
-        [ 'src/js/scriptlet-filtering-core.js', /'\}\)\(\);',/,
-          'the main-world payload is no longer a self-executing IIFE, so mv3-shims.js can no longer insert it as-is' ],
-        [ 'src/js/scriptlet-filtering-core.js', /'function\(\) \{',/,
-          'the isolated-world payload is no longer a bare function expression, which mv3-post.js parses the scriptlet calls out of' ],
-        [ 'src/js/scriptlet-filtering-core.js', /'try \{',/,
-          'scriptlet calls are no longer wrapped in try-blocks, so mv3-post.js can no longer parse them out of the isolated-world payload' ],
-        [ 'src/js/scriptlet-filtering-core.js', /\\t\$\{content\}/,
-          'scriptlet calls are no longer single tab-indented lines, so mv3-post.js can no longer parse them out of the isolated-world payload' ],
-        [ 'src/js/scriptlet-filtering-core.js', /const scriptletGlobals = \$\{scriptletGlobalsJSON\};/,
-          'scriptletGlobals is no longer embedded verbatim in the payloads, so mv3-post.js can no longer capture it for the isolated-world scriptlets' ],
-        [ 'src/js/contentscript.js', /needScriptlets:\s*self\.uBO_scriptletsInjected\s*===\s*undefined/,
-          'contentscript.js no longer derives needScriptlets from self.uBO_scriptletsInjected' ],
-        [ 'src/js/scriptlets/cosmetic-report.js', /self\.uBO_scriptletsInjected/,
-          'cosmetic-report.js no longer reads self.uBO_scriptletsInjected' ],
         [ 'src/js/messaging.js', /name:\s*'contentscript',\s*listener:/,
           'the "contentscript" message channel is gone or renamed' ],
+        // How upstream's Chromium flavor decides where and when to inject,
+        // which mv3-post.js reproduces.
+        [ 'platform/chromium/vapi-scripting.js', /browser\.webNavigation\.onCommitted\.addListener\(details => \{\s*if \( \/\^https\?:\|\^about:\/\.test\(details\.url\) === false \) \{ return; \}/,
+          'the Chromium injector no longer injects on webNavigation.onCommitted for http(s)/about: documents; reconcile the trigger in mv3-post.js' ],
+        [ 'platform/chromium/vapi-scripting.js', /if \( self\.vapiScripting \) \{ return 0; \}/,
+          'the Chromium injector no longer guards on self.vapiScripting, which prepareScriptletInjection in mv3-shims.js mirrors' ],
+        [ 'platform/chromium/vapi-scripting.js', /const tabs = await vAPI\.tabs\.query\(\{ url: '<all_urls>' \}\);/,
+          'the Chromium injector no longer sweeps already-open tabs once per launch, which mv3-post.js mirrors' ],
+        // What the per-frame resolution in mv3-post.js reads.
+        [ 'src/js/redirect-engine.js', /js: entry\.toContent\(\),\s*world: entry\.world,\s*dependencies: entry\.dependencies\.slice\(\),\s*priority: entry\.priority \?\? 0,/,
+          'redirectEngine.contentFromName() no longer returns { js, world, dependencies, priority }, which scriptletCallsFromTokens() in mv3-post.js reads' ],
+        [ 'src/js/scriptlet-filtering-core.js', /this\.scriptletDB = new StaticExtFilteringHostnameDB\(\);/,
+          'the core engine no longer keeps its filters in scriptletDB, which collectScriptletTokens() in mv3-post.js queries' ],
+        [ 'platform/common/vapi-background.js', /onCommittedHandler\(details\) \{\s*details\.url = this\.sanitizeURL\(details\.url\);\s*this\.onNavigation\(details\);/,
+          'vAPI.Tabs.onCommittedHandler no longer forwards to onNavigation, so the frame is not in its page store when mv3-post.js injects' ],
+        [ 'src/js/tab.js', /pageStore\.setFrameURL\(details\);\s*\}/,
+          'tab.js onNavigation no longer records the committed frame in its page store, which ancestor (>>) scriptlet filters need' ],
+        [ 'src/js/pagestore.js', /getFrameAncestorDetails\(frameId\) \{/,
+          'PageStore.getFrameAncestorDetails() is gone' ],
+        [ 'src/js/pagestore.js', /getEffectiveFrameURL\(sender\) \{/,
+          'PageStore.getEffectiveFrameURL() is gone' ],
+        [ 'src/js/pagestore.js', /isTrusted\(\) \{/,
+          'PageStore.isTrusted() is gone' ],
+        [ 'src/js/pagestore.js', /this\.tabHostname = tabContext\.rootHostname;/,
+          'PageStore.tabHostname no longer holds the top-level hostname topFrameRulesBailout() matches' ],
     ];
     let broken = 0;
     for ( const [ rel, re, message ] of checks ) {
         if ( re.test(readRepo(rel)) ) { continue; }
         broken += 1;
-        fail('scriptlet-marker', `${rel}: ${message}`,
-            'reconcile platform/chromium-mv3/mv3-post.js and mv3-shims.js with the new upstream shape');
+        fail('scriptlet-upstream', `${rel}: ${message}`,
+            'reconcile platform/chromium-mv3/vapi-scripting.js, mv3-post.js and mv3-shims.js with the new upstream shape');
+    }
+    // collectScriptletTokens() in mv3-post.js is a copy of the core engine's
+    // retrieve() minus its final decompile step. Pin the upstream body
+    // byte-for-byte: any change must be reflected in the copy, after which
+    // the hash below is updated.
+    {
+        const RETRIEVE_SHA256 = 'cc49a95ac55c65b6';
+        const core = readRepo('src/js/scriptlet-filtering-core.js').replace(/\r\n/g, '\n');
+        const match = /^ {4}retrieve\(request\) \{\n[\s\S]*?\n {4}\}\n/m.exec(core);
+        const digest = match !== null
+            ? createHash('sha256').update(match[0]).digest('hex').slice(0, 16)
+            : '';
+        if ( digest !== RETRIEVE_SHA256 ) {
+            broken += 1;
+            fail('scriptlet-upstream',
+                `src/js/scriptlet-filtering-core.js: ScriptletFilteringEngine.retrieve() changed (sha256 ${digest || 'n/a'}, pinned ${RETRIEVE_SHA256})`,
+                'reconcile collectScriptletTokens() in platform/chromium-mv3/mv3-post.js with it, then update RETRIEVE_SHA256 here');
+        }
+    }
+    // The package must carry this port's vapi-scripting.js, exporting every
+    // function upstream's Chromium flavor exports -- and nothing upstream
+    // calls that it lacks.
+    {
+        const exportsOf = src => new Set(
+            [ ...src.matchAll(/^export (?:async )?function (\w+)\(/gm) ].map(m => m[1])
+        );
+        const upstream = exportsOf(readRepo('platform/chromium/vapi-scripting.js'));
+        const pkg = existsPkg('js/vapi-scripting.js') ? readPkg('js/vapi-scripting.js') : '';
+        const ours = exportsOf(pkg);
+        const problems = [];
+        if ( pkg.includes('mv3RegisteredScriptletGlobals') === false ) {
+            problems.push('js/vapi-scripting.js is not platform/chromium-mv3/vapi-scripting.js: upstream\'s code-string injector was packaged');
+        }
+        for ( const name of upstream ) {
+            if ( ours.has(name) ) { continue; }
+            problems.push(`js/vapi-scripting.js does not export ${name}(), which upstream's Chromium flavor does`);
+        }
+        for ( const rel of [ 'src/js/scriptlet-filtering.js', 'src/js/messaging.js' ] ) {
+            for ( const m of readRepo(rel).matchAll(/\bscripting\.(\w+)\(/g) ) {
+                if ( ours.has(m[1]) ) { continue; }
+                problems.push(`${rel} calls scripting.${m[1]}(), which js/vapi-scripting.js does not export`);
+            }
+        }
+        if ( problems.length !== 0 ) {
+            broken += 1;
+            fail('scriptlet-upstream', problems.join('\n'),
+                'reconcile platform/chromium-mv3/vapi-scripting.js with platform/chromium/vapi-scripting.js');
+        }
     }
     if ( broken === 0 ) {
-        pass(`${checks.length} scriptlet-injection upstream assumptions hold`);
+        pass(`${checks.length + 2} scriptlet-injection upstream assumptions hold`);
     }
 }
 
@@ -1269,7 +1349,7 @@ section('port self-checks');
         [ 'js/mv3-shims.js', 'mjs' ],
         [ 'js/mv3-post.js', 'mjs' ],
         [ 'js/mv3-popup-banner.js', 'mjs' ],
-        [ 'js/mv3-scriptlet-marker.js', 'mjs' ],
+        [ 'js/vapi-scripting.js', 'mjs' ],
         // Generated: the shard manifest (an ES module) and the fixed
         // library files. The shard files are discovered through the
         // directory scan below, so a shard that fails to parse fails here
@@ -1330,116 +1410,6 @@ section('port self-checks');
             'a parse error here means the service worker never starts');
     } else {
         pass(`${PORT_MODULES.length} port-owned modules parse`);
-    }
-}
-
-// Round-trip the scriptlet marker codec out of the built package. It is a pure
-// module for this reason: the encode and decode ends live in different execution
-// contexts at runtime and cannot test each other there.
-{
-    const rel = 'js/mv3-scriptlet-marker.js';
-    let codec;
-    if ( existsPkg(rel) === false ) {
-        fail('marker-codec', `${rel} missing from package`,
-            'tools/make-chromium-mv3.sh copies platform/chromium-mv3/*.js into js/');
-    } else {
-        // Guarded: the parse check above already reports a broken module, and an
-        // uncaught rejection here would abort the run and lose every check after
-        // it, including the summary.
-        try {
-            codec = await import(pathToFileURL(path.join(pkgDir, rel)).href);
-        } catch ( ex ) {
-            fail('marker-codec', `cannot import ${rel}: ${ex.message}`,
-                'see the port-modules-parse check above');
-        }
-    }
-    if ( codec !== undefined ) {
-        const { encodeScriptletMarker, decodeScriptletMarker } = codec;
-        // Hostile-but-real filter text: `*/` would close a block comment, a bare
-        // newline would truncate a line comment, and non-Latin-1 is everywhere in
-        // filter lists (btoa() throws on it). The payloads now ride in the
-        // marker too, so they get the same hostile treatment.
-        // The interned-argument encoding (see internScriptletArgs in
-        // mv3-post.js): both call sets index into one shared args table.
-        // Hostile-but-real filter text rides in the table: `*/` would close
-        // a block comment, a bare newline would truncate a line comment, and
-        // non-Latin-1 is everywhere in filter lists (btoa() throws on it).
-        const args = [
-            'uboParityTest',                                  // 0 (shared by both call sets)
-            '42',                                             // 1
-            'ob',                                             // 2
-            'ads',                                            // 3
-            'a$b',                                            // 4 ('$$$' pre-escaping nets to one '$')
-            '例え.рф',                                         // 5
-            'x.com##+js(set, y, */)',                         // 6
-            'a.com##+js(x, "line1\nline2")',                  // 7
-        ];
-        const details = {
-            hostname: 'пример.рф',
-            filters: [
-                'example.com##+js(trusted-replace-regex, /a*/g, b)',
-                'x.com##+js(set, y, */)',
-                '例え.jp##+js(aopr, 日本語 100%)',
-                'a.com##+js(x, "line1\nline2")',
-            ],
-            args,
-            mainCalls: [
-                [ 'setConstant', [ 0, 1 ] ],
-                [ 'abortOnPropertyRead', [ 2 ] ],
-            ],
-            isolatedCalls: [
-                [ 'removeClass', [ 3, 1 ] ],
-                [ 'replaceNodeText', [ 4, 5, 6, 7 ] ],
-            ],
-            scriptletGlobals: {
-                warOrigin: 'chrome-extension://xyz/web_accessible_resources',
-                bcSecret: 'S3cr3t/* with a slash',
-                logLevel: 2,
-            },
-            bcSecret: 'S3cr3t/* with a slash',
-        };
-        const marker = encodeScriptletMarker(details);
-        const problems = [];
-        if ( marker.includes('\n') === false || marker.endsWith('\n') === false ) {
-            problems.push('the marker is not a single newline-terminated line');
-        }
-        if ( marker.slice(0, -1).includes('\n') ) {
-            problems.push('the marker payload contains a newline, which truncates the line comment');
-        }
-        if ( marker.slice(2).includes('/') ) {
-            problems.push('the marker payload contains "/", which can close a block comment early');
-        }
-        // Exactly how src/js/scriptlet-filtering.js assembles injectNow()'s code:
-        // the relay and an optional `debugger` are prepended, so the marker is
-        // not first, and the inert wrapper output follows it.
-        const assembled = [
-            'debugger',
-            `RELAY(${JSON.stringify('abc')});`,
-            `${marker}WRAPPER(${JSON.stringify(details.filters)});\n\nISOLATED();`,
-        ].join('\n\n');
-        const decoded = decodeScriptletMarker(assembled);
-        if ( JSON.stringify(decoded.details) !== JSON.stringify(details) ) {
-            problems.push(`round trip lost data: ${JSON.stringify(decoded.details)}`);
-        }
-        if ( decoded.code.includes('uBO-mv3-filters') ) {
-            problems.push('the marker survived decoding and would be injected');
-        }
-        for ( const token of [ 'RELAY', 'WRAPPER', 'ISOLATED', 'debugger' ] ) {
-            if ( decoded.code.includes(token) ) { continue; }
-            problems.push(`decoding removed real code: ${token} is gone`);
-        }
-        // An absent marker means the code did not come from the scriptlet
-        // injector at all; it must be a clean pass-through, not a throw.
-        const untouched = decodeScriptletMarker('ISOLATED();');
-        if ( untouched.details !== undefined || untouched.code !== 'ISOLATED();' ) {
-            problems.push('a marker-less program is not passed through unchanged');
-        }
-        if ( problems.length !== 0 ) {
-            fail('marker-codec', problems.join('\n'),
-                'see platform/chromium-mv3/mv3-scriptlet-marker.js');
-        } else {
-            pass('scriptlet marker codec round-trips hostile payloads and filter text');
-        }
     }
 }
 
@@ -1650,11 +1620,9 @@ section('port self-checks');
 }
 
 // The user-filter staleness fix (mv3-post.js) wraps `µb.saveUserFilters` so a
-// raw-asset change also rebuilds the engines, and wraps the scriptlet
-// engine's retrieve so its payload cache invalidates on a user-filters
-// generation. Both halves, plus the upstream shapes they lean on, are pinned
-// here: lose one and removed `+js(...)` filters keep injecting -- within the
-// worker's life from the cache, across reloads from a selfie that snapshotted
+// raw-asset change also rebuilds the engines. The fix, plus the upstream
+// shapes it leans on, are pinned here: lose it and removed filters -- `+js()`
+// included -- keep applying across reloads from a selfie that snapshotted
 // stale engines.
 {
     const post = readRepo('platform/chromium-mv3/mv3-post.js');
@@ -1665,9 +1633,6 @@ section('port self-checks');
     } else {
         const block = region[0];
         const pins = [
-            [ /let userFiltersModifyTime = 0;/, 'the user-filters generation clock' ],
-            [ /this\.scriptletCache\?\.resetTime < userFiltersModifyTime/, 'the scriptlet payload-cache generation check' ],
-            [ /this\.clearCache\(\);/, 'the payload-cache clear' ],
             [ /µb\.saveUserFilters = function/, 'the saveUserFilters wrap' ],
             [ /io\.remove\(`compiled\/\$\{ubo\.userFiltersPath\}`\)/, 'the awaited compiled-entry re-removal through io (the removal helper itself returns nothing -- see the round-7 root cause)' ],
             [ /ubo\.loadFilterLists\(\)/, 'the engine rebuild trigger' ],
@@ -1693,10 +1658,6 @@ section('port self-checks');
           'removeCompiledFilterList no longer returns nothing -- if it now returns io.remove()\'s promise, the wrap in mv3-post.js could await it directly instead of calling io.remove() itself' ],
         [ 'src/js/storage.js', /µb\.loadFilterLists = function\(\) \{\s*\n\s*if \( loadingPromise instanceof Promise \)/,
           'loadFilterLists no longer coalesces concurrent calls -- the wrap triggers it on every save' ],
-        [ 'src/js/scriptlet-filtering.js', /this\.scriptletCache\.resetTime < reng\.modifyTime/,
-          'the scriptlet payload cache no longer consults the redirect engine\'s modify time -- reconcile the generation check in mv3-post.js with the new upstream condition' ],
-        [ 'src/js/scriptlet-filtering.js', /clearCache\(\) \{\s*\n\s*this\.scriptletCache\.reset\(\);/,
-          'the scriptlet engine no longer has a clearCache() the generation check can call' ],
     ];
     for ( const [ rel, re, message ] of drift ) {
         if ( re.test(readRepo(rel)) ) { continue; }
@@ -1704,9 +1665,9 @@ section('port self-checks');
     }
     if ( problems.length !== 0 ) {
         fail('user-filter-staleness', problems.join('\n'),
-            'reconcile platform/chromium-mv3/mv3-post.js with the new upstream shape; removed +js() filters must stop injecting in this worker\'s life AND across reloads');
+            'reconcile platform/chromium-mv3/mv3-post.js with the new upstream shape; removed filters must stop applying in this worker\'s life AND across reloads');
     } else {
-        pass('user-filter staleness fix intact: engine rebuild + payload-cache generation pinned');
+        pass('user-filter staleness fix intact: engine rebuild pinned');
     }
 }
 

@@ -714,7 +714,7 @@ for ( const rel of conflicts ) {
             // js/messaging.js -- the `whenReady()` helper plus the eight handlers
             // routed through it: getPopupData, launchReporter, revertFirewallRules,
             // saveFirewallRules, toggleHostnameSwitch, toggleFirewallRule,
-            // toggleNetFiltering and getLists.
+            // toggleTrustedStatus and getLists.
             rel: 'js/messaging.js',
             probe: 'const whenReady = (( ) => {',
             edits: [
@@ -801,7 +801,7 @@ for ( const rel of conflicts ) {
                         '        break;',
                     ],
                 },
-                // 3. (anchor: 77 lines, replacement: 86 lines)
+                // 3. (anchor: 73 lines, replacement: 82 lines)
                 {
                     anchor: [
                         '        break;',
@@ -866,14 +866,10 @@ for ( const rel of conflicts ) {
                         '        response = popupDataFromTabId(request.tabId);',
                         '        break;',
                         '',
-                        '    case \'toggleNetFiltering\': {',
+                        '    case \'toggleTrustedStatus\': {',
                         '        const pageStore = µb.pageStoreFromTabId(request.tabId);',
                         '        if ( pageStore ) {',
-                        '            pageStore.toggleNetFilteringSwitch(',
-                        '                request.url,',
-                        '                request.scope,',
-                        '                request.state',
-                        '            );',
+                        '            pageStore.toggleTrustedStatus(request.url, request.scope, request.state);',
                         '            µb.updateToolbarIcon(request.tabId, 0b111);',
                         '        }',
                         '        break;',
@@ -953,15 +949,11 @@ for ( const rel of conflicts ) {
                         '            return popupDataFromTabId(request.tabId);',
                         '        }, ( ) => popupDataFromTabId(request.tabId));',
                         '',
-                        '    case \'toggleNetFiltering\':',
+                        '    case \'toggleTrustedStatus\':',
                         '        return whenReady(callback, ( ) => {',
                         '            const pageStore = µb.pageStoreFromTabId(request.tabId);',
                         '            if ( pageStore ) {',
-                        '                pageStore.toggleNetFilteringSwitch(',
-                        '                    request.url,',
-                        '                    request.scope,',
-                        '                    request.state',
-                        '                );',
+                        '                pageStore.toggleTrustedStatus(request.url, request.scope, request.state);',
                         '                µb.updateToolbarIcon(request.tabId, 0b111);',
                         '            }',
                         '        });',

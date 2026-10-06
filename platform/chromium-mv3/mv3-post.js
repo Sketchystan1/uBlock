@@ -33,8 +33,8 @@
     Keep this file small. Anything that can be done from `mv3-shims.js` belongs
     there instead, because a shim installed before uBO loads cannot be defeated
     by load-order surprises. What is here needs uBO itself: a substitute for
-    dynamic `import()`, the scriptlet-injection data channel (the marker prefix
-    `mv3-shims.js` consumes), one user-setting default whose MV2 value is wrong
+    dynamic `import()`, the per-frame scriptlet injection (calls resolved from
+    uBO's engine, injected by `mv3-shims.js`), one user-setting default whose MV2 value is wrong
     under MV3, the replaying of cold-wake events `mv3-shims.js` buffers (the
     context menu, update availability), and the persistence and restore of the
     state a service worker death would otherwise silently revert (session
@@ -66,14 +66,26 @@ import * as benchmarks from './benchmarks.js';
 import * as resourcesScriptlets from './resources/scriptlets.js';
 import * as staticDnrFiltering from './static-dnr-filtering.js';
 import {
+    domainFromHostname,
+    entityFromHostname,
+    hostnameFromURI,
+} from './uri-utils.js';
+import {
+    mv3EarlyEvents,
+    mv3ForkStatus,
+    mv3ForkStatusReady,
+    mv3InjectScriptlets,
+} from './mv3-shims.js';
+import {
     sessionFirewall,
     sessionSwitches,
     sessionURLFiltering,
 } from './filtering-engines.js';
-import { ScriptletFilteringEngine } from './scriptlet-filtering-core.js';
-import { encodeScriptletMarker } from './mv3-scriptlet-marker.js';
 import io from './assets.js';
-import { mv3EarlyEvents, mv3ForkStatus, mv3ForkStatusReady } from './mv3-shims.js';
+import { mv3RegisteredScriptletGlobals } from './vapi-scripting.js';
+import { redirectEngine } from './redirect-engine.js';
+// Generated into the package by tools/patch-mv3-modules.mjs.
+import { scriptletShards } from './mv3-scriptlet-shards.js';
 import scriptletFilteringEngine from './scriptlet-filtering.js';
 import staticNetFilteringEngine from './static-net-filtering.js';
 import webRequest from './traffic.js';
@@ -426,88 +438,130 @@ mv3ForkStatusReady.then(( ) => {
 
 /******************************************************************************/
 
-// Carry a whole scriptlet injection across the func/args boundary.
+// Scriptlet injection, per committed frame.
 //
-// `platform/common/vapi-background.js` declares `vAPI.scriptletsInjector` a
-// platform hook ("To be defined by platform-specific code"), and Chromium's
-// `platform/chromium/vapi-background-ext.js` defines it as a wrapper which
-// both inserts the main-world payload as a `<script>` element and records
-// the filters in `self.uBO_scriptletsInjected`. That wrapper is a code
-// string, and `chrome.scripting` -- the only injection API this port has
-// left -- cannot execute code strings. So the wrapper's output is never run;
-// it is kept only so the program `src/js/scriptlet-filtering.js` assembles
-// still looks like upstream's. Everything `executeCode()` in `mv3-shims.js`
-// needs to perform the injection properly is prefixed to it as a marker:
-// the scriptlet calls for both worlds (parsed back out of their payloads),
-// the per-document scriptlet globals, the filters that fired, and the
-// `bcSecret` of the scriptlet->logger relay. See `./mv3-scriptlet-marker.js`
-// for the wire format and `mv3-shims.js` for the other end.
+// Upstream compiles every scriptlet filter into one program which
+// `platform/chromium/vapi-scripting.js` executes as a code string in every
+// committed frame, where it matches the document's hostname, entity and
+// ancestors against tables baked into the code. No MV3 API executes a code
+// string, so `./vapi-scripting.js` keeps only the registration state and its
+// `scriptletGlobals`, and the per-frame work happens here, in the service
+// worker -- where MV2 uBO itself did it until upstream 9af8ef4c6: resolve the
+// frame's scriptlet calls from the engine's database, then hand them to
+// `mv3InjectScriptlets()` (mv3-shims.js), which runs them through the
+// CSP-exempt sharded libraries `tools/patch-mv3-modules.mjs` generates.
+//
+// Same trigger as upstream: `webNavigation.onCommitted`, for http(s) and
+// about: documents -- the latter resolved to the frame they inherit their
+// origin from, which is what upstream's in-page matcher sees through
+// `document.location.origin`. Hooked onto uBO's own committed handler rather
+// than a listener of ours, so that the frame is already recorded in its page
+// store when this runs: `>>` ancestor filters need the frame tree. The early
+// bailouts upstream serializes into its program -- trusted sites, a
+// first-party `allow` rule -- are applied here, below.
 
-// The relay's channel name is not passed to the injector hook, but
-// `src/js/scriptlet-filtering.js` bakes it into the payloads' private
-// `scriptletGlobals` object whenever the logger is on, so it can be read
-// back out. The `scriptletGlobals` declaration precedes any scriptlet code
-// in the payload, so the first match is the real one -- a filter argument
-// quoting the same text can only appear later, and can at worst redirect
-// log lines to a channel nobody listens on.
-const rebcSecret = /"bcSecret":\s*"([^"]*)"/;
+const reScriptletDocumentURL = /^https?:|^about:/;
+const reNetworkDocumentURL = /^https?:\/\//;
 
-// Neither payload can be executed as a string: no MV3 API injects code into
-// either world, `eval()` is blocked everywhere extension code runs, and a
-// `<script>` element created by extension code is blocked by whichever CSP
-// governs the world that created it. So `mv3-shims.js` runs the scriptlet
-// *calls* instead, through the function libraries `tools/patch-mv3-modules.mjs`
-// generates. Read them back out of the payloads: `lookupScriptlet()` in
-// `src/js/scriptlet-filtering-core.js` renders each call as a single
-// `fname(JSON-args);` line inside a fixed try/catch wrapper -- the same
-// wrapper for both worlds -- and a JSON string never contains a physical
-// newline, so each call is exactly one line and cannot be confused with
-// anything around it.
-const reScriptletCall = /\ntry \{\n\t([A-Za-z_$][\w$]*)\((.*)\);\n\} catch/g;
-const reScriptletTryBlock = /\ntry \{\n/g;
+// `lookupScriptlet()` in upstream's pre-9af8ef4c6 core used the same test to
+// tell function-style scriptlets from legacy `{{1}}`-placeholder ones.
+const reScriptletFunction = /^function\s+([^(\s]+)\s*\(/;
 
-const parseScriptletCalls = payload => {
-    if ( typeof payload !== 'string' || payload === '' ) { return []; }
-    const calls = [];
-    try {
-        for ( const match of payload.matchAll(reScriptletCall) ) {
-            calls.push([ match[1], JSON.parse(`[${match[2]}]`) ]);
+// Mirrors `ScriptletFilteringEngine.prototype.retrieve()` in
+// `src/js/scriptlet-filtering-core.js`, which upstream ends by decompiling the
+// tokens into filter text for the logger; the injection needs the tokens
+// themselves. `tools/verify-mv3-package.mjs` pins upstream's body, so any
+// change to it fails the build until this is reconciled.
+const collectScriptletTokens = request => {
+    const db = scriptletFilteringEngine.scriptletDB;
+    if ( db.size === 0 ) { return; }
+
+    const all = new Set();
+    const { ancestors = [], domain, hostname } = request;
+
+    db.retrieveSpecifics(all, hostname);
+    const entity = entityFromHostname(hostname, domain);
+    db.retrieveSpecifics(all, entity);
+    db.retrieveSpecificsByRegex(all, hostname, request.url);
+    db.retrieveGenerics(all);
+    const visitedAncestors = [];
+    for ( const ancestor of ancestors ) {
+        const { domain, hostname } = ancestor;
+        if ( visitedAncestors.includes(hostname) ) { continue; }
+        visitedAncestors.push(hostname);
+        db.retrieveSpecifics(all, `${hostname}>>`);
+        const entity = entityFromHostname(hostname, domain);
+        if ( entity !== '' ) {
+            db.retrieveSpecifics(all, `${entity}>>`);
         }
-    } catch (reason) {
-        console.error(`uBO: scriptlet calls: ${reason}`);
-        return [];
     }
-    // Every try-block must have parsed, or the payload's shape has drifted
-    // from what the regex above understands. Shipping a partial call list
-    // would run some scriptlets and silently drop the rest, so run none and
-    // say so; `tools/verify-mv3-package.mjs` pins the shapes so this should
-    // be unreachable.
-    const tryCount = (payload.match(reScriptletTryBlock) || []).length;
-    if ( tryCount !== calls.length ) {
-        console.error(
-            `uBO: parsed ${calls.length} scriptlet call(s) out of ${tryCount} ` +
-            `-- dropping them all rather than running a partial set. See ` +
-            `platform/chromium-mv3/mv3-post.js.`
-        );
-        return [];
+    if ( all.size === 0 ) { return; }
+
+    // Wholly disable scriptlet injection?
+    if ( all.has('-[]') ) { return; }
+
+    const tokens = [];
+    for ( const s of all ) {
+        if ( s.charCodeAt(0) === 0x2D /* - */ ) { continue; }
+        const token = s.slice(1);
+        if ( all.has(`-${token}`) ) { continue; }
+        tokens.push(token);
     }
-    return calls;
+    return tokens;
 };
 
-// The per-document `scriptletGlobals` (warOrigin/warSecret, plus the
-// logger's bcSecret/logLevel when it is on) is baked into the payloads but
-// not passed to the injector hook either; the isolated-world scriptlets
-// need it as data, so capture it while it is still an object. Set by the
-// core-retrieve wrap below and consumed by the injector wrap within the
-// same synchronous `retrieve()` call -- nothing can interleave.
-let currentScriptletGlobals;
+// Resolve tokens to calls into the sharded libraries, per world. Only
+// built-in scriptlets ship as library functions: a resource from
+// `userResourcesLocation`, or a legacy placeholder-style one, would have to
+// be executed as a code string, which MV3 cannot do -- say so once per name
+// and inject the rest. Ordered as upstream ordered calls before 9af8ef4c6
+// (resource priority first, then the call text), so that e.g.
+// `proxy-apply-config` still runs ahead of the scriptlets it configures.
+const unsupportedScriptlets = new Set();
+
+const scriptletCallsFromTokens = tokens => {
+    const worlds = { main: [], isolated: [] };
+    for ( const token of tokens ) {
+        let args;
+        try { args = JSON.parse(token); } catch { continue; }
+        if ( Array.isArray(args) === false || args.length === 0 ) { continue; }
+        const details = redirectEngine.contentFromName(`${args[0]}.js`, 'text/javascript');
+        if ( details === undefined ) { continue; }
+        const world = details.world === 'ISOLATED' ? 'isolated' : 'main';
+        const match = reScriptletFunction.exec(details.js);
+        const fname = match !== null ? match[1] : undefined;
+        if ( fname === undefined || typeof scriptletShards?.[world]?.fns?.[fname] !== 'string' ) {
+            if ( unsupportedScriptlets.has(args[0]) === false ) {
+                unsupportedScriptlets.add(args[0]);
+                console.warn(
+                    `uBO: +js(${args[0]}) is not a built-in scriptlet, and ` +
+                    'only built-in scriptlets can be injected under MV3'
+                );
+            }
+            continue;
+        }
+        const fargs = args.slice(1);
+        worlds[world].push({
+            call: [ fname, fargs ],
+            priority: details.priority ?? 0,
+            key: `${fname}(${JSON.stringify(fargs).slice(1, -1)})`,
+        });
+    }
+    const sorted = entries => entries.sort((a, b) =>
+        b.priority - a.priority || a.key.localeCompare(b.key)
+    ).map(a => a.call);
+    return {
+        mainCalls: sorted(worlds.main),
+        isolatedCalls: sorted(worlds.isolated),
+    };
+};
 
 // uBOL-style argument interning (see
 // platform/mv3/extension/js/offscreen/make-scriptlets.js): scriptlet
 // arguments repeat heavily -- the same selector in two filters, the empty
 // flags most scriptlets take -- and the calls travel several IPC hops
-// (marker string, executeScript args, DOM launch record), so carry them as
-// a deduped table plus index arrays instead. The two call sets share one
+// (executeScript args, the MAIN-world launch record), so carry them as a
+// deduped table plus index arrays instead. The two call sets share one
 // table.
 //
 // Dedupe is by `JSON.stringify` identity. The arguments are JSON values
@@ -534,66 +588,139 @@ const internScriptletArgs = ( ) => {
     return { args, compact };
 };
 
-// When only isolated-world scriptlets fired, upstream's `retrieve()` never
-// calls `vAPI.scriptletsInjector` (it gates on `details.mainWorld`), so no
-// marker would ride the assembled code and `executeCode()` would have
-// nothing to inject. Force the call by handing the engine's own core
-// `retrieve()` result a truthy sentinel in the main-world slot; the wrapper
-// below maps it back to "no main-world payload" and flags the injection
-// `isolatedOnly`. Nothing downstream executes the slot, so the sentinel
-// never escapes as code; the NULs on both ends ensure no assembled payload
-// -- all of which start with `(function() {` -- can ever equal it.
-const MV3_ISOLATED_ONLY = '\u0000uBO-mv3-isolated-only\u0000';
-{
-    const injector = vAPI.scriptletsInjector;
-    const coreRetrieve = ScriptletFilteringEngine.prototype.retrieve;
-    if ( typeof injector !== 'function' ) {
-        console.error(
-            'uBO: vAPI.scriptletsInjector is not a function, so scriptlet ' +
-            'filters cannot be injected. See platform/chromium-mv3/mv3-post.js.'
-        );
-    } else if ( typeof coreRetrieve !== 'function' ) {
-        console.error(
-            'uBO: ScriptletFilteringEngine.prototype.retrieve is not a ' +
-            'function, so documents with only isolated-world scriptlets ' +
-            'cannot be injected. See platform/chromium-mv3/mv3-post.js.'
-        );
-    } else {
-        ScriptletFilteringEngine.prototype.retrieve = function(...args) {
-            currentScriptletGlobals = args[1]?.scriptletGlobals;
-            const details = coreRetrieve.apply(this, args);
-            if (
-                details instanceof Object &&
-                details.isolatedWorld &&
-                !details.mainWorld
-            ) {
-                details.mainWorld = MV3_ISOLATED_ONLY;
-            }
-            return details;
-        };
-        vAPI.scriptletsInjector = (hostname, details) => {
-            const isolatedOnly = details.mainWorld === MV3_ISOLATED_ONLY;
-            const mainWorld = isolatedOnly ? '' : details.mainWorld;
-            const findbcSecret = payload => {
-                if ( typeof payload !== 'string' ) { return undefined; }
-                const match = rebcSecret.exec(payload);
-                return match !== null ? match[1] : undefined;
-            };
-            const { args, compact } = internScriptletArgs();
-            const marker = {
-                hostname,
-                filters: details.filters,
-                args,
-                mainCalls: compact(parseScriptletCalls(mainWorld)),
-                isolatedCalls: compact(parseScriptletCalls(details.isolatedWorld)),
-                scriptletGlobals: currentScriptletGlobals,
-                bcSecret: findbcSecret(mainWorld) ??
-                    findbcSecret(details.isolatedWorld),
-            };
-            if ( isolatedOnly ) { marker.isolatedOnly = true; }
-            return encodeScriptletMarker(marker) + injector(hostname, details);
+// Upstream's second early bailout (`topFrameRulesMatcher` in
+// `src/js/scriptlet-filtering.js`): the session firewall's first-party rules,
+// snapshotted at registration time, matched against the top-level document's
+// hostname and its parent domains, then `*`. The first rule found decides,
+// and only an `allow` rule bails out. Rebuilt whenever upstream re-registers
+// -- which it does on every `filteringBehaviorChanged`, firewall toggles
+// included -- exactly as its serialized copy is.
+let topFrameRules = { globals: undefined, rules: new Map() };
+
+const topFrameRulesBailout = (globals, tabHostname) => {
+    if ( topFrameRules.globals !== globals ) {
+        topFrameRules = {
+            globals,
+            rules: new Map(sessionFirewall.export1stPartyRules().filter(a =>
+                a[1] !== 'behind-the-scene'
+            )),
         };
     }
+    const { rules } = topFrameRules;
+    if ( rules.size === 0 ) { return false; }
+    let pos = 0;
+    do {
+        const value = rules.get(tabHostname.slice(pos));
+        if ( typeof value === 'boolean' ) { return value; }
+        pos = tabHostname.indexOf('.', pos) + 1;
+    } while ( pos !== 0 );
+    return rules.get('*') === true;
+};
+
+// `details` is a webNavigation frame: tabId, frameId, url, and documentId
+// when the browser supplies one -- which binds the injection to the document
+// that committed rather than to whatever occupies the frame by then.
+const injectFrameScriptlets = details => {
+    const { tabId, frameId } = details;
+    if ( typeof tabId !== 'number' || tabId < 0 ) { return; }
+    if ( typeof frameId !== 'number' ) { return; }
+    if ( typeof details.url !== 'string' ) { return; }
+    if ( reScriptletDocumentURL.test(details.url) === false ) { return; }
+    // Nothing registered: the engine is being reset, or holds no scriptlet.
+    const globals = mv3RegisteredScriptletGlobals();
+    if ( globals === undefined ) { return; }
+    // Upstream's first early bailout (`isTrustedContext`): the top-level
+    // document is on a trusted site.
+    const pageStore = µb.pageStoreFromTabId(tabId);
+    if ( pageStore === null || pageStore.isTrusted() ) { return; }
+    if ( topFrameRulesBailout(globals, pageStore.tabHostname) ) { return; }
+    const url = details.url.startsWith('about:')
+        ? pageStore.getEffectiveFrameURL({ frameId, frameURL: details.url })
+        : details.url;
+    if ( reNetworkDocumentURL.test(url) === false ) { return; }
+    const hostname = hostnameFromURI(url);
+    if ( hostname === '' ) { return; }
+    const tokens = collectScriptletTokens({
+        url,
+        hostname,
+        domain: domainFromHostname(hostname),
+        ancestors: pageStore.getFrameAncestorDetails(frameId),
+    });
+    if ( tokens === undefined || tokens.length === 0 ) { return; }
+    const { mainCalls, isolatedCalls } = scriptletCallsFromTokens(tokens);
+    if ( mainCalls.length === 0 && isolatedCalls.length === 0 ) { return; }
+    const { args, compact } = internScriptletArgs();
+    return mv3InjectScriptlets({
+        target: typeof details.documentId === 'string'
+            ? { tabId, documentIds: [ details.documentId ] }
+            : { tabId, frameIds: [ frameId ] },
+        hostname,
+        bcSecret: typeof globals.bcSecret === 'string' ? globals.bcSecret : '',
+        globals,
+        args,
+        mainCalls: compact(mainCalls),
+        isolatedCalls: compact(isolatedCalls),
+    });
+};
+
+{
+    const tabs = vAPI.tabs;
+    const baseOnCommitted = tabs instanceof Object
+        ? tabs.onCommittedHandler
+        : undefined;
+    if ( typeof baseOnCommitted !== 'function' ) {
+        console.error(
+            'uBO: vAPI.tabs.onCommittedHandler is not a function, so ' +
+            'scriptlet filters cannot be injected. See ' +
+            'platform/chromium-mv3/mv3-post.js.'
+        );
+    } else {
+        tabs.onCommittedHandler = function(details) {
+            baseOnCommitted.call(this, details);
+            try {
+                injectFrameScriptlets(details);
+            } catch (reason) {
+                console.error(`uBO: scriptlet injection: ${reason}`);
+            }
+        };
+    }
+}
+
+// Upstream also injects into every already-open tab, once per launch (`onceFn`
+// in platform/chromium/vapi-scripting.js): that is what gives tabs open at
+// install, update or re-enable their scriptlets. A service worker restart is
+// not a launch -- the tabs it finds went through `onCommitted` already -- so
+// the sweep is gated on a `storage.session` flag, which survives worker
+// restarts and is cleared by browser restart and extension reload/update.
+// Frames the page store has not seen are recorded first, so that ancestor
+// and about: resolution work as they do for a live navigation.
+{
+    const SWEEP_KEY = 'uBOMv3ScriptletSweepDone';
+    Promise.resolve(µb.isReadyPromise).then(async ( ) => {
+        const bin = await chrome.storage.session.get(SWEEP_KEY).catch(( ) => null);
+        if ( bin instanceof Object === false || bin[SWEEP_KEY] === true ) { return; }
+        await chrome.storage.session.set({ [SWEEP_KEY]: true });
+        const tabs = await vAPI.tabs.query({ url: '<all_urls>' });
+        for ( const tab of tabs ) {
+            if ( tab.discarded === true ) { continue; }
+            if ( tab.status === 'unloaded' ) { continue; }
+            const pageStore = µb.pageStoreFromTabId(tab.id);
+            if ( pageStore === null ) { continue; }
+            const frames = await chrome.webNavigation.getAllFrames({
+                tabId: tab.id,
+            }).catch(( ) => null);
+            if ( Array.isArray(frames) === false ) { continue; }
+            for ( const frame of frames ) {
+                if ( pageStore.getFrameStore(frame.frameId) !== null ) { continue; }
+                pageStore.setFrameURL(frame);
+            }
+            for ( const frame of frames ) {
+                injectFrameScriptlets(Object.assign({ tabId: tab.id }, frame));
+            }
+        }
+    }).catch(reason => {
+        console.error(`uBO: scriptlet injection into open tabs: ${reason}`);
+    });
 }
 
 /******************************************************************************/
@@ -614,11 +741,9 @@ const MV3_ISOLATED_ONLY = '\u0000uBO-mv3-isolated-only\u0000';
 // trigger) schedules a selfie recreate a `selfieDelayInSeconds` later, which
 // snapshots whatever is in memory at that moment: the stale engines get
 // baked into a *fresh* selfie, and the removed scriptlet survives extension
-// reloads and browser restarts. Upstream's scriptlet payload cache adds a
-// same-lifetime staleness on top: `scriptlet-filtering.js` clears it only
-// when the redirect engine's resources change, so even rebuilt engines keep
-// serving the removed scriptlet's assembled payload for the rest of the
-// worker's life.
+// reloads and browser restarts. (Scriptlets themselves need nothing more:
+// the per-frame injection above reads the engine's database live, and the
+// rebuild recompiles upstream's registered program on `freeze()`.)
 //
 // MV2 parity: every piece of this is shared `src/` code, so the MV2 build
 // has the identical hole through the identical call sequence (its dashboard
@@ -626,39 +751,17 @@ const MV3_ISOLATED_ONLY = '\u0000uBO-mv3-isolated-only\u0000';
 // rather than in `src/js/storage.js`: this fork's whole merge story is "no
 // upstream file is modified", and the wrap below gives every
 // `saveUserFilters` caller the dashboard's semantics without touching one.
-// The upstreamable version is the same two changes in `saveUserFilters()`
-// (rebuild the engines) and in the scriptlet cache's reset condition
-// (a user-filters generation).
+// The upstreamable version is the same change in `saveUserFilters()`:
+// rebuild the engines.
 {
     const baseSaveUserFilters = µb.saveUserFilters;
-    const baseEngineRetrieve = scriptletFilteringEngine?.retrieve;
     if ( typeof baseSaveUserFilters !== 'function' ) {
         console.error(
             'uBO: µb.saveUserFilters is not a function, so user-filter ' +
             'changes cannot be made to take effect in the engines. See ' +
             'platform/chromium-mv3/mv3-post.js.'
         );
-    } else if ( typeof baseEngineRetrieve !== 'function' ) {
-        console.error(
-            'uBO: scriptletFilteringEngine.retrieve is not a function, so ' +
-            'stale scriptlet payloads cannot be invalidated on user-filter ' +
-            'changes. See platform/chromium-mv3/mv3-post.js.'
-        );
     } else {
-        // Generation clock: bumped each time the user-filters raw asset is
-        // (re)written. Compared against the scriptlet payload cache's own
-        // reset time below -- upstream's condition only consults the
-        // redirect engine's modify time, which user-filter changes do not
-        // touch.
-        let userFiltersModifyTime = 0;
-
-        scriptletFilteringEngine.retrieve = function(...args) {
-            if ( this.scriptletCache?.resetTime < userFiltersModifyTime ) {
-                this.clearCache();
-            }
-            return baseEngineRetrieve.apply(this, args);
-        };
-
         // Coalesce rapid successive saves into a single engine rebuild. Each
         // save bumps the generation; a rebuild records the generation it
         // covered and, on completion, runs exactly once more if newer saves
@@ -701,10 +804,6 @@ const MV3_ISOLATED_ONLY = '\u0000uBO-mv3-isolated-only\u0000';
             const result = baseSaveUserFilters.apply(this, args);
             const ubo = this;
             Promise.resolve(result).then(( ) => {
-                // `+ 1` so a cache reset happening in the same millisecond as
-                // this save still counts as pre-save state (a save and a reset
-                // can share a timestamp; the stale check is strict less-than).
-                userFiltersModifyTime = Date.now() + 1;
                 saveGeneration += 1;
                 // Readiness gate: a save landing before `readyToFilter` (a
                 // filter added during boot -- restoreUserData, an eager element
