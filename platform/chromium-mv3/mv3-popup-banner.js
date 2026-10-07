@@ -23,8 +23,6 @@
 
 /* global chrome */
 
-'use strict';
-
 // The fork's setup/troubleshooting documentation. A link, not a hard
 // dependency: the banner is fully informative on its own if it 404s.
 const DOC_URL =

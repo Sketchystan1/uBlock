@@ -55,7 +55,7 @@ jobs:
 
       - name: Upload upstream lint report
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: upstream-lint-report
           path: /tmp/upstream-lint.txt
@@ -74,6 +74,8 @@ jobs:
           "tools/patch-mv3-modules.mjs"
           "tools/verify-mv3-package.mjs"
           "tools/make-crx.mjs"
+          "tools/make-update-xml.mjs"
+          "tools/verify-crx.mjs"
 
       - name: Clone uAssets
         run: bash tools/pull-assets.sh
@@ -85,7 +87,7 @@ jobs:
         run: bash tools/make-chromium-mv3.sh
 
       - name: Upload package
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: uBlock0.chromium-mv3
           path: dist/build/uBlock0.chromium-mv3

@@ -24,7 +24,7 @@
 
     Apply MV3 fix-ups to the built package that can only be made to the output.
 
-    Six transforms, all against the BUILD OUTPUT and never the source tree:
+    Every transform runs against the BUILD OUTPUT and never the source tree:
     the port must not modify a single upstream file, so that the unattended
     merge from upstream can never conflict. Transforming the copy is the same
     approach the port already takes for the manifest.
@@ -132,6 +132,13 @@
     marker comment is added to the patched text and idempotency is probed on
     a substring unique to it instead (see the section below).
 
+    7. Resolve `js/publicsuffix.js`'s library fallback with a static import.
+
+    Upstream loads the bundled publicsuffixlist library with a top-level
+    `await import(...)` whenever `browser.publicSuffix` is absent -- always, on
+    Chromium. Top-level await fails service worker registration outright, and
+    the file is shared with the dashboard, so transform 1 cannot rewrite it.
+
     Usage: node tools/patch-mv3-modules.mjs [--dir <package-dir>]
 
 **/
@@ -163,6 +170,75 @@ const pkgDir = path.resolve(args.get('dir') || 'dist/build/uBlock0.chromium-mv3'
 if ( fs.existsSync(pkgDir) === false ) {
     console.error(`*** patch-mv3-modules: no package at ${pkgDir}`);
     process.exit(1);
+}
+
+/******************************************************************************/
+
+// Resolve js/publicsuffix.js's library fallback statically.
+//
+// Upstream's js/publicsuffix.js prefers Firefox's `browser.publicSuffix` API
+// and otherwise falls back to the bundled library, loaded at module scope with
+// `await import(...)`. Chromium has no such API, so that fallback is the only
+// path ever taken here, and it is doubly fatal in a service worker: dynamic
+// import() is forbidden (transform 1), and so is top-level await -- a module
+// graph containing one fails service worker registration outright. The file
+// is also loaded by the dashboard (dyna-rules.js), so transform 1 could not
+// rewrite it anyway.
+//
+// Replace the awaited dynamic import with a static one. Both contexts end up
+// with exactly the module upstream's fallback would have loaded. This runs
+// before the module graphs below are computed, so they include the static
+// edge it adds. verify-mv3-package.mjs fails the build if either construct
+// reaches the service worker.
+
+{
+    const rel = 'js/publicsuffix.js';
+    const abs = path.join(pkgDir, rel);
+    const marker = 'uBO MV3 static publicsuffixlist fallback';
+    const lib = '../lib/publicsuffixlist/publicsuffixlist.js';
+    if ( fs.existsSync(abs) === false ) {
+        console.error(
+            `*** patch-mv3-modules: ${rel} missing; cannot resolve its ` +
+            `publicsuffixlist fallback`
+        );
+        process.exit(1);
+    }
+    const src = fs.readFileSync(abs, 'utf8');
+    if ( src.includes(marker) ) {
+        console.log(`*** patch-mv3-modules: ${rel} already resolves publicsuffixlist statically`);
+    } else {
+        // The upstream source may use either line ending; match the file's own.
+        const eol = src.includes('\r\n') ? '\r\n' : '\n';
+        const anchor = [
+            `await import('${lib}').then(module =>`,
+            `    module['default']`,
+            `);`,
+        ].join(eol);
+        const count = src.split(anchor).length - 1;
+        if ( count !== 1 ) {
+            console.error(
+                `*** patch-mv3-modules: ${rel} contains ${count} ` +
+                `occurrence(s) of the expected publicsuffixlist fallback ` +
+                `(expected exactly 1):\n${anchor}\n` +
+                `    Reconcile tools/patch-mv3-modules.mjs with the new ` +
+                `upstream shape. Neither dynamic import() nor top-level await ` +
+                `may reach the service worker.`
+            );
+            process.exit(1);
+        }
+        const shim = [
+            `// [${marker}] Dynamic imports and top-level await are both`,
+            `// forbidden in a service worker, and Chromium has no browser.publicSuffix.`,
+            `import publicSuffixListFallback from '${lib}';`,
+            ``,
+            ``,
+        ].join(eol);
+        fs.writeFileSync(abs, shim + src.replace(anchor, () => 'publicSuffixListFallback;'));
+        console.log(
+            `*** patch-mv3-modules: ${rel} resolves its publicsuffixlist ` +
+            `fallback statically`
+        );
+    }
 }
 
 /******************************************************************************/

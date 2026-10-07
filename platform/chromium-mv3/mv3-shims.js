@@ -1012,8 +1012,11 @@ if ( typeof Worker !== 'function' ) {
             this.newHostedId();
             // Posts made while the replacement is being set up are held in
             // the queue; they were tracked when posted, and are relayed
-            // after the replay below, in order.
-            this.queue = this.queue === null ? null : [];
+            // after the replay below, in order. Unconditionally: even when
+            // the queue was null (= relay directly), the old hosted worker
+            // was just terminated and the new one has not been created yet,
+            // so a direct relay would be dropped by the offscreen document.
+            this.queue = [];
             whenOffscreenReady().then(( ) => {
                 if ( this.dead || workers.get(this.hostedId) !== this ) {
                     return;

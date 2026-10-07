@@ -99,7 +99,8 @@ fork-mv3-sources := \
 	$(shell find ./tools -name 'make-chromium-mv3*' -o -name 'patch-mv3-modules*' \
 	              -o -name 'verify-mv3-package*' -o -name 'make-crx*' \
 	              -o -name 'copy-common-files*') \
-	dist/version
+	dist/version \
+	dist/mv3-build
 
 dist/build/uBlock0.chromium-mv3: tools/make-chromium-mv3.sh $(fork-mv3-sources) $(assets)
 	bash tools/make-chromium-mv3.sh

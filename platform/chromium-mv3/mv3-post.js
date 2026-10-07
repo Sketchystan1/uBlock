@@ -84,9 +84,9 @@ import {
 import io from './assets.js';
 import { mv3RegisteredScriptletGlobals } from './vapi-scripting.js';
 import { redirectEngine } from './redirect-engine.js';
+import scriptletFilteringEngine from './scriptlet-filtering.js';
 // Generated into the package by tools/patch-mv3-modules.mjs.
 import { scriptletShards } from './mv3-scriptlet-shards.js';
-import scriptletFilteringEngine from './scriptlet-filtering.js';
 import staticNetFilteringEngine from './static-net-filtering.js';
 import webRequest from './traffic.js';
 import µb from './background.js';
@@ -157,7 +157,19 @@ let flushDurableSettingsWrites = ( ) => Promise.resolve();
                     db.createObjectStore(STORE_NAME);
                 }
             };
-            req.onsuccess = ev => { resolve(ev.target.result); };
+            req.onsuccess = ev => {
+                const db = ev.target.result;
+                // A connection the browser closes under us (storage pressure,
+                // site data cleared) would otherwise stay cached, and every
+                // later transaction() would throw: re-arm so the next access
+                // reopens it.
+                db.onclose = ( ) => { dbPromise = undefined; };
+                db.onversionchange = ( ) => {
+                    db.close();
+                    dbPromise = undefined;
+                };
+                resolve(db);
+            };
             req.onerror = ( ) => {
                 // A wedged open must not poison every later call: re-arm so a
                 // transient failure can be retried on the next access.
@@ -173,9 +185,18 @@ let flushDurableSettingsWrites = ( ) => Promise.resolve();
         try {
             return db.transaction(STORE_NAME, mode).objectStore(STORE_NAME);
         } catch {
+            dbPromise = undefined;
             return null;
         }
     };
+
+    // A write is durable once its transaction completes, not when its request
+    // succeeds: the commit is only issued after control returns to the event
+    // loop, which a restart chained on the request's success would beat.
+    const txDone = store => new Promise(resolve => {
+        const tx = store.transaction;
+        tx.oncomplete = tx.onerror = tx.onabort = ( ) => resolve();
+    });
 
     // All idb helpers resolve rather than reject -- a broken mirror must never
     // wedge a settings read/write, only forgo durability. Missing keys are
@@ -211,34 +232,34 @@ let flushDurableSettingsWrites = ( ) => Promise.resolve();
         });
     };
 
+    // `put()` throws synchronously on a value that cannot be cloned; skip it
+    // rather than reject, so the other keys of the bin still commit.
     const idbSet = async bin => {
         const store = await txStore('readwrite');
         if ( store === null ) { return; }
-        await Promise.all(Object.keys(bin).map(key => new Promise(resolve => {
-            const req = store.put(bin[key], key);
-            req.onsuccess = ( ) => resolve();
-            req.onerror = ( ) => resolve();
-        })));
+        const done = txDone(store);
+        for ( const key of Object.keys(bin) ) {
+            try { store.put(bin[key], key); } catch { }
+        }
+        await done;
     };
     const idbRemove = async keys => {
         const store = await txStore('readwrite');
         if ( store === null ) { return; }
+        const done = txDone(store);
         const list = Array.isArray(keys) ? keys : [ keys ];
-        await Promise.all(list.map(key => new Promise(resolve => {
-            const req = store.delete(key);
-            req.onsuccess = ( ) => resolve();
-            req.onerror = ( ) => resolve();
-        })));
+        for ( const key of list ) {
+            try { store.delete(key); } catch { }
+        }
+        await done;
     };
 
     const idbClear = async ( ) => {
         const store = await txStore('readwrite');
         if ( store === null ) { return; }
-        await new Promise(resolve => {
-            const req = store.clear();
-            req.onsuccess = ( ) => resolve();
-            req.onerror = ( ) => resolve();
-        });
+        const done = txDone(store);
+        try { store.clear(); } catch { }
+        await done;
     };
 
     // The argument shapes uBO passes to storage.get: a string key, an array of
@@ -379,23 +400,20 @@ let flushDurableSettingsWrites = ( ) => Promise.resolve();
 // the feature can never sync cross-device here; it would be a toggle that
 // silently does nothing. Flag it unsupported so the feature is genuinely off:
 // src/js/messaging.js no-ops every cloud handler and src/js/cloud-ui.js leaves
-// each per-pane cloud widget hidden. The Settings checkbox is greyed + unchecked
-// the SAME way "Uncloak canonical names" is: src/js/messaging.js sends
-// `cloudStorageEnabled = undefined` when unsupported, so settings.js takes the
-// generic disabled+unchecked path (disables the .checkbox wrapper, which
-// common.css greys via `.checkbox[disabled]` -- not just the input). One
-// assignment plus that one mirror line; chrome.storage.sync is reached only
+// each per-pane cloud widget hidden. chrome.storage.sync is reached only
 // through vAPI.cloud, so nothing else is affected. The Google-Drive-based
 // cross-device sync design (the only viable route) is recorded in docs/mv3-sync.md.
 µb.cloudStorageSupported = false;
 
 // Grey out + uncheck "Enable cloud storage support" in Settings, the same way
-// "Uncloak canonical names" is greyed when cname-uncloaking is unavailable.
-// Upstream src/js/messaging.js sends `cloudStorageEnabled = undefined` from
-// within the `userSettings` handler, which makes settings.js take the generic
-// disabled+unchecked path. Rather than patching that upstream file (which
-// reopens the merge-conflict surface), we wrap its already-registered default
-// message handler here: vAPI.messaging.defaultHandler is set by messaging.js's
+// "Uncloak canonical names" is greyed when cname-uncloaking is unavailable:
+// upstream src/js/messaging.js sends `cnameUncloakEnabled = undefined` in its
+// `userSettings` reply for that, and settings.js takes a generic
+// disabled+unchecked path for any setting whose value is undefined (it disables
+// the .checkbox wrapper, which common.css greys via `.checkbox[disabled]`).
+// Upstream has no such line for cloud storage, and patching one in would reopen
+// the merge-conflict surface, so wrap its already-registered default message
+// handler instead: vAPI.messaging.defaultHandler is set by messaging.js's
 // vAPI.messaging.setup() call, which evaluates during start.js, before this
 // module runs. The wrapper intercepts only `userSettings` replies and is
 // otherwise transparent.

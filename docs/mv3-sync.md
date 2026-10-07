@@ -51,7 +51,8 @@ implementation with the SAME five methods and signatures the messaging layer cal
 - `used(datakey)` → file size + a nominal quota so the capacity strip renders.
 - `getOptions`/`setOptions` → device name, persisted via the durable store.
 And undo the grey-out: remove the `µb.cloudStorageSupported = false` line **and** the
-`response.cloudStorageEnabled = undefined` mirror in `src/js/messaging.js` (plus their verify pins).
+`vAPI.messaging.defaultHandler` wrapper that zeroes `cloudStorageEnabled`, both in `mv3-post.js`
+(plus their verify pins).
 
 ## Auth: `chrome.identity.launchWebAuthFlow` + PKCE (NOT `getAuthToken`)
 `chrome.identity.getAuthToken` effectively requires the extension to be published to the Chrome Web
@@ -95,7 +96,7 @@ The OAuth **client id** — a public app identifier like `123456-abc.apps.google
   unconfigured.
 - **`mv3-post.js`** — import `js/mv3-oauth-config.js`; if a client id is present, `vAPI.cloud =
   installDriveCloud()` and DROP the `µb.cloudStorageSupported = false` line (and the
-  `cloudStorageEnabled = undefined` mirror in `messaging.js`) so the UI re-appears.
+  `defaultHandler` wrapper that zeroes `cloudStorageEnabled`) so the UI re-appears.
 - **Manifest** (`manifest.overlay.json` + `make-chromium-mv3-meta.py`) — add `identity` and host
   permissions `https://www.googleapis.com/*`, `https://oauth2.googleapis.com/*`; teach the meta
   script to union `host_permissions`/`optional_permissions` from the overlay (today only

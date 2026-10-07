@@ -219,7 +219,8 @@ jobs:
       # Gate the master push on the merged tree actually building. A merge can
       # be conflict-free and still break the port -- upstream renaming a file the
       # shims stand in front of, adding a manifest key the generator does not
-      # know, or adding a dynamic import() the patcher does not reach.
+      # know, or adding a dynamic import() or top-level await the patcher does
+      # not reach.
       - name: Build and verify the merged tree
         id: verify_master
         run: bash tools/make-chromium-mv3.sh
@@ -273,6 +274,7 @@ jobs:
             '- upstream added a `<script>` to `src/background.html` that `sw.js` does not import' \
             '- upstream added a manifest key `tools/make-chromium-mv3-meta.py` does not transform' \
             '- upstream added a dynamic `import()` that `tools/patch-mv3-modules.mjs` did not rewrite' \
+            '- upstream added a top-level `await` to a module the service worker loads (registration fails outright; resolve it statically in `tools/patch-mv3-modules.mjs`)' \
             '- upstream reshaped something the scriptlet marker depends on (`vAPI.scriptletsInjector`, `self.uBO_scriptletsInjected`, the `contentscript` message channel)' \
             '' \
             'Reproduce locally:' \

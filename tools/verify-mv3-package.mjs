@@ -494,6 +494,47 @@ const swReachable = new Set();
     }
 }
 
+// Top-level await is disallowed in a service worker as well: a module graph
+// containing one fails registration outright, so the extension is dead. The
+// scan is not parser-based. uBO indents function bodies, so a module-scope
+// statement starts at column 0 -- except inside a column-0 async IIFE (the
+// shape of start.js's launch sequence), whose body is skipped.
+{
+    const offenders = [];
+    for ( const rel of swReachable ) {
+        let src;
+        try {
+            src = readPkg(rel);
+        } catch {
+            continue;
+        }
+        const lines = src.split('\n');
+        let inAsyncIIFE = false;
+        for ( let i = 0; i < lines.length; i++ ) {
+            const line = lines[i];
+            if ( inAsyncIIFE ) {
+                if ( /^\}\)\(\);?\s*$/.test(line) ) { inAsyncIIFE = false; }
+                continue;
+            }
+            if ( /^\(async\b.*=>\s*\{\s*$/.test(line) ) {
+                inAsyncIIFE = true;
+                continue;
+            }
+            if ( /^[^\s/*]/.test(line) === false ) { continue; }
+            if ( /\bawait\b/.test(line) === false ) { continue; }
+            offenders.push(`${rel}:${i+1}: ${line.trim()}`);
+        }
+    }
+    if ( offenders.length !== 0 ) {
+        fail('top-level-await',
+            `top-level await is forbidden in a service worker; ${offenders.length} module-scope use(s):\n` +
+            offenders.map(o => `  ${o}`).join('\n'),
+            'resolve it at build time in tools/patch-mv3-modules.mjs (see its js/publicsuffix.js transform); if the line is not really at module scope, refine this scan');
+    } else {
+        pass('no top-level await reachable from the service worker');
+    }
+}
+
 // The rewrite is only useful if the substitute exists and is populated.
 {
     const shims = readPkg('js/mv3-shims.js');
