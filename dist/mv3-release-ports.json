@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "pins": {
+    "1.75.0": {
+      "upstream": "21f0e686506bb21b514b451c8c6cb9bf8c82d232",
+      "port": "adc99f6bde4ee562da93963d888ea1ae7eab5b40",
+      "reason": "Use the MV3 port shipped as 1.75.0.506-mv3; current master requires newer upstream scriptlet and publicsuffix modules."
+    }
+  }
+}

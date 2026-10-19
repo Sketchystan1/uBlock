@@ -88,6 +88,7 @@ cat > $DES/build-info.json <<EOF
   "version": "$(cat ./dist/version)",
   "ref": "${1:-}",
   "commit": "$(git_head .)",
+  "release": $(cat ./dist/mv3-release.json 2>/dev/null || echo null),
   "uAssets": {
     "main": "$(git_head dist/build/uAssets/main)",
     "prod": "$(git_head dist/build/uAssets/prod)"

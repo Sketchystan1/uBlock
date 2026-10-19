@@ -264,6 +264,9 @@ jobs:
           else
             echo "Chromium **Manifest V3** build of **uBlock Origin (Sketchy MV3 fork)** \`${VERSION}\`, from upstream tag \`${VERSION}\`." > release.body.md
           fi
+          if [ -f dist/mv3-release.json ]; then
+            node -e 'const p = require("./dist/mv3-release.json"); if (p.pinned) console.log("\nUses MV3 port commit `" + p.port + "` for compatibility with this upstream release.")' >> release.body.md
+          fi
 
       - name: Create GitHub release
         env:

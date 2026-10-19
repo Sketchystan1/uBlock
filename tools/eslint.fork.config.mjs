@@ -20,6 +20,8 @@ export default [
             'tools/patch-mv3-modules.mjs',
             'tools/verify-mv3-package.mjs',
             'tools/test-mv3-scriptlet-injection.mjs',
+            'tools/make-mv3-release-tree.mjs',
+            'tools/test-mv3-release-tree.mjs',
             'tools/make-crx.mjs',
         ],
         languageOptions: {

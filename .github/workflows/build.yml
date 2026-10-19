@@ -31,6 +31,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check fork overlay
+        run: |
+          git fetch --no-tags https://github.com/gorhill/uBlock.git master:refs/remotes/upstream/master
+          node tools/make-mv3-release-tree.mjs --check-only
 
       - name: Set up node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -74,9 +80,14 @@ jobs:
           "tools/patch-mv3-modules.mjs"
           "tools/verify-mv3-package.mjs"
           "tools/test-mv3-scriptlet-injection.mjs"
+          "tools/make-mv3-release-tree.mjs"
+          "tools/test-mv3-release-tree.mjs"
           "tools/make-crx.mjs"
           "tools/make-update-xml.mjs"
           "tools/verify-crx.mjs"
+
+      - name: Test release tree construction
+        run: node --test tools/test-mv3-release-tree.mjs
 
       - name: Clone uAssets
         run: bash tools/pull-assets.sh
@@ -85,10 +96,51 @@ jobs:
         # Invoked through `bash` rather than relying on the executable bit,
         # which is not preserved when committing from a filesystem without one.
         # Runs tools/patch-mv3-modules.mjs and then tools/verify-mv3-package.mjs.
-        run: bash tools/make-chromium-mv3.sh
+        run: make chromium-mv3-fork
 
       - name: Upload package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: uBlock0.chromium-mv3
           path: dist/build/uBlock0.chromium-mv3
+
+  release-tree:
+    name: Verify release tree (${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable, current]
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Construct release without publishing
+        env:
+          CHANNEL: ${{ matrix.channel }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --no-tags https://github.com/gorhill/uBlock.git master:refs/remotes/upstream/master
+          git fetch --no-tags https://github.com/gorhill/uBlock.git '+refs/tags/*:refs/upstream-tags/*'
+          base=$(git merge-base HEAD upstream/master)
+          pattern='^[0-9]+\.[0-9]+\.[0-9]+((b|rc)[0-9]+)?$'
+          if [ "$CHANNEL" = stable ]; then pattern='^[0-9]+\.[0-9]+\.[0-9]+$'; fi
+          tag=$(git for-each-ref --merged "$base" --format='%(refname:strip=2)' refs/upstream-tags/ \
+            | grep -E "$pattern" | sort -V | tail -n 1)
+          test -n "$tag"
+          node tools/make-mv3-release-tree.mjs --tag "$tag"
+
+      - name: Clone uAssets
+        run: bash tools/pull-assets.sh
+
+      - name: Build and verify release package
+        run: make chromium-mv3-fork

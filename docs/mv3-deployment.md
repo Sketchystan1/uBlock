@@ -37,6 +37,10 @@ bash tools/pull-assets.sh            # clone uAssets (once)
 bash tools/make-chromium-mv3.sh      # -> dist/build/uBlock0.chromium-mv3/
 ```
 
+`make chromium-mv3-fork` is the equivalent Make target. It lives in the fork's
+`GNUmakefile`, which includes upstream's unchanged `Makefile` and preserves its
+default target.
+
 Pass a version to also produce a zip: `bash tools/make-chromium-mv3.sh 1.74.2`.
 
 The MV3 manifest is **generated** from `platform/chromium/manifest.json` by
@@ -336,21 +340,56 @@ defeated by load-order surprises.
 |---|---|---|
 | `.github/workflows/sync-upstream.yml` | daily + manual | Merges `gorhill/uBlock` `master`, **builds and verifies before pushing anything**, then constructs the release tree (upstream at the tag + this fork's files) and tags it `<upstream-tag>-mv3`. On a conflict, a merge that no longer builds, or a release tree that does not build, it opens an issue and pushes nothing. |
 | `.github/workflows/release.yml` | `*-mv3` tag push, or dispatch | Builds and verifies, signs the CRX, publishes the release with checksums and provenance, and deploys both update manifests to GitHub Pages |
-| `.github/workflows/build.yml` | push / PR | Builds and verifies |
+| `.github/workflows/build.yml` | push / PR | Checks that the fork only adds files, builds master, and constructs/builds both stable and current release trees without publishing |
 
 Two details worth knowing, both learned the hard way:
 
 - **The release tree is not master.** Tagging the merge commit would ship upstream master's *tip*
   under a tag name it does not correspond to, and take the package version from whatever
   `dist/version` master happened to hold. The release tree is therefore built as *upstream at the
-  tag* plus this fork's added files — conflict-free by construction. The fork's
-  add-nothing-modify-nothing property is what makes this work: the release tree is assembled from
+  tag* plus a compatible revision of this fork's added files. The fork's
+  add-files-modify-none property is what makes this work: the release tree is assembled from
   `git diff --diff-filter=A`, so a modification to an upstream file would be silently dropped
   from every release while master still looked correct. `sync-upstream.yml` asserts the property
   on every run.
 - **`gh` needs `GH_REPO` pinned.** `gh` infers its target repository from git remotes and prefers
   a remote named `upstream` over `origin`. `sync-upstream.yml` adds exactly such a remote, so
   without the pin every `gh` call in that job silently targets `gorhill/uBlock`.
+
+### Compatibility with older upstream releases
+
+`tools/make-mv3-release-tree.mjs` uses the current port by default. Exact upstream
+tags can select an older, tested port in `dist/mv3-release-ports.json`, pinned by
+full upstream and port commit hashes. A moved upstream tag or a port based on a
+different upstream revision fails before the checkout changes.
+
+Upstream `1.75.0` uses the port shipped in `1.75.0.506-mv3`, because newer port
+revisions depend on scriptlet and publicsuffix modules added after that stable
+tag. This preserves the tested older runtime; it does not backport newer runtime
+fixes. To update that runtime, apply compatible fixes to a branch based on its
+pinned port, verify it against `1.75.0`, then update the port hash.
+
+Release construction always takes signing/publishing tools and `dist/mv3-build`
+from current master. A new `1.75.0` build therefore gets a new version rather than
+reusing `1.75.0.506`. The selected upstream, port and tooling commits are recorded
+in `dist/mv3-release.json` and the package's `build-info.json`.
+
+Every `Build MV3` run tests release construction and builds the newest stable and
+newest release-shaped upstream tags already merged into the fork. These checks
+have read-only GitHub permissions and publish nothing. They exercise the same
+release-tree constructor used by the sync workflow.
+
+To inspect the selection without changing the checkout:
+
+```sh
+node tools/make-mv3-release-tree.mjs --plan --tag 1.75.0
+```
+
+This needs the upstream tag refs fetched as described in `sync-upstream.yml`.
+Dispatch `build.yml` to verify both release paths. Dispatching `sync-upstream.yml`
+with `tag=1.75.0` goes further: it builds, tags and publishes the next stable build.
+
+### Repository setup
 
 One-time repository setup:
 
