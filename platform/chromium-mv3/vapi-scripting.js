@@ -24,8 +24,7 @@
     MV3 replacement for `platform/chromium/vapi-scripting.js`, which
     `tools/make-chromium-mv3.sh` overwrites with this file in the package.
 
-    Upstream's Chromium flavor executes one code string -- every scriptlet of
-    every filter list, plus an early-bailout preamble -- in each committed
+    Upstream's Chromium flavor executes a generated code string in each committed
     frame through `tabs.executeScript({ code })`, and has the isolated half
     insert the main-world half as a `<script>` element. Neither survives MV3:
     no API executes a code string in any world, and every world governs
@@ -34,9 +33,9 @@
     one piece of them which is data: the per-registration `scriptletGlobals`
     (warOrigin, warSecret, and the logger's bcSecret/logLevel when it is on),
     which the scriptlets read at run time and which upstream bakes into the
-    code strings. Registration also serves as the "armed" state: upstream
-    unregisters while the engine is reset or holds no scriptlet at all, and
-    injects nothing in the meantime -- neither does this port.
+    code strings. Before upstream 66e759691 it supplied these at registration;
+    newer builds supply a callback which prepares them for each hostname.
+    Keep both APIs so the fork can also build the preceding upstream versions.
 
     The injection itself is performed per committed frame by `mv3-post.js`,
     which resolves the frame's scriptlet calls from the engine's own database
@@ -53,6 +52,21 @@
 /******************************************************************************/
 
 let registeredGlobals;
+let getContentScripts;
+const hostnameGlobals = new Map();
+
+export function onGetContentScripts(fn) {
+    getContentScripts = fn;
+    reset();
+}
+
+// Upstream calls this after engine reloads/selfies and changes to filtering,
+// hidden settings or the logger. Never retain a secret or firewall snapshot
+// across one of those changes. The callback itself survives a reset.
+export function reset() {
+    registeredGlobals = undefined;
+    hostnameGlobals.clear();
+}
 
 export function registerContentScripts(details) {
     registeredGlobals = undefined;
@@ -67,9 +81,28 @@ export function unregisterContentScripts() {
     registeredGlobals = undefined;
 }
 
-// MV3-only: consumed by mv3-post.js. `undefined` while nothing is registered.
-export function mv3RegisteredScriptletGlobals() {
-    return registeredGlobals;
+// MV3-only: the caller resolves about: frames and checks the live filter DB
+// before asking for globals. Only data is retained; generated code is never
+// executed. Bound this cache because a worker can stay alive indefinitely.
+export function mv3RegisteredScriptletGlobals(url) {
+    if ( getContentScripts === undefined ) { return registeredGlobals; }
+    let hostname;
+    try { hostname = new URL(url).hostname; } catch { return; }
+    if ( hostname === '' ) { return; }
+    if ( hostnameGlobals.has(hostname) ) {
+        const globals = hostnameGlobals.get(hostname);
+        hostnameGlobals.delete(hostname);
+        hostnameGlobals.set(hostname, globals);
+        return globals;
+    }
+    const details = getContentScripts(url);
+    if ( details?.scriptletGlobals instanceof Object === false ) { return; }
+    const globals = Object.assign({}, details.scriptletGlobals);
+    hostnameGlobals.set(hostname, globals);
+    if ( hostnameGlobals.size > 128 ) {
+        hostnameGlobals.delete(hostnameGlobals.keys().next().value);
+    }
+    return globals;
 }
 
 /******************************************************************************/

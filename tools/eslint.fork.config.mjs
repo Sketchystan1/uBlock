@@ -19,6 +19,7 @@ export default [
             'platform/chromium-mv3/*.js',
             'tools/patch-mv3-modules.mjs',
             'tools/verify-mv3-package.mjs',
+            'tools/test-mv3-scriptlet-injection.mjs',
             'tools/make-crx.mjs',
         ],
         languageOptions: {

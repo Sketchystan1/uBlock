@@ -243,6 +243,32 @@ if ( fs.existsSync(pkgDir) === false ) {
 
 /******************************************************************************/
 
+// Upstream 66e759691 moved these bundled templates to a top-level awaited
+// fetch. Inline their exact text at build time: a service worker module must
+// evaluate synchronously. Older upstream versions load them inside an async
+// method and need no change. Fail closed if the top-level shape drifts.
+{
+    const rel = 'js/scriptlet-filtering.js';
+    const abs = path.join(pkgDir, rel);
+    const src = fs.readFileSync(abs, 'utf8');
+    const marker = 'uBO MV3 bundled scriptlet templates';
+    if ( src.includes(marker) === false && /^const \[\r?\n\s+templateBegin,/m.test(src) ) {
+        const anchor = /^const \[\r?\n {4}templateBegin,\r?\n {4}templateCore,\r?\n {4}templateEnd,\r?\n\] = await Promise\.all\(\[\r?\n {4}fetch\('\/js\/scriptlet-begin\.template\.js'\)\.then\(response => response\.text\(\)\),\r?\n {4}fetch\('\/js\/scriptlet\.template\.js'\)\.then\(response => response\.text\(\)\),\r?\n {4}fetch\('\/js\/scriptlet-end\.template\.js'\)\.then\(response => response\.text\(\)\),\r?\n\]\);/gm;
+        if ( [ ...src.matchAll(anchor) ].length !== 1 ) {
+            throw new Error(`${rel}: scriptlet template loader changed; reconcile the MV3 build transform`);
+        }
+        const templates = [ 'scriptlet-begin', 'scriptlet', 'scriptlet-end' ].map(name =>
+            fs.readFileSync(path.join(pkgDir, `js/${name}.template.js`), 'utf8')
+        );
+        const replacement = `// [${marker}]\n` +
+            `const [ templateBegin, templateCore, templateEnd ] = ${JSON.stringify(templates)};`;
+        fs.writeFileSync(abs, src.replace(anchor, () => replacement));
+        console.log(`*** patch-mv3-modules: ${rel} embeds bundled templates synchronously`);
+    }
+}
+
+/******************************************************************************/
+
 const reStaticImport =
     /(?:^|\n)[ \t]*(?:import|export)[^;\n]*?from[ \t]+["']([^"']+)["']|(?:^|\n)[ \t]*import[ \t]+["']([^"']+)["']/g;
 

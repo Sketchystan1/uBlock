@@ -488,11 +488,11 @@ mv3ForkStatusReady.then(( ) => {
 
 // Scriptlet injection, per committed frame.
 //
-// Upstream compiles every scriptlet filter into one program which
-// `platform/chromium/vapi-scripting.js` executes as a code string in every
+// Upstream compiles scriptlet filters into programs which
+// `platform/chromium/vapi-scripting.js` executes as code strings in each
 // committed frame, where it matches the document's hostname, entity and
 // ancestors against tables baked into the code. No MV3 API executes a code
-// string, so `./vapi-scripting.js` keeps only the registration state and its
+// string, so `./vapi-scripting.js` keeps only the registration/callback and its
 // `scriptletGlobals`, and the per-frame work happens here, in the service
 // worker -- where MV2 uBO itself did it until upstream 9af8ef4c6: resolve the
 // frame's scriptlet calls from the engine's database, then hand them to
@@ -638,11 +638,10 @@ const internScriptletArgs = ( ) => {
 
 // Upstream's second early bailout (`topFrameRulesMatcher` in
 // `src/js/scriptlet-filtering.js`): the session firewall's first-party rules,
-// snapshotted at registration time, matched against the top-level document's
+// snapshotted when globals are prepared, matched against the top-level document's
 // hostname and its parent domains, then `*`. The first rule found decides,
 // and only an `allow` rule bails out. Rebuilt whenever upstream re-registers
-// -- which it does on every `filteringBehaviorChanged`, firewall toggles
-// included -- exactly as its serialized copy is.
+// or resets its hostname cache -- including every filteringBehaviorChanged.
 let topFrameRules = { globals: undefined, rules: new Map() };
 
 const topFrameRulesBailout = (globals, tabHostname) => {
@@ -674,14 +673,12 @@ const injectFrameScriptlets = details => {
     if ( typeof frameId !== 'number' ) { return; }
     if ( typeof details.url !== 'string' ) { return; }
     if ( reScriptletDocumentURL.test(details.url) === false ) { return; }
-    // Nothing registered: the engine is being reset, or holds no scriptlet.
-    const globals = mv3RegisteredScriptletGlobals();
-    if ( globals === undefined ) { return; }
+    // The callback is registered at module evaluation, before engine startup.
+    if ( µb.readyToFilter !== true ) { return; }
     // Upstream's first early bailout (`isTrustedContext`): the top-level
     // document is on a trusted site.
     const pageStore = µb.pageStoreFromTabId(tabId);
     if ( pageStore === null || pageStore.isTrusted() ) { return; }
-    if ( topFrameRulesBailout(globals, pageStore.tabHostname) ) { return; }
     const url = details.url.startsWith('about:')
         ? pageStore.getEffectiveFrameURL({ frameId, frameURL: details.url })
         : details.url;
@@ -695,6 +692,9 @@ const injectFrameScriptlets = details => {
         ancestors: pageStore.getFrameAncestorDetails(frameId),
     });
     if ( tokens === undefined || tokens.length === 0 ) { return; }
+    const globals = mv3RegisteredScriptletGlobals(url);
+    if ( globals === undefined ) { return; }
+    if ( topFrameRulesBailout(globals, pageStore.tabHostname) ) { return; }
     const { mainCalls, isolatedCalls } = scriptletCallsFromTokens(tokens);
     if ( mainCalls.length === 0 && isolatedCalls.length === 0 ) { return; }
     const { args, compact } = internScriptletArgs();
@@ -734,9 +734,11 @@ const injectFrameScriptlets = details => {
     }
 }
 
-// Upstream also injects into every already-open tab, once per launch (`onceFn`
-// in platform/chromium/vapi-scripting.js): that is what gives tabs open at
-// install, update or re-enable their scriptlets. A service worker restart is
+// Preserve the once-per-launch sweep from the pre-66e759691 Chromium injector:
+// it gives tabs open at install, update or re-enable their scriptlets. The
+// upstream hostname-cache refactor removed its sweep; this fork still needs
+// it for documents which committed before the worker finished booting.
+// A service worker restart is
 // not a launch -- the tabs it finds went through `onCommitted` already -- so
 // the sweep is gated on a `storage.session` flag, which survives worker
 // restarts and is cleared by browser restart and extension reload/update.

@@ -1090,19 +1090,39 @@ section('upstream drift');
 // silently does nothing, injects where upstream would not (or the reverse),
 // or its log lines stop reaching the logger.
 {
+    const perHostname = /scripting\.onGetContentScripts\(/.test(readRepo('src/js/scriptlet-filtering.js'));
     const checks = [
         // The registration API this port's vapi-scripting.js stands in for,
         // and what it reads out of the registration.
         [ 'src/js/scriptlet-filtering.js', /import \* as scripting from '\.\/vapi-scripting\.js';/,
           'scriptlet-filtering.js no longer registers through vapi-scripting.js, which platform/chromium-mv3/vapi-scripting.js replaces' ],
-        [ 'src/js/scriptlet-filtering.js', /return scripting\.registerContentScripts\(options\);/,
-          'scriptlet-filtering.js no longer hands its registration to scripting.registerContentScripts(options)' ],
+        ...(perHostname ? [
+            [ 'src/js/scriptlet-filtering.js', /scripting\.onGetContentScripts\(\s*scriptletFilteringEngine\.getContentScripts\.bind\(scriptletFilteringEngine\)\s*\);/,
+              'the per-hostname scriptlet provider changed' ],
+            [ 'src/js/scriptlet-filtering.js', /getContentScripts\(url\) \{[\s\S]*?return options;\s*\}/,
+              'the per-hostname provider no longer returns its options' ],
+            [ 'src/js/scriptlet-filtering.js', /case 'filteringBehaviorChanged':\s*scripting\.reset\(\);/,
+              'filteringBehaviorChanged no longer invalidates cached scriptlet globals' ],
+            [ 'platform/chromium/vapi-scripting.js', /browser\.webNavigation\.onCommitted\.addListener\(onCommitted\);/,
+              'the per-hostname Chromium injector no longer runs on committed frames' ],
+            [ 'platform/chromium/vapi-scripting.js', /url\.startsWith\('about:'\)[\s\S]*?getEffectiveURL\(tabId, frameId\)/,
+              'the per-hostname Chromium injector changed about: frame resolution' ],
+            [ 'platform/chromium/vapi-scripting.js', /const hostname = hostnameFromURI\(url\);\s*if \( hostname === '' \) \{ return; \}/,
+              'the per-hostname Chromium injector changed its hostname guard' ],
+        ] : [
+            [ 'src/js/scriptlet-filtering.js', /return scripting\.registerContentScripts\(options\);/,
+              'scriptlet-filtering.js no longer hands its registration to scripting.registerContentScripts(options)' ],
+            [ 'src/js/scriptlet-filtering.js', /case 'filteringBehaviorChanged':\s*this\.registerContentScripts\(\);/,
+              'filteringBehaviorChanged no longer re-registers scriptlets' ],
+            [ 'platform/chromium/vapi-scripting.js', /browser\.webNavigation\.onCommitted\.addListener\(details => \{\s*if \( \/\^https\?:\|\^about:\/\.test\(details\.url\) === false \) \{ return; \}/,
+              'the Chromium injector changed its committed-frame trigger' ],
+            [ 'platform/chromium/vapi-scripting.js', /const tabs = await vAPI\.tabs\.query\(\{ url: '<all_urls>' \}\);/,
+              'the Chromium injector changed its launch sweep' ],
+        ]),
         [ 'src/js/scriptlet-filtering.js', /scriptletGlobals: \{\s*warOrigin: this\.warOrigin,\s*warSecret: this\.warSecret,\s*\},/,
           'the registration no longer carries scriptletGlobals { warOrigin, warSecret }, which vapi-scripting.js keeps for the injection' ],
         [ 'src/js/scriptlet-filtering.js', /options\.scriptletGlobals\.bcSecret = vAPI\.generateSecret\(3\);/,
           'the logger secret is no longer carried in scriptletGlobals, so mv3-post.js can no longer hand it to the relay' ],
-        [ 'src/js/scriptlet-filtering.js', /case 'filteringBehaviorChanged':\s*this\.registerContentScripts\(\);/,
-          'the engine no longer re-registers on filteringBehaviorChanged, which is when mv3-post.js re-snapshots the first-party firewall rules' ],
         // Upstream's early bailouts, which mv3-post.js re-applies: exactly
         // isTrustedContext (+ the matcher it is handed) and
         // topFrameRulesMatcher. A third one appearing is a new bailout the
@@ -1124,12 +1144,8 @@ section('upstream drift');
           'the "contentscript" message channel is gone or renamed' ],
         // How upstream's Chromium flavor decides where and when to inject,
         // which mv3-post.js reproduces.
-        [ 'platform/chromium/vapi-scripting.js', /browser\.webNavigation\.onCommitted\.addListener\(details => \{\s*if \( \/\^https\?:\|\^about:\/\.test\(details\.url\) === false \) \{ return; \}/,
-          'the Chromium injector no longer injects on webNavigation.onCommitted for http(s)/about: documents; reconcile the trigger in mv3-post.js' ],
         [ 'platform/chromium/vapi-scripting.js', /if \( self\.vapiScripting \) \{ return 0; \}/,
           'the Chromium injector no longer guards on self.vapiScripting, which prepareScriptletInjection in mv3-shims.js mirrors' ],
-        [ 'platform/chromium/vapi-scripting.js', /const tabs = await vAPI\.tabs\.query\(\{ url: '<all_urls>' \}\);/,
-          'the Chromium injector no longer sweeps already-open tabs once per launch, which mv3-post.js mirrors' ],
         // What the per-frame resolution in mv3-post.js reads.
         [ 'src/js/redirect-engine.js', /js: entry\.toContent\(\),\s*world: entry\.world,\s*dependencies: entry\.dependencies\.slice\(\),\s*priority: entry\.priority \?\? 0,/,
           'redirectEngine.contentFromName() no longer returns { js, world, dependencies, priority }, which scriptletCallsFromTokens() in mv3-post.js reads' ],
@@ -1205,6 +1221,21 @@ section('upstream drift');
     }
     if ( broken === 0 ) {
         pass(`${checks.length + 2} scriptlet-injection upstream assumptions hold`);
+    }
+}
+
+// Exercise the upstream engine and this fork's adapter together; export and
+// source-shape checks alone cannot detect stale globals or a reset that leaves
+// injection permanently disarmed.
+{
+    const result = spawnSync(process.execPath, [
+        path.join(repoDir, 'tools/test-mv3-scriptlet-injection.mjs'), pkgDir,
+    ], { encoding: 'utf8', timeout: 30000 });
+    if ( result.status === 0 ) {
+        pass('scriptlet runtime: selection, exceptions, frames, firewall, logger, reload and selfie');
+    } else {
+        fail('scriptlet-runtime', result.error?.message || result.stderr || result.stdout,
+            'run node tools/test-mv3-scriptlet-injection.mjs with the package directory');
     }
 }
 
