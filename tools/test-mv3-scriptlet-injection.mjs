@@ -15,6 +15,19 @@ const plain = value => JSON.parse(JSON.stringify(value));
 const withoutImports = src => src.replace(/^import\b[\s\S]*?;\r?$/gm, '').replace(/^export /gm, '');
 const broadcasts = [];
 const injections = [];
+const contentScripts = [];
+const openTabs = [
+    { id: 1 },
+    { id: 2 }, // content script already present
+    { id: 3, discarded: true },
+    { id: 4, status: 'unloaded' },
+    { id: 5 }, // tab closes before the checker runs
+];
+const manifest = { content_scripts: [ {
+    js: [ 'js/vapi.js', 'js/contentscript.js' ],
+    all_frames: true,
+    run_at: 'document_start',
+} ] };
 const storage = {};
 let secret = 0;
 let firewallRules = [];
@@ -39,6 +52,7 @@ const ubo = {
 };
 const context = vm.createContext({
     URL, console, structuredClone,
+    chrome: { runtime: { getManifest: () => manifest } },
     self: { crypto: webcrypto },
     makeScriptlets,
     builtinScriptlets: [ main, isolated ],
@@ -51,7 +65,14 @@ const context = vm.createContext({
         generateSecret: () => `logger-${++secret}`,
         webextFlavor: { soup: new Set() },
         defer: { create: () => ({ off() {}, onidle() {}, ongoing: () => false }) },
-        tabs: { query: async () => [] },
+        tabs: {
+            query: async () => openTabs,
+            executeScript: async (tabId, details) => {
+                contentScripts.push({ tabId, ...details });
+                if ( tabId === 5 ) { return []; }
+                return [ tabId === 1 ];
+            },
+        },
     },
     logger: { enabled: true },
     onBroadcast: fn => { broadcasts.push(fn); return {}; },
@@ -72,13 +93,13 @@ const context = vm.createContext({
 });
 const run = src => vm.runInContext(src, context);
 const scripting = run(withoutImports(read('vapi-scripting')) + '\n' +
-    '({ registerContentScripts, unregisterContentScripts, onGetContentScripts, reset, mv3RegisteredScriptletGlobals });');
+    '({ registerContentScripts, unregisterContentScripts, onGetContentScripts, start, reset, mv3RegisteredScriptletGlobals });');
 context.scripting = scripting;
 context.mv3RegisteredScriptletGlobals = scripting.mv3RegisteredScriptletGlobals;
 run(withoutImports(read('static-ext-filtering-db')));
 run(withoutImports(read('scriptlet-filtering-core')));
 const engineSource = read('scriptlet-filtering');
-const perHostname = engineSource.includes('scripting.onGetContentScripts(');
+const perHostname = /scripting\.(?:onGetContentScripts|start)\(/.test(engineSource);
 const engine = run(withoutImports(engineSource).replace(/^default scriptletFilteringEngine;\r?$/m, 'scriptletFilteringEngine;'));
 
 if ( perHostname ) {
@@ -113,6 +134,17 @@ add('other.test', 'main-probe', 'other');
 await engine.freeze();
 assert.equal(inject(details), undefined, 'do not prepare scripts before the engine is ready');
 ubo.readyToFilter = true;
+if ( typeof engine.start === 'function' ) {
+    await engine.start();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(contentScripts, [
+        ...[ 1, 2, 5 ].map(tabId => ({ tabId, file: 'js/scriptlets/should-inject-contentscript.js' })),
+        ...manifest.content_scripts[0].js.map(file => ({ tabId: 1, file, allFrames: true, runAt: 'document_start' })),
+    ], 'startup injects missing declarative scripts and skips injected, discarded, unloaded and closed tabs');
+    const injectionCount = contentScripts.length;
+    await engine.start();
+    assert.equal(contentScripts.length, injectionCount, 'repeated startup does not repeat the launch sweep');
+}
 let result = inject(details);
 assert.deepEqual(plain(result.target), { tabId: 1, documentIds: [ 'doc-1' ] });
 assert.deepEqual(plain(calls(result)).sort(), [
@@ -170,4 +202,4 @@ if ( perHostname ) {
     assert.notEqual(scripting.mv3RegisteredScriptletGlobals(details.url), beforeEviction, 'hostname cache is bounded');
 }
 assert.ok(injections.length > 0);
-console.log('Scriptlet runtime checks passed: templates, selection, exceptions, frames, firewall, logger, reload and selfie.');
+console.log('Scriptlet runtime checks passed: startup, templates, selection, exceptions, frames, firewall, logger, reload and selfie.');

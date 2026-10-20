@@ -111,10 +111,10 @@
     through and left the worker half-up. The handlers this covers (the
     popup-panel commands, and getLists) report or mutate state which is fully
     initialized only at the very end of the launch sequence, so they await
-    `µb.isReadyPromise` -- a promise created with a resolve handler only and
-    resolved as the last statement of a *successful* launch (see background.js
-    and start.js); a failed launch leaves it pending forever, and a handler
-    awaiting it hangs the reply `callback` (the popup panel never paints). The
+    `µb.isReadyPromise` -- the startup promise in start.js (older upstream
+    versions resolve it explicitly). A failed launch can reject it or leave
+    it pending forever, and a handler awaiting it hangs the reply `callback`
+    unless both cases are handled (the popup panel never paints). The
     `whenReady()` helper races readiness against a bounded timeout, answers the
     callback exactly once, and degrades gracefully on timeout or error.
     Symmetrically, a failed storage read must not be treated as a first-run:
@@ -837,10 +837,9 @@ for ( const rel of conflicts ) {
                         '// Several message handlers routed through `whenReady()` (the popup-panel',
                         '// commands, and `getLists`) report or mutate state which is fully initialized',
                         '// only at the very end of the launch sequence, so they must wait on',
-                        '// `µb.isReadyPromise`. That promise is created with a resolve handler only (see',
-                        '// background.js) and is resolved as the last statement of a *successful* launch',
-                        '// (see start.js); a launch which throws at an earlier `await` leaves it forever',
-                        '// pending. To ensure the framework\'s reply `callback` is invoked exactly once',
+                        '// `µb.isReadyPromise`. A failed launch can reject it or leave it pending',
+                        '// forever, depending on the upstream startup implementation. To ensure',
+                        '// the framework\'s reply `callback` is invoked exactly once',
                         '// -- so the caller never hangs and the reply callback is never leaked -- race',
                         '// readiness against a bounded timeout and degrade gracefully on timeout or',
                         '// error. `fn` performs the work and resolves to the response; `fallback`',
@@ -1084,8 +1083,8 @@ for ( const rel of conflicts ) {
                         '    case \'getLists\':',
                         '        // Same readiness/hang guard as the popup-panel commands: `getLists`',
                         '        // reads engine state that is only valid at the end of the launch',
-                        '        // sequence, and `µb.isReadyPromise` stays pending forever on a failed',
-                        '        // launch. Route through `whenReady()` so the reply callback fires',
+                        '        // sequence. A failed launch can reject `µb.isReadyPromise` or leave',
+                        '        // it pending. Route through `whenReady()` so the reply callback fires',
                         '        // exactly once -- with the lists on success, or an empty (but',
                         '        // object-shaped) degraded response on timeout/error so the dashboard\'s',
                         '        // `Object.entries(response.available)` cannot throw.',
@@ -1206,6 +1205,7 @@ for ( const rel of conflicts ) {
             probe: 'mv3FirstInstallRestarted',
             edits: [
                 {
+                    reindent: true,
                     anchor: [
                         '    // https://github.com/uBlockOrigin/uBlock-issues/issues/1547',
                         '    if ( lastVersionInt === 0 && vAPI.webextFlavor.soup.has(\'chromium\') ) {',
@@ -1274,7 +1274,18 @@ for ( const rel of conflicts ) {
                 const eol = src.includes('\r\n') ? '\r\n' : '\n';
                 let out = src;
                 for ( const [ i, edit ] of edits.entries() ) {
-                    const anchor = edit.anchor.join(eol);
+                    // Startup was reindented when upstream made its async
+                    // function the readiness promise. Match the same exact
+                    // block at its current indentation, retaining drift checks.
+                    let format = lines => lines.join(eol);
+                    if ( edit.reindent ) {
+                        const first = edit.anchor[0].trimStart();
+                        const matches = out.split(eol).filter(line => line.trimStart() === first);
+                        const indent = matches.length === 1 ? matches[0].slice(0, -first.length) : '';
+                        const offset = edit.anchor[0].length - first.length;
+                        format = lines => lines.map(line => indent + line.slice(offset)).join(eol);
+                    }
+                    const anchor = format(edit.anchor);
                     const count = out.split(anchor).length - 1;
                     if ( count !== 1 ) {
                         console.error(
@@ -1287,7 +1298,7 @@ for ( const rel of conflicts ) {
                         );
                         process.exit(1);
                     }
-                    out = out.replace(anchor, ( ) => edit.replacement.join(eol));
+                    out = out.replace(anchor, ( ) => format(edit.replacement));
                 }
                 fs.writeFileSync(abs, out);
                 console.log(

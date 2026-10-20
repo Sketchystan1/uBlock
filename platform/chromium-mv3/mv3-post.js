@@ -1067,10 +1067,9 @@ const injectFrameScriptlets = details => {
     }
 }
 
-// The real update listener is registered by start.js immediately before
-// isReadyResolve() -- within the same synchronous run of the boot sequence
-// -- so replaying the buffered event once ready is equivalent to having had
-// the listener all along. Same logic as the listener start.js registers.
+// The real update listener is registered by start.js before its readiness
+// promise resolves, so replaying the buffered event once ready is equivalent
+// to having had the listener all along. Same logic as start.js's listener.
 µb.isReadyPromise.then(( ) => {
     const details = mv3EarlyEvents.consumeUpdateAvailable();
     if ( details === null || details instanceof Object === false ) { return; }
@@ -1128,9 +1127,9 @@ if ( vAPI.cloud instanceof Object && typeof vAPI.cloud.getOptions === 'function'
 // The restore is driven from `webRequest.start()`, which start.js calls after
 // `initializeTabs()` has rebuilt the page stores and after
 // `onFirstFetchReady()` has re-seeded the session rules, and before
-// `µb.isReadyResolve()`. The `storage.session` reads are asynchronous, so the
-// restore can complete just after `start()` un-parks the first requests and
-// just after `µb.isReadyResolve()`: a request un-parked in that first tick may
+// `µb.isReadyPromise` resolves. The `storage.session` reads are asynchronous,
+// so the restore can complete just after `start()` un-parks the first requests and
+// just after readiness resolves: a request un-parked in that first tick may
 // be evaluated before its restored strict-block bypass is back, and a popup
 // opened in that window may briefly read pre-restore counts. Both self-heal on
 // the next navigation / journal flush. The flush-snapshot and unbind paths are

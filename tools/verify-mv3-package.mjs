@@ -1090,15 +1090,24 @@ section('upstream drift');
 // silently does nothing, injects where upstream would not (or the reverse),
 // or its log lines stop reaching the logger.
 {
-    const perHostname = /scripting\.onGetContentScripts\(/.test(readRepo('src/js/scriptlet-filtering.js'));
+    const engine = readRepo('src/js/scriptlet-filtering.js');
+    const explicitStart = /await scripting\.start\(/.test(engine);
+    const perHostname = explicitStart || /scripting\.onGetContentScripts\(/.test(engine);
     const checks = [
         // The registration API this port's vapi-scripting.js stands in for,
         // and what it reads out of the registration.
         [ 'src/js/scriptlet-filtering.js', /import \* as scripting from '\.\/vapi-scripting\.js';/,
           'scriptlet-filtering.js no longer registers through vapi-scripting.js, which platform/chromium-mv3/vapi-scripting.js replaces' ],
         ...(perHostname ? [
-            [ 'src/js/scriptlet-filtering.js', /scripting\.onGetContentScripts\(\s*scriptletFilteringEngine\.getContentScripts\.bind\(scriptletFilteringEngine\)\s*\);/,
-              'the per-hostname scriptlet provider changed' ],
+            ...(explicitStart ? [
+                [ 'src/js/scriptlet-filtering.js', /await scripting\.start\(\(\.\.\.args\) =>\s*this\.getContentScripts\(\.\.\.args\)\s*\);\s*this\.#startListening\(\);/,
+                  'scriptlet startup no longer registers its provider and change listeners' ],
+                [ 'src/js/start.js', /await scriptletFilteringEngine\.start\(\);/,
+                  'startup no longer starts the scriptlet engine' ],
+            ] : [
+                [ 'src/js/scriptlet-filtering.js', /scripting\.onGetContentScripts\(\s*scriptletFilteringEngine\.getContentScripts\.bind\(scriptletFilteringEngine\)\s*\);/,
+                  'the per-hostname scriptlet provider changed' ],
+            ]),
             [ 'src/js/scriptlet-filtering.js', /getContentScripts\(url\) \{[\s\S]*?return options;\s*\}/,
               'the per-hostname provider no longer returns its options' ],
             [ 'src/js/scriptlet-filtering.js', /case 'filteringBehaviorChanged':\s*scripting\.reset\(\);/,
@@ -1227,15 +1236,18 @@ section('upstream drift');
 // Exercise the upstream engine and this fork's adapter together; export and
 // source-shape checks alone cannot detect stale globals or a reset that leaves
 // injection permanently disarmed.
-{
+for ( const [ script, label ] of [
+    [ 'test-mv3-scriptlet-injection.mjs', 'scriptlet runtime: startup, selection, exceptions, frames, firewall, logger, reload and selfie' ],
+    [ 'test-mv3-startup.mjs', 'startup runtime: durable write, once-only restart, storage failures and normal boot' ],
+] ) {
     const result = spawnSync(process.execPath, [
-        path.join(repoDir, 'tools/test-mv3-scriptlet-injection.mjs'), pkgDir,
+        path.join(repoDir, 'tools', script), pkgDir,
     ], { encoding: 'utf8', timeout: 30000 });
     if ( result.status === 0 ) {
-        pass('scriptlet runtime: selection, exceptions, frames, firewall, logger, reload and selfie');
+        pass(label);
     } else {
-        fail('scriptlet-runtime', result.error?.message || result.stderr || result.stdout,
-            'run node tools/test-mv3-scriptlet-injection.mjs with the package directory');
+        fail(label, result.error?.message || result.stderr || result.stdout,
+            `run node tools/${script} with the package directory`);
     }
 }
 
@@ -1336,19 +1348,26 @@ section('upstream drift');
     }
     // start.js must call contextMenu.update() and register
     // runtime.onUpdateAvailable after initializeTabs() but before
-    // isReadyResolve(): the replay of buffered cold-wake events and the
+    // readiness resolves: the replay of buffered cold-wake events and the
     // session-state restore both hang off that exact window.
     {
         const start = readRepo('src/js/start.js');
         const p1 = start.indexOf('await initializeTabs()');
         const p2 = start.indexOf('contextMenu.update()');
         const p3 = start.indexOf('onUpdateAvailable.addListener');
-        const p4 = start.indexOf('isReadyResolve()');
+        // New upstream assigns the whole async startup to isReadyPromise;
+        // the preceding implementation resolved it explicitly near the end.
+        const asyncStart = /^µb\.isReadyPromise = \(async function start\(\) \{/m.exec(start);
+        const asyncEnd = /^\}\)\(\);\s*$/m.exec(asyncStart === null ? '' : start.slice(asyncStart.index));
+        const p4 = asyncEnd === null
+            ? start.indexOf('isReadyResolve()')
+            : asyncStart.index + asyncEnd.index;
         if ( p1 === -1 || p2 === -1 || p3 === -1 || p4 === -1 ||
-             p1 > p2 || p2 > p3 || p3 > p4 ) {
+             p1 > p2 || p2 > p3 || p3 > p4 ||
+             (asyncStart !== null && asyncStart.index > p1) ) {
             broken += 1;
             fail('worker-relay-upstream',
-                'src/js/start.js no longer runs initializeTabs() -> contextMenu.update() -> onUpdateAvailable -> isReadyResolve() in that order',
+                'src/js/start.js no longer runs initializeTabs() -> contextMenu.update() -> onUpdateAvailable before readiness resolves',
                 'the cold-wake replay and the session-state restore in platform/chromium-mv3/mv3-post.js are wired to this exact sequence');
         }
     }
@@ -1609,7 +1628,7 @@ section('port self-checks');
     }
     // The unguarded upstream restart -- a bare restart right after the block
     // open -- must not survive into the package: that is the reload-loop hazard.
-    if ( pkg.includes('soup.has(\'chromium\') ) {\n        vAPI.app.restart();') ) {
+    if ( /soup\.has\('chromium'\) \) \{\s*vAPI\.app\.restart\(\);/.test(pkg) ) {
         problems.push('js/start.js still has the unguarded #1547 first-install restart in the package');
     }
     // Upstream anchor the transform rewrites.
@@ -1858,7 +1877,7 @@ section('port self-checks');
 // Session state a service worker death would otherwise revert -- session
 // dynamic rules, per-tab page stores, strict-block bypasses -- is persisted
 // to storage.session and restored from a webRequest.start() wrap, before
-// isReadyResolve(). The strict-block half additionally needs the
+// readiness resolves. The strict-block half additionally needs the
 // strictBlockBypassMap exposure the patcher adds to js/traffic.js.
 {
     const post = readPkg('js/mv3-post.js');
@@ -1885,7 +1904,7 @@ section('port self-checks');
         problems.push('mv3-post.js no longer drives the session-state restore');
     }
     if ( /webRequest\.start = function/.test(post) === false ) {
-        problems.push('mv3-post.js no longer wraps webRequest.start, the one hook that runs after onFirstFetchReady() and before isReadyResolve()');
+        problems.push('mv3-post.js no longer wraps webRequest.start, the one hook that runs after onFirstFetchReady() and before readiness resolves');
     }
     if ( /'\/js\/benchmarks\.js': benchmarks/.test(post) === false ) {
         problems.push('mv3-post.js no longer registers /js/benchmarks.js, so the devtools benchmark buttons hang');

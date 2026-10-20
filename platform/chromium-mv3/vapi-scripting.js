@@ -60,6 +60,34 @@ export function onGetContentScripts(fn) {
     reset();
 }
 
+// Upstream 4594da551 moved provider registration and the content-script
+// launch sweep into start(). Scriptlets themselves are swept by mv3-post.js
+// after readiness; here restore the declarative scripts in already-open tabs.
+export async function start(fn) {
+    const initialized = getContentScripts !== undefined;
+    onGetContentScripts(fn);
+    if ( initialized ) { return; }
+    const manifest = globalThis.chrome.runtime.getManifest();
+    const tabs = await vAPI.tabs.query({ url: [ 'http://*/*', 'https://*/*' ] });
+    for ( const tab of tabs ) {
+        if ( tab.discarded || tab.status === 'unloaded' ) { continue; }
+        vAPI.tabs.executeScript(tab.id, {
+            file: 'js/scriptlets/should-inject-contentscript.js',
+        }).then(results => {
+            if ( results[0] !== true ) { return; }
+            for ( const contentScript of manifest.content_scripts ) {
+                for ( const file of contentScript.js ) {
+                    vAPI.tabs.executeScript(tab.id, {
+                        file,
+                        allFrames: contentScript.all_frames,
+                        runAt: contentScript.run_at,
+                    });
+                }
+            }
+        });
+    }
+}
+
 // Upstream calls this after engine reloads/selfies and changes to filtering,
 // hidden settings or the logger. Never retain a secret or firewall snapshot
 // across one of those changes. The callback itself survives a reset.
