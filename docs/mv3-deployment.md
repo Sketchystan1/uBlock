@@ -361,7 +361,9 @@ Two details worth knowing, both learned the hard way:
 `tools/make-mv3-release-tree.mjs` uses the current port by default. Exact upstream
 tags can select an older, tested port in `dist/mv3-release-ports.json`, pinned by
 full upstream and port commit hashes. A moved upstream tag or a port based on a
-different upstream revision fails before the checkout changes.
+newer or unrelated upstream revision fails before the checkout changes. An
+explicit pin can reuse an ancestor port for a tested maintenance release;
+upstream files still come from the exact requested tag.
 
 Upstream `1.75.0` uses the port shipped in `1.75.0.506-mv3`, because newer port
 revisions depend on scriptlet and publicsuffix modules added after that stable
@@ -369,13 +371,18 @@ tag. This preserves the tested older runtime; it does not backport newer runtime
 fixes. To update that runtime, apply compatible fixes to a branch based on its
 pinned port, verify it against `1.75.0`, then update the port hash.
 
+`1.75.4` is a maintenance release based on `1.75.0`, outside upstream master's
+development line. It pins the same compatible port while retaining the exact
+resource and element-picker fixes from the `1.75.4` tag.
+
 Release construction always takes signing/publishing tools and `dist/mv3-build`
 from current master. A new `1.75.0` build therefore gets a new version rather than
 reusing `1.75.0.506`. The selected upstream, port and tooling commits are recorded
 in `dist/mv3-release.json` and the package's `build-info.json`.
 
-Every `Build MV3` run tests release construction and builds the newest stable and
-newest release-shaped upstream tags already merged into the fork. These checks
+Every `Build MV3` run tests release construction and builds the newest stable tag
+(including maintenance branches) and newest release-shaped upstream tag already
+merged into the fork. These checks
 have read-only GitHub permissions and publish nothing. They exercise the same
 release-tree constructor used by the sync workflow.
 

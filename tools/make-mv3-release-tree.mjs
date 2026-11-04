@@ -61,7 +61,10 @@ export function planRelease({ cwd = process.cwd(), fork = 'HEAD', upstream = 'up
     }
     const port = pin === undefined ? forkCommit : repo.commit(pin.port);
     const selected = repo.overlay(port, upstreamHead);
-    if ( pin !== undefined && selected.base !== upstreamCommit ) {
+    // A stable maintenance tag can descend from an older port's base without
+    // containing master's newer APIs. The exact upstream + port pin records
+    // that this pairing was reviewed; reject newer or unrelated port bases.
+    if ( pin !== undefined && repo.git('merge-base', selected.base, upstreamCommit).trim() !== selected.base ) {
         throw new Error(`Pinned MV3 port was not based on upstream ${tag}`);
     }
     for ( const name of controlFiles ) {

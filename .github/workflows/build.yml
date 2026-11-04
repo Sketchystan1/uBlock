@@ -133,10 +133,15 @@ jobs:
           git fetch --no-tags https://github.com/gorhill/uBlock.git master:refs/remotes/upstream/master
           git fetch --no-tags https://github.com/gorhill/uBlock.git '+refs/tags/*:refs/upstream-tags/*'
           base=$(git merge-base HEAD upstream/master)
-          pattern='^[0-9]+\.[0-9]+\.[0-9]+((b|rc)[0-9]+)?$'
-          if [ "$CHANNEL" = stable ]; then pattern='^[0-9]+\.[0-9]+\.[0-9]+$'; fi
-          tag=$(git for-each-ref --merged "$base" --format='%(refname:strip=2)' refs/upstream-tags/ \
-            | grep -E "$pattern" | sort -V | tail -n 1)
+          if [ "$CHANNEL" = stable ]; then
+            # Match the sync's newest stable tag, including maintenance
+            # releases on branches which have not been merged into master.
+            tag=$(git for-each-ref --sort=-creatordate --format='%(refname:strip=2)' refs/upstream-tags/ \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sed -n '1p')
+          else
+            tag=$(git for-each-ref --merged "$base" --format='%(refname:strip=2)' refs/upstream-tags/ \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+((b|rc)[0-9]+)?$' | sort -V | tail -n 1)
+          fi
           test -n "$tag"
           node tools/make-mv3-release-tree.mjs --tag "$tag"
 

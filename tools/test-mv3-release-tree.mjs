@@ -89,6 +89,29 @@ test('unlisted upstream tags use the current port', t => {
     assert.equal(f.read('platform/runtime.js'), 'current runtime\n');
 });
 
+test('maintenance tags can pin an ancestor port while retaining exact upstream fixes', t => {
+    const f = fixture(t);
+    f.git('checkout', '--detach', f.oldUpstream);
+    f.write('src/engine.js', 'old upstream with maintenance fix\n');
+    const maintenance = f.commit('Upstream maintenance release');
+    f.git('update-ref', 'refs/upstream-tags/1.0.2', maintenance);
+    f.git('checkout', '--detach', f.fork);
+    f.config.pins['1.0.2'] = {
+        upstream: maintenance, port: f.legacy, reason: 'Tested maintenance port',
+    };
+    f.write('dist/mv3-release-ports.json', JSON.stringify(f.config));
+    f.commit('Pin maintenance release');
+    const result = prepareRelease({ cwd: f.cwd, tag: '1.0.2' });
+    assert.equal(result.pinned, true);
+    assert.equal(result.port, f.legacy);
+    assert.equal(f.git('rev-parse', 'HEAD^'), maintenance);
+    assert.equal(f.read('src/engine.js'), 'old upstream with maintenance fix\n');
+    assert.equal(f.read('platform/runtime.js'), 'legacy runtime\n');
+    assert.equal(f.read('tools/make-crx.mjs'), 'current tools/make-crx.mjs\n');
+    assert.equal(f.read('dist/mv3-build'), '508\n');
+    assert.equal(f.git('diff', '--name-only', '--diff-filter=MDRT', maintenance, 'HEAD'), '');
+});
+
 test('upstream modifications fail before any checkout change', t => {
     const f = fixture(t);
     f.write('Makefile', 'changed upstream\n');
