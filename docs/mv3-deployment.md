@@ -375,8 +375,10 @@ pinned port, verify it against `1.75.0`, then update the port hash.
 development line. It pins the same compatible port while retaining the exact
 resource and element-picker fixes from the `1.75.4` tag.
 
-Release construction always takes signing/publishing tools and `dist/mv3-build`
-from current master. A new `1.75.0` build therefore gets a new version rather than
+Release construction always takes signing/publishing tools, every fork-owned
+workflow and `dist/mv3-build` from current master. Keeping current workflows
+avoids GitHub rejecting a release tag pushed with `GITHUB_TOKEN` for restoring
+an older workflow definition. A new `1.75.0` build therefore gets a new version rather than
 reusing `1.75.0.506`. The selected upstream, port and tooling commits are recorded
 in `dist/mv3-release.json` and the package's `build-info.json`.
 

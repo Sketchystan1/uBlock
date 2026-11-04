@@ -38,6 +38,8 @@ function fixture(t, { collision = false } = {}) {
     git('update-ref', 'refs/upstream-tags/1.0.0', oldUpstream);
     write('platform/runtime.js', 'legacy runtime\n');
     write('platform/legacy-only.js', 'legacy helper\n');
+    write('.github/workflows/build.yml', 'legacy build workflow\n');
+    write('.github/workflows/version-shim.yml', 'legacy shim workflow\n');
     write('dist/mv3-build', '501\n');
     const legacy = commit('Compatible legacy port');
 
@@ -73,6 +75,9 @@ test('pinned releases retain exact upstream and legacy runtime, with current too
     assert.equal(fs.existsSync(path.join(f.cwd, 'platform/current-only.js')), false);
     assert.equal(f.read('tools/make-crx.mjs'), 'current tools/make-crx.mjs\n');
     assert.equal(f.read('dist/mv3-build'), '508\n', 'do not reuse the legacy build number');
+    for ( const name of [ '.github/workflows/build.yml', '.github/workflows/version-shim.yml' ] ) {
+        assert.equal(f.read(name), `current ${name}\n`, 'release tags must retain current fork workflows');
+    }
     const provenance = JSON.parse(f.read('dist/mv3-release.json'));
     assert.equal(provenance.upstream, f.oldUpstream);
     assert.equal(provenance.port, f.legacy);

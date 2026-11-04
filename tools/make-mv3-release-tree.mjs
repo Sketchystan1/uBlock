@@ -9,8 +9,13 @@ export const controlFiles = [
     'GNUmakefile',
     'dist/mv3-build',
     'dist/mv3-release-ports.json',
+    // Every fork workflow must match current master: GITHUB_TOKEN cannot
+    // push a release tag which restores a historical workflow definition.
+    '.github/workflows/build.yml',
+    '.github/workflows/release-version-shim.yml',
     '.github/workflows/release.yml',
     '.github/workflows/sync-upstream.yml',
+    '.github/workflows/version-shim.yml',
     'tools/make-mv3-release-tree.mjs',
     'tools/make-chromium-mv3.sh',
     'tools/make-crx.mjs',
