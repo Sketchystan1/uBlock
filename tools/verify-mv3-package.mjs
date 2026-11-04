@@ -1093,6 +1093,7 @@ section('upstream drift');
     const engine = readRepo('src/js/scriptlet-filtering.js');
     const explicitStart = /await scripting\.start\(/.test(engine);
     const perHostname = explicitStart || /scripting\.onGetContentScripts\(/.test(engine);
+    const separateGlobals = /const scriptletGlobals = \{/.test(engine);
     const checks = [
         // The registration API this port's vapi-scripting.js stands in for,
         // and what it reads out of the registration.
@@ -1108,14 +1109,16 @@ section('upstream drift');
                 [ 'src/js/scriptlet-filtering.js', /scripting\.onGetContentScripts\(\s*scriptletFilteringEngine\.getContentScripts\.bind\(scriptletFilteringEngine\)\s*\);/,
                   'the per-hostname scriptlet provider changed' ],
             ]),
-            [ 'src/js/scriptlet-filtering.js', /getContentScripts\(url\) \{[\s\S]*?return options;\s*\}/,
+            [ 'src/js/scriptlet-filtering.js', separateGlobals
+                ? /getContentScripts\(url, options = \{\}\) \{[\s\S]*?return out;\s*\}/
+                : /getContentScripts\(url\) \{[\s\S]*?return options;\s*\}/,
               'the per-hostname provider no longer returns its options' ],
             [ 'src/js/scriptlet-filtering.js', /case 'filteringBehaviorChanged':\s*scripting\.reset\(\);/,
               'filteringBehaviorChanged no longer invalidates cached scriptlet globals' ],
             [ 'platform/chromium/vapi-scripting.js', /browser\.webNavigation\.onCommitted\.addListener\(onCommitted\);/,
               'the per-hostname Chromium injector no longer runs on committed frames' ],
-            [ 'platform/chromium/vapi-scripting.js', /url\.startsWith\('about:'\)[\s\S]*?getEffectiveURL\(tabId, frameId\)/,
-              'the per-hostname Chromium injector changed about: frame resolution' ],
+            [ 'platform/chromium/vapi-scripting.js', /if \( frameId !== 0 && (?:url\.startsWith\('about:'\)|reIsHTTP\.test\(url\) === false) \) \{\s*url = getEffectiveURL\(tabId, frameId\);/,
+              'the per-hostname Chromium injector changed non-network frame resolution' ],
             [ 'platform/chromium/vapi-scripting.js', /const hostname = hostnameFromURI\(url\);\s*if \( hostname === '' \) \{ return; \}/,
               'the per-hostname Chromium injector changed its hostname guard' ],
         ] : [
@@ -1128,9 +1131,13 @@ section('upstream drift');
             [ 'platform/chromium/vapi-scripting.js', /const tabs = await vAPI\.tabs\.query\(\{ url: '<all_urls>' \}\);/,
               'the Chromium injector changed its launch sweep' ],
         ]),
-        [ 'src/js/scriptlet-filtering.js', /scriptletGlobals: \{\s*warOrigin: this\.warOrigin,\s*warSecret: this\.warSecret,\s*\},/,
+        [ 'src/js/scriptlet-filtering.js', separateGlobals
+            ? /const scriptletGlobals = \{\s*warOrigin: this\.warOrigin,\s*warSecret: this\.warSecret,\s*\};[\s\S]*?const out = \{ hostname, scriptletGlobals \};/
+            : /scriptletGlobals: \{\s*warOrigin: this\.warOrigin,\s*warSecret: this\.warSecret,\s*\},/,
           'the registration no longer carries scriptletGlobals { warOrigin, warSecret }, which vapi-scripting.js keeps for the injection' ],
-        [ 'src/js/scriptlet-filtering.js', /options\.scriptletGlobals\.bcSecret = vAPI\.generateSecret\(3\);/,
+        [ 'src/js/scriptlet-filtering.js', separateGlobals
+            ? /scriptletGlobals\.bcSecret = vAPI\.generateSecret\(3\);/
+            : /options\.scriptletGlobals\.bcSecret = vAPI\.generateSecret\(3\);/,
           'the logger secret is no longer carried in scriptletGlobals, so mv3-post.js can no longer hand it to the relay' ],
         // Upstream's early bailouts, which mv3-post.js re-applies: exactly
         // isTrustedContext (+ the matcher it is handed) and
@@ -1166,8 +1173,12 @@ section('upstream drift');
           'tab.js onNavigation no longer records the committed frame in its page store, which ancestor (>>) scriptlet filters need' ],
         [ 'src/js/pagestore.js', /getFrameAncestorDetails\(frameId\) \{/,
           'PageStore.getFrameAncestorDetails() is gone' ],
-        [ 'src/js/pagestore.js', /getEffectiveFrameURL\(sender\) \{/,
-          'PageStore.getEffectiveFrameURL() is gone' ],
+        [ 'src/js/pagestore.js', /getFrameStore\(frameId\) \{\s*return this\.frames\.get\(frameId\) \|\| null;/,
+          'PageStore.getFrameStore() no longer returns the frame or null' ],
+        [ 'src/js/pagestore.js', /this\.rawURL = url;/,
+          'FrameStore no longer records rawURL for non-network frame resolution' ],
+        [ 'src/js/pagestore.js', /this\.parentId = parentId;/,
+          'FrameStore no longer records parentId for non-network frame resolution' ],
         [ 'src/js/pagestore.js', /isTrusted\(\) \{/,
           'PageStore.isTrusted() is gone' ],
         [ 'src/js/pagestore.js', /this\.tabHostname = tabContext\.rootHostname;/,
@@ -1185,16 +1196,19 @@ section('upstream drift');
     // byte-for-byte: any change must be reflected in the copy, after which
     // the hash below is updated.
     {
-        const RETRIEVE_SHA256 = 'cc49a95ac55c65b6';
+        // 5a550f43f only corrected the blanket-exception logger result from
+        // { filters: [...] } to an array. Both still suppress all injections;
+        // collectScriptletTokens() returns no tokens for either version.
+        const RETRIEVE_SHA256 = [ 'cc49a95ac55c65b6', '18ec68a2258be937' ];
         const core = readRepo('src/js/scriptlet-filtering-core.js').replace(/\r\n/g, '\n');
         const match = /^ {4}retrieve\(request\) \{\n[\s\S]*?\n {4}\}\n/m.exec(core);
         const digest = match !== null
             ? createHash('sha256').update(match[0]).digest('hex').slice(0, 16)
             : '';
-        if ( digest !== RETRIEVE_SHA256 ) {
+        if ( RETRIEVE_SHA256.includes(digest) === false ) {
             broken += 1;
             fail('scriptlet-upstream',
-                `src/js/scriptlet-filtering-core.js: ScriptletFilteringEngine.retrieve() changed (sha256 ${digest || 'n/a'}, pinned ${RETRIEVE_SHA256})`,
+                `src/js/scriptlet-filtering-core.js: ScriptletFilteringEngine.retrieve() changed (sha256 ${digest || 'n/a'}, pinned ${RETRIEVE_SHA256.join(', ')})`,
                 'reconcile collectScriptletTokens() in platform/chromium-mv3/mv3-post.js with it, then update RETRIEVE_SHA256 here');
         }
     }

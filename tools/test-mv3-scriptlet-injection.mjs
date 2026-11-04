@@ -30,6 +30,8 @@ const manifest = { content_scripts: [ {
 } ] };
 const storage = {};
 let secret = 0;
+let warSecret = 0;
+const activeWarSecrets = new Set();
 let firewallRules = [];
 let trusted = false;
 const main = { name: 'main-probe.js', fn: function mainProbe() {}, world: 'MAIN' };
@@ -37,10 +39,22 @@ const isolated = { name: 'isolated-probe.js', fn: function isolatedProbe() {}, w
 const resources = new Map([ main, isolated ].map(entry => [ entry.name, {
     js: entry.fn.toString(), world: entry.world, priority: 0,
 } ]));
+const frames = new Map([
+    [ 0, { rawURL: 'https://example.com/page', parentId: -1 } ],
+    [ 1, { rawURL: 'about:blank', parentId: 0 } ],
+    [ 2, { rawURL: 'data:text/html,test', parentId: 1 } ],
+    [ 3, { rawURL: 'blob:https://example.com/id', parentId: 2 } ],
+    [ 4, { rawURL: 'about:srcdoc', parentId: 99 } ],
+    [ 5, { rawURL: 'about:blank', parentId: 6 } ],
+    [ 6, { rawURL: 'about:blank', parentId: 5 } ],
+    [ 7, { rawURL: 'https://other.test/frame', parentId: 0 } ],
+    [ 8, { rawURL: 'data:text/html,test', parentId: 7 } ],
+    [ 9, { rawURL: 'about:blank', parentId: -1 } ],
+]);
 const pageStore = {
     tabHostname: 'example.com',
     isTrusted: () => trusted,
-    getEffectiveFrameURL: () => 'https://example.com/frame',
+    getFrameStore: frameId => frames.get(frameId) || null,
     getFrameAncestorDetails: () => [ { hostname: 'parent.test', domain: 'parent.test' } ],
 };
 const ubo = {
@@ -61,7 +75,12 @@ const context = vm.createContext({
     entityFromHostname: (hostname, domain) => hostname.slice(0, -domain.split('.').at(-1).length) + '*',
     vAPI: {
         getURL: value => `chrome-extension://test${value}`,
-        warSecret: { long: value => value || 'war-secret' },
+        warSecret: { long: previous => {
+            activeWarSecrets.delete(previous);
+            const value = `war-secret-${++warSecret}`;
+            activeWarSecrets.add(value);
+            return value;
+        } },
         generateSecret: () => `logger-${++secret}`,
         webextFlavor: { soup: new Set() },
         defer: { create: () => ({ off() {}, onidle() {}, ongoing: () => false }) },
@@ -111,7 +130,7 @@ if ( perHostname ) {
 const post = read('mv3-post');
 // Source checkouts may use CRLF; locate the same delimiter after normalizing.
 const normalizedPost = post.replace(/\r\n/g, '\n');
-const regionStart = normalizedPost.indexOf('const reScriptletDocumentURL =');
+const regionStart = normalizedPost.indexOf('const reNetworkDocumentURL =');
 const regionEnd = normalizedPost.indexOf('\n{\n    const tabs = vAPI.tabs;', regionStart);
 assert.ok(regionStart !== -1 && regionEnd > regionStart, 'per-frame injection region exists');
 const inject = run(normalizedPost.slice(regionStart, regionEnd) + '\ninjectFrameScriptlets;');
@@ -150,13 +169,22 @@ assert.deepEqual(plain(result.target), { tabId: 1, documentIds: [ 'doc-1' ] });
 assert.deepEqual(plain(calls(result)).sort(), [
     [ 'mainProbe', [ 'ancestor' ] ], [ 'mainProbe', [ 'specific' ] ], [ 'isolatedProbe', [ 'entity' ] ],
 ].sort(), 'hostname, entity and ancestor rules select only matching calls');
-assert.equal(result.globals.warSecret, 'war-secret');
+assert.ok(activeWarSecrets.has(result.globals.warSecret), 'first injection carries a valid resource secret');
 assert.equal(result.globals.logLevel, 1);
 const firstGlobals = result.globals;
+const firstCalls = plain(calls(result)).sort();
 assert.equal(inject(details).globals, firstGlobals, 'reuse globals for the hostname');
 result = inject({ ...details, url: 'https://example.com/special' });
 assert.ok(calls(result).some(([, args]) => args[0] === 'path'), 'path matching is per frame, even with cached globals');
-assert.ok(inject({ ...details, frameId: 1, url: 'about:blank' }), 'about: frames use their effective URL');
+for ( const frameId of [ 1, 2, 3 ] ) {
+    const inherited = inject({ ...details, frameId, url: frames.get(frameId).rawURL });
+    assert.equal(inherited?.hostname, 'example.com', 'non-network subframes inherit the nearest HTTP(S) ancestor');
+    assert.deepEqual(plain(calls(inherited)).sort(), firstCalls, 'inherited URL selects the same scriptlets');
+}
+for ( const frameId of [ 4, 5, 9, 99 ] ) {
+    assert.equal(inject({ ...details, frameId, url: 'about:blank' }), undefined, 'missing or cyclic frame ancestry does not inject');
+}
+assert.equal(inject({ ...details, url: 'about:blank' }), undefined, 'top-level non-network documents do not inherit a URL');
 assert.equal(inject({ ...details, url: 'data:text/html,test' }), undefined);
 assert.equal(inject({ ...details, tabId: -1 }), undefined);
 trusted = true;
@@ -175,6 +203,11 @@ assert.equal(inject(details).bcSecret, '', 'logger disable clears its secret');
 context.logger.enabled = true;
 await refresh('loggerEnabled');
 assert.notEqual(inject(details).globals.bcSecret, firstGlobals.bcSecret, 'logger restart gets a fresh secret');
+assert.ok(activeWarSecrets.has(inject(details).globals.warSecret), 'refreshed globals carry the newly rotated resource secret');
+assert.equal(activeWarSecrets.has(firstGlobals.warSecret), false, 'the old resource secret was revoked');
+const nested = inject({ ...details, frameId: 8, url: frames.get(8).rawURL });
+assert.equal(nested?.hostname, 'other.test', 'resolve the nearest HTTP(S) ancestor, even when the top-level hostname differs');
+assert.deepEqual(plain(calls(nested)).sort(), [ [ 'mainProbe', [ 'ancestor' ] ], [ 'mainProbe', [ 'other' ] ] ]);
 
 add('example.com', 'main-probe', 'specific', true);
 assert.equal(calls(inject(details)).some(([, args]) => args[0] === 'specific'), false, 'scriptlet exception wins');

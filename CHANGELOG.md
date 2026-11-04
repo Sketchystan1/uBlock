@@ -1,3 +1,7 @@
+- [Validate about to be created filter in element picker](https://github.com/gorhill/uBlock/commit/b1f7d27c87)
+- [Prevent re-entrancy with recursive operator in JSONPath](https://github.com/gorhill/uBlock/commit/b6fec9089f)
+- [Improve `[trusted-]edit-inbound-object` scriptlet](https://github.com/gorhill/uBlock/commit/a20cfcebd8)
+- [Add support for iso-8850-2 in response body filtering code](https://github.com/gorhill/uBlock/commit/ca7aa6c55f)
 - [Improve `trusted-prevent-dom-bypass` scriptlet](https://github.com/gorhill/uBlock/commit/1492d7f979)
 - [Improve `JSONPath`](https://github.com/gorhill/uBlock/commit/006dfc4da9)
 - [Improve `googletagservices_gpt.js` shim](https://github.com/gorhill/uBlock/commit/f609ebc5e9)
@@ -10,6 +14,12 @@
 - [Improve jsonl-edit-fetch-response/jsonl-edit-xhr-response scriptlets](https://github.com/gorhill/uBlock/commit/42bcca027b)
 - [Export "My filters" content as an array in JSON backup file](https://github.com/gorhill/uBlock/commit/80f5a99fe4)
 - [Improve `prevent-clipboard-write` scriptlet](https://github.com/gorhill/uBlock/commit/e530864c46)
+
+----------
+
+# 1.75.2
+
+- [Avoid use of potentially tainted XHR methods in scriptlets](https://github.com/gorhill/uBlock/commit/9a083e7e54)
 
 ----------
 

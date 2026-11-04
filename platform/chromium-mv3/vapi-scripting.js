@@ -109,7 +109,7 @@ export function unregisterContentScripts() {
     registeredGlobals = undefined;
 }
 
-// MV3-only: the caller resolves about: frames and checks the live filter DB
+// MV3-only: the caller resolves non-network frames and checks the live filter DB
 // before asking for globals. Only data is retained; generated code is never
 // executed. Bound this cache because a worker can stay alive indefinitely.
 export function mv3RegisteredScriptletGlobals(url) {

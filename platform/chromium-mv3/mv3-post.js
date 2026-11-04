@@ -499,16 +499,14 @@ mv3ForkStatusReady.then(( ) => {
 // `mv3InjectScriptlets()` (mv3-shims.js), which runs them through the
 // CSP-exempt sharded libraries `tools/patch-mv3-modules.mjs` generates.
 //
-// Same trigger as upstream: `webNavigation.onCommitted`, for http(s) and
-// about: documents -- the latter resolved to the frame they inherit their
-// origin from, which is what upstream's in-page matcher sees through
-// `document.location.origin`. Hooked onto uBO's own committed handler rather
+// Same trigger as upstream: `webNavigation.onCommitted`, for http(s) documents
+// and non-network subframes resolved through their nearest HTTP(S) ancestor.
+// Hooked onto uBO's own committed handler rather
 // than a listener of ours, so that the frame is already recorded in its page
 // store when this runs: `>>` ancestor filters need the frame tree. The early
 // bailouts upstream serializes into its program -- trusted sites, a
 // first-party `allow` rule -- are applied here, below.
 
-const reScriptletDocumentURL = /^https?:|^about:/;
 const reNetworkDocumentURL = /^https?:\/\//;
 
 // `lookupScriptlet()` in upstream's pre-9af8ef4c6 core used the same test to
@@ -672,17 +670,28 @@ const injectFrameScriptlets = details => {
     if ( typeof tabId !== 'number' || tabId < 0 ) { return; }
     if ( typeof frameId !== 'number' ) { return; }
     if ( typeof details.url !== 'string' ) { return; }
-    if ( reScriptletDocumentURL.test(details.url) === false ) { return; }
     // The callback is registered at module evaluation, before engine startup.
     if ( µb.readyToFilter !== true ) { return; }
     // Upstream's first early bailout (`isTrustedContext`): the top-level
     // document is on a trusted site.
     const pageStore = µb.pageStoreFromTabId(tabId);
     if ( pageStore === null || pageStore.isTrusted() ) { return; }
-    const url = details.url.startsWith('about:')
-        ? pageStore.getEffectiveFrameURL({ frameId, frameURL: details.url })
-        : details.url;
-    if ( reNetworkDocumentURL.test(url) === false ) { return; }
+    let url = details.url;
+    // Upstream now resolves every non-HTTP(S) subframe, including data: and
+    // blob:. PageStore.getEffectiveFrameURL() only climbs past about: URLs,
+    // so walk its frame tree here. Missing or stale ancestry must not inject.
+    let ancestorId = frameId;
+    const visited = new Set();
+    while ( reNetworkDocumentURL.test(url) === false ) {
+        if ( ancestorId === 0 || visited.has(ancestorId) ) { return; }
+        visited.add(ancestorId);
+        const frame = pageStore.getFrameStore(ancestorId);
+        if ( frame === null || frame.parentId === -1 ) { return; }
+        ancestorId = frame.parentId;
+        const parent = pageStore.getFrameStore(ancestorId);
+        if ( parent === null ) { return; }
+        url = parent.rawURL;
+    }
     const hostname = hostnameFromURI(url);
     if ( hostname === '' ) { return; }
     const tokens = collectScriptletTokens({
@@ -743,7 +752,7 @@ const injectFrameScriptlets = details => {
 // the sweep is gated on a `storage.session` flag, which survives worker
 // restarts and is cleared by browser restart and extension reload/update.
 // Frames the page store has not seen are recorded first, so that ancestor
-// and about: resolution work as they do for a live navigation.
+// and non-network frame resolution work as they do for a live navigation.
 {
     const SWEEP_KEY = 'uBOMv3ScriptletSweepDone';
     Promise.resolve(µb.isReadyPromise).then(async ( ) => {

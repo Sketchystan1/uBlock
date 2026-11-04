@@ -54,18 +54,26 @@ const [
 function isTrustedContext(fn, data) {
     const docloc = document.location;
     const origins = document.location.ancestorOrigins;
-    const url = origins?.length
-        ? new URL(origins.item(origins.length-1))
-        : docloc;
-    return Boolean(fn(data, url.href, url.hostname));
+    let topurl = docloc;
+    if ( origins?.length ) {
+        try {
+            topurl = new URL(origins.item(origins.length-1));
+        } catch {
+        }
+    }
+    return Boolean(fn(data, topurl.href, topurl.hostname));
 }
 
 function topFrameRulesMatcher(rules) {
     const docloc = document.location;
-    const href = docloc.ancestorOrigins?.length
-        ? docloc.ancestorOrigins.item(docloc.ancestorOrigins.length-1)
-        : docloc.href;
-    const topurl = new URL(href);
+    const origins = document.location.ancestorOrigins;
+    let topurl = docloc;
+    if ( origins?.length ) {
+        try {
+            topurl = new URL(origins.item(origins.length-1));
+        } catch {
+        }
+    }
     const hostname = topurl.hostname;
     let pos = 0;
     do {
@@ -175,7 +183,7 @@ export class ScriptletFilteringEngineEx extends ScriptletFilteringEngine {
         }
     }
 
-    getContentScripts(url) {
+    getContentScripts(url, options = {}) {
         const hostname = hostnameFromURI(url);
         const domain = domainFromHostname(hostname);
         const map = this.scriptletDB.retrieveOne(hostname, domain);
@@ -211,25 +219,26 @@ export class ScriptletFilteringEngineEx extends ScriptletFilteringEngine {
             this.isDevBuild = vAPI.webextFlavor.soup.has('devbuild') ||
                 µb.hiddenSettings.filterAuthorMode;
         }
-        this.warSecret = vAPI.warSecret.long(this.warSecret);
-        const options = {
-            hostname,
-            scriptletGlobals: {
-                warOrigin: this.warOrigin,
-                warSecret: this.warSecret,
-            },
+        const scriptletGlobals = {
+            warOrigin: this.warOrigin,
+            warSecret: this.warSecret,
         };
+        if ( options.topOrigin ) {
+            scriptletGlobals.topOrigin = options.topOrigin;
+        }
+        this.warSecret = vAPI.warSecret.long(this.warSecret);
+        const out = { hostname, scriptletGlobals };
         if ( logger.enabled ) {
-            options.scriptletGlobals.bcSecret = vAPI.generateSecret(3);
-            options.scriptletGlobals.logLevel = this.logLevel;
+            scriptletGlobals.bcSecret = vAPI.generateSecret(3);
+            scriptletGlobals.logLevel = this.logLevel;
         }
         if ( result.ISOLATED ) {
-            options.debug = µb.hiddenSettings.debugIsolatedScriptlets;
-            options.isolatedCode = assembleIsolatedWorldWrapper(result.ISOLATED.code, options);
+            out.debug = µb.hiddenSettings.debugIsolatedScriptlets;
+            out.isolatedCode = assembleIsolatedWorldWrapper(result.ISOLATED.code, out);
         }
         if ( result.MAIN ) {
-            options.debug = µb.hiddenSettings.debugMainScriptlets;
-            options.mainCode = assembleMainWorldWrapper(result.MAIN.code, options);
+            out.debug = µb.hiddenSettings.debugMainScriptlets;
+            out.mainCode = assembleMainWorldWrapper(result.MAIN.code, out);
         }
         const trustedSiteMatcher = µb.trustedSites.getMatcher();
         const earlyBailoutCode = [
@@ -249,8 +258,8 @@ export class ScriptletFilteringEngineEx extends ScriptletFilteringEngine {
                 `if ( topFrameRulesMatcher(new Map(${JSON.stringify(topFrameRules)})) ) { return; }`,
             );
         }
-        options.earlyBailoutCode = earlyBailoutCode.join('\n');
-        return options;
+        out.earlyBailoutCode = earlyBailoutCode.join('\n');
+        return out;
     }
 
     retrieve(request) {

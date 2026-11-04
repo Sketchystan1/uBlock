@@ -269,6 +269,38 @@ if ( fs.existsSync(pkgDir) === false ) {
 
 /******************************************************************************/
 
+// Upstream bcfb95163 captures scriptletGlobals before rotating warSecret.
+// The first hostname therefore receives undefined, and later ones receive a
+// revoked secret. Move the rotation before the snapshot in the built copy.
+// Older upstream versions already have the correct order and need no patch.
+{
+    const rel = 'js/scriptlet-filtering.js';
+    const abs = path.join(pkgDir, rel);
+    const src = fs.readFileSync(abs, 'utf8');
+    const marker = 'uBO MV3 scriptlet secret before globals';
+    if ( src.includes(marker) === false && src.includes('const scriptletGlobals = {') ) {
+        const capture = '        const scriptletGlobals = {';
+        const rotate = '        this.warSecret = vAPI.warSecret.long(this.warSecret);';
+        if ( src.split(capture).length !== 2 || src.split(rotate).length !== 2 ) {
+            throw new Error(`${rel}: scriptlet secret setup changed; reconcile the MV3 build transform`);
+        }
+        if ( src.indexOf(rotate) > src.indexOf(capture) ) {
+            const eol = src.includes('\r\n') ? '\r\n' : '\n';
+            const anchor = /^ {8}const scriptletGlobals = \{\r?\n {12}warOrigin: this\.warOrigin,\r?\n {12}warSecret: this\.warSecret,\r?\n {8}\};\r?\n(?: {8}if \( options\.topOrigin \) \{\r?\n {12}scriptletGlobals\.topOrigin = options\.topOrigin;\r?\n {8}\}\r?\n)? {8}this\.warSecret = vAPI\.warSecret\.long\(this\.warSecret\);/gm;
+            if ( [ ...src.matchAll(anchor) ].length !== 1 ) {
+                throw new Error(`${rel}: scriptlet globals setup changed; reconcile the MV3 build transform`);
+            }
+            fs.writeFileSync(abs, src.replace(anchor, block =>
+                `        // [${marker}]${eol}${rotate}${eol}` +
+                block.slice(0, -(eol.length + rotate.length))
+            ));
+            console.log(`*** patch-mv3-modules: ${rel} rotates the resource secret before capturing globals`);
+        }
+    }
+}
+
+/******************************************************************************/
+
 const reStaticImport =
     /(?:^|\n)[ \t]*(?:import|export)[^;\n]*?from[ \t]+["']([^"']+)["']|(?:^|\n)[ \t]*import[ \t]+["']([^"']+)["']/g;
 
