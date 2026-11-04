@@ -1,0 +1,9 @@
+{
+  "tag": "1.75.4",
+  "upstream": "f417911934edb2d3e2700110803ed7fde6f51022",
+  "port": "adc99f6bde4ee562da93963d888ea1ae7eab5b40",
+  "tooling": "3f8731a8e9d7fa6760e209fb09e36c39bdfa9a68",
+  "forkBuild": 508,
+  "pinned": true,
+  "reason": "Maintenance release based on 1.75.0 with upstream resource and element-picker fixes; retain its compatible MV3 port."
+}

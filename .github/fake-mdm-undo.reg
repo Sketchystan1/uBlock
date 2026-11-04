@@ -1,0 +1,9 @@
+Windows Registry Editor Version 5.00
+
+; Undo edge-fake-mdm.reg — removes the synthetic MDM enrollment.
+; Run elevated. After this, the device reports as unmanaged again and Edge will
+; once more show off-store force-install entries as [BLOCKED]. Restart Edge to apply.
+
+[-HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Enrollments\FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF]
+
+[-HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts\FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF]

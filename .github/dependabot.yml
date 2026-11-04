@@ -1,0 +1,58 @@
+# Keep the pinned action SHAs fresh.
+#
+# The workflows in this repository pin every action to a commit SHA rather than a
+# floating major tag, because release.yml has access to CRX_PRIVATE_KEY -- the
+# secret that defines the extension identity for every policy-installed client.
+# A floating tag means a third party can change what runs next to that key.
+#
+# SHA pins only stay safe if something bumps them, which is what this does.
+#
+# DELIBERATELY NOT HERE: `package-ecosystem: npm`. The root package.json and
+# package-lock.json are upstream's files, and this fork must never modify an
+# upstream file -- that is the whole reason the daily merge in sync-upstream.yml
+# cannot conflict. A merged npm bump would rewrite the lockfile, and upstream
+# regenerating its own (as in its "Update npm" commits) would then collide and
+# stall the sync until someone resolved it by hand. There would be nothing to
+# show for the risk: those devDependencies feed only `npm run lint`, which
+# build.yml already runs with continue-on-error because upstream's own sources do
+# not pass the config, and no part of the MV3 build touches node_modules -- every
+# tool under tools/ imports node: builtins only.
+#
+# ONE PR PER ACTION, NOT GROUPED. Upstream's own .github/workflows/main.yml pins
+# actions/checkout@v4, and dependabot updates an action's pin in EVERY workflow
+# that uses it -- there is no way to scope a bump to this fork's files only.
+# Grouping would put such a hunk in the same PR as every other bump, and a
+# grouped PR cannot be partially merged -- so closing it (which is the only
+# option) would also discard the pins for the actions that appear solely in this
+# fork's workflows. Ungrouped, the problem is confined to one action's PR at a
+# time, and the ignore rule below removes even that one: every PR dependabot
+# opens now touches only this fork's own workflow files.
+#
+# actions/checkout is IGNORED outright, not just handled carefully. A bump PR
+# for it necessarily edits main.yml (an upstream-owned file), and merging such
+# a hunk would break the fork's adds-only invariant: sync-upstream.yml asserts
+# that the fork modifies no upstream file, and would then fail every release
+# tree it tries to build. Depending on a human to drop the main.yml hunk every
+# time is how that eventually gets merged by mistake.
+#
+# The cost is accepted deliberately: this fork's own checkout pins (SHA-pinned
+# in build.yml, release.yml and sync-upstream.yml) no longer get dependabot
+# bumps -- bump those by hand. If upstream ever starts using another action in
+# main.yml, add its name to the ignore list too, or its bump PRs will carry
+# main.yml hunks again.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      # Off the hour, and clear of the 04:17 sync window.
+      time: '09:23'
+    open-pull-requests-limit: 6
+    commit-message:
+      prefix: 'ci:'
+    ignore:
+      # The one action upstream's main.yml uses; see the comment block above.
+      - dependency-name: actions/checkout
