@@ -203,8 +203,7 @@ assert.equal(inject(details).bcSecret, '', 'logger disable clears its secret');
 context.logger.enabled = true;
 await refresh('loggerEnabled');
 assert.notEqual(inject(details).globals.bcSecret, firstGlobals.bcSecret, 'logger restart gets a fresh secret');
-assert.ok(activeWarSecrets.has(inject(details).globals.warSecret), 'refreshed globals carry the newly rotated resource secret');
-assert.equal(activeWarSecrets.has(firstGlobals.warSecret), false, 'the old resource secret was revoked');
+assert.ok(activeWarSecrets.has(inject(details).globals.warSecret), 'refreshed globals carry a valid resource secret');
 const nested = inject({ ...details, frameId: 8, url: frames.get(8).rawURL });
 assert.equal(nested?.hostname, 'other.test', 'resolve the nearest HTTP(S) ancestor, even when the top-level hostname differs');
 assert.deepEqual(plain(calls(nested)).sort(), [ [ 'mainProbe', [ 'ancestor' ] ], [ 'mainProbe', [ 'other' ] ] ]);
@@ -213,12 +212,21 @@ add('example.com', 'main-probe', 'specific', true);
 assert.equal(calls(inject(details)).some(([, args]) => args[0] === 'specific'), false, 'scriptlet exception wins');
 engine.scriptletDB.store('example.com', '-[]');
 assert.equal(inject(details), undefined, 'blanket exception suppresses every scriptlet');
+// Upstream 150df125f rotates the resource secret on engine reset, rather than
+// while preparing globals after logger or hostname changes. Both lifecycles
+// must supply a fresh, valid secret and revoke the previous one after reload.
+const preReloadWarSecret = nested.globals.warSecret;
+assert.ok(activeWarSecrets.has(preReloadWarSecret), 'the last injected resource secret is valid before reload');
 await engine.reset();
 assert.equal(inject(details), undefined, 'engine reset clears all injections');
 add('example.com', 'main-probe', 'after-reload');
 await engine.freeze();
 const selfie = structuredClone(engine.toSelfie());
-assert.ok(inject(details), 'filter reload rearms injection');
+result = inject(details);
+assert.ok(result, 'filter reload rearms injection');
+assert.ok(activeWarSecrets.has(result.globals.warSecret), 'filter reload supplies a valid resource secret');
+assert.notEqual(result.globals.warSecret, preReloadWarSecret, 'filter reload rotates the resource secret');
+assert.equal(activeWarSecrets.has(preReloadWarSecret), false, 'filter reload revokes the old resource secret');
 // Restore into an empty DB, as happens on worker startup. Old registration
 // builds also need their persisted compiled program, which reset removes.
 const savedStorage = { ...storage };
