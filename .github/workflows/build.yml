@@ -1,0 +1,152 @@
+name: Build MV3
+
+# Sanity build of the Chromium MV3 package on every push and pull request, so
+# that an upstream merge which breaks the port is caught before release time.
+#
+# The package assertions and the upstream-drift assertions live in
+# tools/verify-mv3-package.mjs, which tools/make-chromium-mv3.sh runs as its last
+# step. They used to be inlined here, which meant the one build that actually
+# shipped -- release.yml -- was the least checked build in the repository.
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check fork overlay
+        run: |
+          git fetch --no-tags https://github.com/gorhill/uBlock.git master:refs/remotes/upstream/master
+          node tools/make-mv3-release-tree.mjs --check-only
+
+      - name: Set up node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dev dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint
+        # Informational only. Upstream's own sources do not currently pass this
+        # config -- `chrome` and `browser` are not declared as globals, which
+        # yields ~130 pre-existing no-undef errors. Gating on it would mean
+        # editing eslint.config.mjs, and this port deliberately modifies no
+        # existing file so that upstream merges cannot conflict.
+        # Output is captured as an artifact so regressions are visible without
+        # failing the build.
+        id: upstream-lint
+        continue-on-error: true
+        run: npm run lint 2>&1 | tee /tmp/upstream-lint.txt; exit ${PIPESTATUS[0]}
+
+      - name: Upload upstream lint report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-lint-report
+          path: /tmp/upstream-lint.txt
+          if-no-files-found: ignore
+
+      - name: Fork lint
+        # GATED (no continue-on-error). Lints ONLY the fork's own files with a
+        # fork-owned ESLint config (tools/eslint.fork.config.mjs) that declares
+        # the extension globals. It touches no upstream file, so it can gate
+        # without reopening the merge-conflict surface the informational lint
+        # above avoids -- a real error in a fork file (undefined variable,
+        # duplicate key, unreachable code) fails the build.
+        run: >-
+          npx --no-install eslint --no-config-lookup -c tools/eslint.fork.config.mjs
+          "platform/chromium-mv3/*.js"
+          "tools/patch-mv3-modules.mjs"
+          "tools/verify-mv3-package.mjs"
+          "tools/test-mv3-scriptlet-injection.mjs"
+          "tools/test-mv3-startup.mjs"
+          "tools/make-mv3-release-tree.mjs"
+          "tools/test-mv3-release-tree.mjs"
+          "tools/make-crx.mjs"
+          "tools/make-update-xml.mjs"
+          "tools/verify-crx.mjs"
+
+      - name: Test release tree construction
+        run: node --test tools/test-mv3-release-tree.mjs
+
+      - name: Clone uAssets
+        run: bash tools/pull-assets.sh
+
+      - name: Build and verify MV3 package
+        # Invoked through `bash` rather than relying on the executable bit,
+        # which is not preserved when committing from a filesystem without one.
+        # Runs tools/patch-mv3-modules.mjs and then tools/verify-mv3-package.mjs.
+        run: make chromium-mv3-fork
+
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: uBlock0.chromium-mv3
+          path: dist/build/uBlock0.chromium-mv3
+
+  release-tree:
+    name: Verify release tree (${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable, current]
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Construct release without publishing
+        env:
+          CHANNEL: ${{ matrix.channel }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --no-tags https://github.com/gorhill/uBlock.git master:refs/remotes/upstream/master
+          git fetch --no-tags https://github.com/gorhill/uBlock.git '+refs/tags/*:refs/upstream-tags/*'
+          base=$(git merge-base HEAD upstream/master)
+          if [ "$CHANNEL" = stable ]; then
+            # Match the sync's newest stable tag, including maintenance
+            # releases on branches which have not been merged into master.
+            tag=$(git for-each-ref --sort=-creatordate --format='%(refname:strip=2)' refs/upstream-tags/ \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sed -n '1p')
+          else
+            tag=$(git for-each-ref --merged "$base" --format='%(refname:strip=2)' refs/upstream-tags/ \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+((b|rc)[0-9]+)?$' | sort -V | tail -n 1)
+          fi
+          test -n "$tag"
+          node tools/make-mv3-release-tree.mjs --tag "$tag"
+
+      - name: Clone uAssets
+        run: bash tools/pull-assets.sh
+
+      - name: Build and verify release package
+        run: make chromium-mv3-fork

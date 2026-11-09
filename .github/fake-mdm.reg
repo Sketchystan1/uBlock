@@ -1,0 +1,19 @@
+Windows Registry Editor Version 5.00
+
+; Fake MDM enrollment — makes the device report as "managed by your organization" so
+; off-store ExtensionSettings/Forcelist policies are HONORED instead of shown as [BLOCKED].
+; Run elevated. Windows Pro/Enterprise/Education only (no-op on Home — SUITE_HOME skips the check).
+; Machine-wide and reversible with fake-mdm-undo.reg. Verify at browser://policy — entry has no [BLOCKED].
+; The all-F GUID is a placeholder for easy removal; any GUID works. No real MDM server is contacted.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Enrollments\FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF]
+"EnrollmentState"=dword:00000001
+"EnrollmentType"=dword:00000000
+"IsFederated"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts\FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF]
+"Flags"=dword:00d6fb7f
+"AcctUId"="0x000000000000000000000000000000000000000000000000000000000000000000000000"
+"RoamingCount"=dword:00000000
+"SslClientCertReference"="MY;User;0000000000000000000000000000000000000000"
+"ProtoVer"="1.2"

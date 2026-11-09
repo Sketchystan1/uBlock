@@ -1,0 +1,12 @@
+Windows Registry Editor Version 5.00
+
+; Chrome Enterprise Core (CBCM) enrollment token — official alternative to fake-mdm.reg.
+; Real cloud management makes the device TRUSTED, so off-store policies are honored, not
+; [BLOCKED]. Not the Windows MDM signal, so not gated by SUITE_HOME — works on Home too.
+; 1. admin.google.com (free CBCM account, verified domain) > Devices > Chrome > Managed
+;    browsers > Enroll; copy the token and paste it below.
+; 2. Run elevated, restart Chrome. 32-bit Chrome: add the same value under WOW6432Node too.
+; Verify: chrome://policy shows enrolled, chrome://management shows managed. Then apply chrome.reg.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome]
+"CloudManagementEnrollmentToken"="PASTE_YOUR_ENROLLMENT_TOKEN_HERE"
