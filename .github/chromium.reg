@@ -1,0 +1,12 @@
+Windows Registry Editor Version 5.00
+
+; Chromium (vanilla) — off-store force-install via ExtensionSettings.
+; Replace the ID (32 chars, a-p) and update_url with your own. Don't also use
+; ExtensionInstallForcelist (double-delivers). 32-bit: add under WOW6432Node too.
+; Verify at chrome://policy — entry present, no [BLOCKED].
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Chromium\ExtensionSettings]
+"cbmpaamhmhdhnkofemgdlnbdadbpmjkn"="{\"installation_mode\":\"force_installed\",\"update_url\":\"https://sketchystan1.github.io/uBlock/update.xml\"}"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Chromium]
+"DeveloperToolsAvailability"=dword:00000001
