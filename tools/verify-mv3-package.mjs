@@ -1131,10 +1131,13 @@ section('upstream drift');
             [ 'platform/chromium/vapi-scripting.js', /const tabs = await vAPI\.tabs\.query\(\{ url: '<all_urls>' \}\);/,
               'the Chromium injector changed its launch sweep' ],
         ]),
+        // Upstream 73ef1b23f removed the unused resource origin/secret from
+        // globals. Keep accepting the legacy pair, but do not require the
+        // adapter to restore values upstream deliberately stopped exposing.
         [ 'src/js/scriptlet-filtering.js', separateGlobals
-            ? /const scriptletGlobals = \{\s*warOrigin: this\.warOrigin,\s*warSecret: this\.warSecret,\s*\};[\s\S]*?const out = \{ hostname, scriptletGlobals \};/
+            ? /const scriptletGlobals = \{\s*(?:warOrigin: this\.warOrigin,\s*warSecret: this\.warSecret,\s*)?\};[\s\S]*?const out = \{ hostname, scriptletGlobals \};/
             : /scriptletGlobals: \{\s*warOrigin: this\.warOrigin,\s*warSecret: this\.warSecret,\s*\},/,
-          'the registration no longer carries scriptletGlobals { warOrigin, warSecret }, which vapi-scripting.js keeps for the injection' ],
+          'the registration no longer carries the supported scriptletGlobals object, which vapi-scripting.js keeps for the injection' ],
         [ 'src/js/scriptlet-filtering.js', separateGlobals
             ? /scriptletGlobals\.bcSecret = vAPI\.generateSecret\(3\);/
             : /options\.scriptletGlobals\.bcSecret = vAPI\.generateSecret\(3\);/,

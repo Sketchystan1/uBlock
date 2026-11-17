@@ -31,9 +31,11 @@
     element creation with a CSP. So the code strings `src/js/scriptlet-
     filtering.js` assembles are never run here. What this module keeps is the
     one piece of them which is data: the per-registration `scriptletGlobals`
-    (warOrigin, warSecret, and the logger's bcSecret/logLevel when it is on),
+    (the logger's bcSecret/logLevel and other upstream-supplied metadata),
     which the scriptlets read at run time and which upstream bakes into the
-    code strings. Before upstream 66e759691 it supplied these at registration;
+    code strings. Older releases also supplied warOrigin/warSecret; upstream
+    73ef1b23f removed them, so this adapter does not restore them. Before
+    upstream 66e759691 it supplied these at registration;
     newer builds supply a callback which prepares them for each hostname.
     Keep both APIs so the fork can also build the preceding upstream versions.
 
