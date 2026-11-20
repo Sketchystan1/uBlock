@@ -50,19 +50,27 @@ const frames = new Map([
     [ 7, { rawURL: 'https://other.test/frame', parentId: 0 } ],
     [ 8, { rawURL: 'data:text/html,test', parentId: 7 } ],
     [ 9, { rawURL: 'about:blank', parentId: -1 } ],
+    [ 10, { rawURL: 'https://parent.test/frame', parentId: 0 } ],
+    [ 11, { rawURL: 'https://example.com/frame', parentId: 10 } ],
 ]);
+for ( const frame of frames.values() ) {
+    frame.hostname = /^https?:/.test(frame.rawURL) ? new URL(frame.rawURL).hostname : '';
+    frame.domain = frame.hostname;
+}
 const pageStore = {
     tabHostname: 'example.com',
     isTrusted: () => trusted,
     getFrameStore: frameId => frames.get(frameId) || null,
-    getFrameAncestorDetails: () => [ { hostname: 'parent.test', domain: 'parent.test' } ],
+    setFrameURL: frame => frames.set(frame.frameId, {
+        rawURL: frame.url, parentId: frame.parentFrameId,
+    }),
 };
 const ubo = {
     readyToFilter: false,
     hiddenSettings: {},
     userSettings: {},
     trustedSites: { getMatcher: () => ({ match() {}, data: new Map() }) },
-    pageStoreFromTabId: () => pageStore,
+    pageStoreFromTabId: tabId => tabId === 1 ? pageStore : null,
 };
 const context = vm.createContext({
     URL, console, structuredClone,
@@ -85,6 +93,7 @@ const context = vm.createContext({
         webextFlavor: { soup: new Set() },
         defer: { create: () => ({ off() {}, onidle() {}, ongoing: () => false }) },
         tabs: {
+            onCommittedHandler: details => pageStore.setFrameURL(details),
             query: async () => openTabs,
             executeScript: async (tabId, details) => {
                 contentScripts.push({ tabId, ...details });
@@ -111,6 +120,18 @@ const context = vm.createContext({
     mv3InjectScriptlets: details => { injections.push(details); return details; },
 });
 const run = src => vm.runInContext(src, context);
+const hasFrameManager = /export const tabDict =/.test(read('vapi-contexts'));
+context.browser = { tabs: { TAB_ID_NONE: -1 } };
+const frameManager = hasFrameManager
+    ? run(withoutImports(read('vapi-contexts')) +
+        '\n({ tabDict, addFrame, addListener, commit: onCommitted });')
+    : {};
+context.frameManager = frameManager;
+if ( hasFrameManager ) {
+    frameManager.tabDict.set(1, { frameDict: new Map([ ...frames ].map(([ id, frame ]) =>
+        [ id, { url: frame.rawURL, parentId: frame.parentId } ]
+    )) });
+}
 const scripting = run(withoutImports(read('vapi-scripting')) + '\n' +
     '({ registerContentScripts, unregisterContentScripts, onGetContentScripts, start, reset, mv3RegisteredScriptletGlobals });');
 context.scripting = scripting;
@@ -144,7 +165,7 @@ const post = read('mv3-post');
 // Source checkouts may use CRLF; locate the same delimiter after normalizing.
 const normalizedPost = post.replace(/\r\n/g, '\n');
 const regionStart = normalizedPost.indexOf('const reNetworkDocumentURL =');
-const regionEnd = normalizedPost.indexOf('\n{\n    const tabs = vAPI.tabs;', regionStart);
+const regionEnd = normalizedPost.indexOf('\n{\n    const onCommitted =', regionStart);
 assert.ok(regionStart !== -1 && regionEnd > regionStart, 'per-frame injection region exists');
 const inject = run(normalizedPost.slice(regionStart, regionEnd) + '\ninjectFrameScriptlets;');
 const add = (hostname, name, arg = hostname, exception = false) =>
@@ -180,8 +201,8 @@ if ( typeof engine.start === 'function' ) {
 let result = inject(details);
 assert.deepEqual(plain(result.target), { tabId: 1, documentIds: [ 'doc-1' ] });
 assert.deepEqual(plain(calls(result)).sort(), [
-    [ 'mainProbe', [ 'ancestor' ] ], [ 'mainProbe', [ 'specific' ] ], [ 'isolatedProbe', [ 'entity' ] ],
-].sort(), 'hostname, entity and ancestor rules select only matching calls');
+    [ 'mainProbe', [ 'specific' ] ], [ 'isolatedProbe', [ 'entity' ] ],
+].sort(), 'a top-level document matches hostname/entity rules without ancestors');
 assertResourceGlobals(result.globals, 'first injection');
 assert.equal(result.globals.logLevel, 1);
 const firstGlobals = result.globals;
@@ -189,6 +210,8 @@ const firstCalls = plain(calls(result)).sort();
 assert.equal(inject(details).globals, firstGlobals, 'reuse globals for the hostname');
 result = inject({ ...details, url: 'https://example.com/special' });
 assert.ok(calls(result).some(([, args]) => args[0] === 'path'), 'path matching is per frame, even with cached globals');
+const descendant = inject({ ...details, frameId: 11, url: frames.get(11).rawURL });
+assert.ok(calls(descendant).some(([, args]) => args[0] === 'ancestor'), 'real frame ancestry selects >> rules');
 for ( const frameId of [ 1, 2, 3 ] ) {
     const inherited = inject({ ...details, frameId, url: frames.get(frameId).rawURL });
     assert.equal(inherited?.hostname, 'example.com', 'non-network subframes inherit the nearest HTTP(S) ancestor');
@@ -219,7 +242,47 @@ assert.notEqual(inject(details).globals.bcSecret, firstGlobals.bcSecret, 'logger
 assertResourceGlobals(inject(details).globals, 'refreshed globals');
 const nested = inject({ ...details, frameId: 8, url: frames.get(8).rawURL });
 assert.equal(nested?.hostname, 'other.test', 'resolve the nearest HTTP(S) ancestor, even when the top-level hostname differs');
-assert.deepEqual(plain(calls(nested)).sort(), [ [ 'mainProbe', [ 'ancestor' ] ], [ 'mainProbe', [ 'other' ] ] ]);
+assert.deepEqual(plain(calls(nested)), [ [ 'mainProbe', [ 'other' ] ] ]);
+
+const hookEnd = normalizedPost.indexOf('// Preserve the once-per-launch sweep', regionEnd);
+assert.ok(hookEnd > regionEnd, 'committed-frame hook exists');
+run(normalizedPost.slice(regionEnd, hookEnd));
+const beforeCommit = injections.length;
+const committed = { ...details, frameId: 12, parentFrameId: 10, url: 'about:blank' };
+if ( hasFrameManager ) {
+    frameManager.commit(committed);
+} else {
+    context.vAPI.tabs.onCommittedHandler(committed);
+}
+assert.equal(injections.length, beforeCommit + 1, 'a committed frame injects once after its parent link is recorded');
+assert.equal(injections.at(-1).hostname, 'parent.test');
+assert.ok(calls(injections.at(-1)).some(([, args]) => args[0] === 'ancestor'), 'committed-frame injection sees its ancestor filters');
+
+const sweepEnd = normalizedPost.indexOf('/******************************************************************************/', hookEnd);
+assert.ok(sweepEnd > hookEnd, 'open-tab scriptlet sweep exists');
+const sweepState = run('({})');
+let sweepReads = 0;
+context.chrome.storage = { session: {
+    get: async () => sweepState,
+    set: async data => Object.assign(sweepState, data),
+} };
+context.chrome.webNavigation = { getAllFrames: async ({ tabId }) => {
+    assert.equal(tabId, 1, 'skip discarded, unloaded and missing page stores');
+    sweepReads += 1;
+    return [
+        { frameId: 13, parentFrameId: 10, url: 'about:blank', documentId: 'doc-open' },
+        { frameId: 0, parentFrameId: -1, url: details.url },
+    ];
+} };
+ubo.isReadyPromise = Promise.resolve();
+run(normalizedPost.slice(hookEnd, sweepEnd));
+await new Promise(resolve => setImmediate(resolve));
+const swept = injections.find(entry => entry.target.documentIds?.includes('doc-open'));
+assert.equal(swept?.hostname, 'parent.test', 'open-tab sweep records new frames before injection');
+assert.ok(calls(swept).some(([, args]) => args[0] === 'ancestor'), 'open-tab sweep retains existing ancestors');
+run(normalizedPost.slice(hookEnd, sweepEnd));
+await new Promise(resolve => setImmediate(resolve));
+assert.equal(sweepReads, 1, 'worker restarts do not repeat the scriptlet sweep');
 
 add('example.com', 'main-probe', 'specific', true);
 assert.equal(calls(inject(details)).some(([, args]) => args[0] === 'specific'), false, 'scriptlet exception wins');

@@ -63,6 +63,7 @@
 //   service worker start and nothing else until a benchmark is run.
 
 import * as benchmarks from './benchmarks.js';
+import * as frameManager from './vapi-contexts.js';
 import * as resourcesScriptlets from './resources/scriptlets.js';
 import * as staticDnrFiltering from './static-dnr-filtering.js';
 import {
@@ -499,15 +500,12 @@ mv3ForkStatusReady.then(( ) => {
 // `mv3InjectScriptlets()` (mv3-shims.js), which runs them through the
 // CSP-exempt sharded libraries `tools/patch-mv3-modules.mjs` generates.
 //
-// Same trigger as upstream: `webNavigation.onCommitted`, for http(s) documents
-// and non-network subframes resolved through their nearest HTTP(S) ancestor.
-// Hooked onto uBO's own committed handler rather
-// than a listener of ours, so that the frame is already recorded in its page
-// store when this runs: `>>` ancestor filters need the frame tree. The early
-// bailouts upstream serializes into its program -- trusted sites, a
-// first-party `allow` rule -- are applied here, below.
+// Run after uBO records a committed frame so that non-network subframes and
+// ancestor filters (>>) can use the frame tree. Older releases kept that tree
+// in the page store.
 
 const reNetworkDocumentURL = /^https?:\/\//;
+const hasFrameManager = typeof frameManager.addListener === 'function';
 
 // `lookupScriptlet()` in upstream's pre-9af8ef4c6 core used the same test to
 // tell function-style scriptlets from legacy `{{1}}`-placeholder ones.
@@ -676,29 +674,42 @@ const injectFrameScriptlets = details => {
     // document is on a trusted site.
     const pageStore = µb.pageStoreFromTabId(tabId);
     if ( pageStore === null || pageStore.isTrusted() ) { return; }
-    let url = details.url;
-    // Upstream now resolves every non-HTTP(S) subframe, including data: and
-    // blob:. PageStore.getEffectiveFrameURL() only climbs past about: URLs,
-    // so walk its frame tree here. Missing or stale ancestry must not inject.
-    let ancestorId = frameId;
-    const visited = new Set();
-    while ( reNetworkDocumentURL.test(url) === false ) {
-        if ( ancestorId === 0 || visited.has(ancestorId) ) { return; }
-        visited.add(ancestorId);
-        const frame = pageStore.getFrameStore(ancestorId);
-        if ( frame === null || frame.parentId === -1 ) { return; }
-        ancestorId = frame.parentId;
-        const parent = pageStore.getFrameStore(ancestorId);
-        if ( parent === null ) { return; }
-        url = parent.rawURL;
+    let { url } = details;
+    const ancestors = [];
+    if ( frameId !== 0 ) {
+        const frames = frameManager.tabDict?.get(tabId)?.frameDict;
+        const getFrame = hasFrameManager
+            ? id => frames?.get(id)
+            : id => pageStore.getFrameStore(id);
+        // Walk once for both the inherited URL and the >> filter ancestry.
+        const visited = new Set([ frameId ]);
+        let frame = getFrame(frameId);
+        while ( frame ) {
+            const { parentId } = frame;
+            if ( parentId === -1 ) { break; }
+            if ( visited.has(parentId) ) { return; }
+            visited.add(parentId);
+            frame = getFrame(parentId);
+            if ( !frame ) { break; }
+            const parentURL = frame.url ?? frame.rawURL;
+            const isNetwork = reNetworkDocumentURL.test(parentURL);
+            if ( isNetwork && reNetworkDocumentURL.test(url) === false ) {
+                url = parentURL;
+            }
+            const hostname = frame.hostname ?? (isNetwork ? hostnameFromURI(parentURL) : '');
+            if ( hostname === '' ) { continue; }
+            const domain = frame.domain ?? (domainFromHostname(hostname) || hostname);
+            ancestors.push({ hostname, domain });
+        }
     }
+    if ( reNetworkDocumentURL.test(url) === false ) { return; }
     const hostname = hostnameFromURI(url);
     if ( hostname === '' ) { return; }
     const tokens = collectScriptletTokens({
         url,
         hostname,
         domain: domainFromHostname(hostname),
-        ancestors: pageStore.getFrameAncestorDetails(frameId),
+        ancestors,
     });
     if ( tokens === undefined || tokens.length === 0 ) { return; }
     const globals = mv3RegisteredScriptletGlobals(url);
@@ -721,11 +732,22 @@ const injectFrameScriptlets = details => {
 };
 
 {
+    const onCommitted = details => {
+        try {
+            injectFrameScriptlets(details);
+        } catch (reason) {
+            console.error(`uBO: scriptlet injection: ${reason}`);
+        }
+    };
     const tabs = vAPI.tabs;
-    const baseOnCommitted = tabs instanceof Object
-        ? tabs.onCommittedHandler
-        : undefined;
-    if ( typeof baseOnCommitted !== 'function' ) {
+    const baseOnCommitted = tabs?.onCommittedHandler;
+    if ( hasFrameManager ) {
+        frameManager.addListener((type, details) => {
+            if ( type === 'frame-committed' ) {
+                onCommitted(details);
+            }
+        });
+    } else if ( typeof baseOnCommitted !== 'function' ) {
         console.error(
             'uBO: vAPI.tabs.onCommittedHandler is not a function, so ' +
             'scriptlet filters cannot be injected. See ' +
@@ -734,11 +756,7 @@ const injectFrameScriptlets = details => {
     } else {
         tabs.onCommittedHandler = function(details) {
             baseOnCommitted.call(this, details);
-            try {
-                injectFrameScriptlets(details);
-            } catch (reason) {
-                console.error(`uBO: scriptlet injection: ${reason}`);
-            }
+            onCommitted(details);
         };
     }
 }
@@ -751,7 +769,7 @@ const injectFrameScriptlets = details => {
 // not a launch -- the tabs it finds went through `onCommitted` already -- so
 // the sweep is gated on a `storage.session` flag, which survives worker
 // restarts and is cleared by browser restart and extension reload/update.
-// Frames the page store has not seen are recorded first, so that ancestor
+// Frames the worker has not seen are recorded first, so that ancestor
 // and non-network frame resolution work as they do for a live navigation.
 {
     const SWEEP_KEY = 'uBOMv3ScriptletSweepDone';
@@ -769,9 +787,15 @@ const injectFrameScriptlets = details => {
                 tabId: tab.id,
             }).catch(( ) => null);
             if ( Array.isArray(frames) === false ) { continue; }
+            const frameDict = frameManager.tabDict?.get(tab.id)?.frameDict;
+            if ( hasFrameManager && frameDict === undefined ) { continue; }
             for ( const frame of frames ) {
-                if ( pageStore.getFrameStore(frame.frameId) !== null ) { continue; }
-                pageStore.setFrameURL(frame);
+                if ( hasFrameManager ) {
+                    if ( frameDict.has(frame.frameId) ) { continue; }
+                    frameManager.addFrame({ ...frame, tabId: tab.id });
+                } else if ( pageStore.getFrameStore(frame.frameId) === null ) {
+                    pageStore.setFrameURL(frame);
+                }
             }
             for ( const frame of frames ) {
                 injectFrameScriptlets(Object.assign({ tabId: tab.id }, frame));
@@ -1134,7 +1158,7 @@ if ( vAPI.cloud instanceof Object && typeof vAPI.cloud.getOptions === 'function'
 // extension) ends -- the same lifetime this state had under MV2.
 //
 // The restore is driven from `webRequest.start()`, which start.js calls after
-// `initializeTabs()` has rebuilt the page stores and after
+// tab initialization has rebuilt the page stores and after
 // `onFirstFetchReady()` has re-seeded the session rules, and before
 // `µb.isReadyPromise` resolves. The `storage.session` reads are asynchronous,
 // so the restore can complete just after `start()` un-parks the first requests and

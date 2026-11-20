@@ -720,8 +720,9 @@ section('upstream drift');
     if ( /mv3InjectScriptlets\(\{/.test(post) === false ) {
         problems.push('mv3-post.js no longer injects through mv3InjectScriptlets()');
     }
-    if ( /tabs\.onCommittedHandler = function/.test(post) === false ) {
-        problems.push('mv3-post.js no longer hooks vAPI.tabs.onCommittedHandler, the per-frame injection trigger');
+    if ( /frameManager\.addListener\(/.test(post) === false ||
+         /tabs\.onCommittedHandler = function/.test(post) === false ) {
+        problems.push('mv3-post.js no longer supports both frame-manager and legacy committed-frame triggers');
     }
     if ( problems.length !== 0 ) {
         fail('scriptlet-bridge', problems.join('\n'),
@@ -1094,6 +1095,7 @@ section('upstream drift');
     const explicitStart = /await scripting\.start\(/.test(engine);
     const perHostname = explicitStart || /scripting\.onGetContentScripts\(/.test(engine);
     const separateGlobals = /const scriptletGlobals = \{/.test(engine);
+    const hasFrameManager = /import \* as frameManager from '\.\/vapi-contexts\.js';/.test(readRepo('platform/chromium/vapi-scripting.js'));
     const checks = [
         // The registration API this port's vapi-scripting.js stands in for,
         // and what it reads out of the registration.
@@ -1115,9 +1117,13 @@ section('upstream drift');
               'the per-hostname provider no longer returns its options' ],
             [ 'src/js/scriptlet-filtering.js', /case 'filteringBehaviorChanged':\s*scripting\.reset\(\);/,
               'filteringBehaviorChanged no longer invalidates cached scriptlet globals' ],
-            [ 'platform/chromium/vapi-scripting.js', /browser\.webNavigation\.onCommitted\.addListener\(onCommitted\);/,
+            [ 'platform/chromium/vapi-scripting.js', hasFrameManager
+                ? /frameManager\.addListener\(\(type, details\) => \{\s*if \( type !== 'frame-committed' \) \{ return; \}\s*onCommitted\(details\);/
+                : /browser\.webNavigation\.onCommitted\.addListener\(onCommitted\);/,
               'the per-hostname Chromium injector no longer runs on committed frames' ],
-            [ 'platform/chromium/vapi-scripting.js', /if \( frameId !== 0 && (?:url\.startsWith\('about:'\)|reIsHTTP\.test\(url\) === false) \) \{\s*url = getEffectiveURL\(tabId, frameId\);/,
+            [ 'platform/chromium/vapi-scripting.js', hasFrameManager
+                ? /if \( frameId !== 0 && frameManager\.isHTTP\(url\) === false \) \{\s*url = frameManager\.getEffectiveURL\(tabId, frameId\);/
+                : /if \( frameId !== 0 && (?:url\.startsWith\('about:'\)|reIsHTTP\.test\(url\) === false) \) \{\s*url = getEffectiveURL\(tabId, frameId\);/,
               'the per-hostname Chromium injector changed non-network frame resolution' ],
             [ 'platform/chromium/vapi-scripting.js', /const hostname = hostnameFromURI\(url\);\s*if \( hostname === '' \) \{ return; \}/,
               'the per-hostname Chromium injector changed its hostname guard' ],
@@ -1170,21 +1176,32 @@ section('upstream drift');
           'redirectEngine.contentFromName() no longer returns { js, world, dependencies, priority }, which scriptletCallsFromTokens() in mv3-post.js reads' ],
         [ 'src/js/scriptlet-filtering-core.js', /this\.scriptletDB = new StaticExtFilteringHostnameDB\(\);/,
           'the core engine no longer keeps its filters in scriptletDB, which collectScriptletTokens() in mv3-post.js queries' ],
-        [ 'platform/common/vapi-background.js', /onCommittedHandler\(details\) \{\s*details\.url = this\.sanitizeURL\(details\.url\);\s*this\.onNavigation\(details\);/,
-          'vAPI.Tabs.onCommittedHandler no longer forwards to onNavigation, so the frame is not in its page store when mv3-post.js injects' ],
-        [ 'src/js/tab.js', /pageStore\.setFrameURL\(details\);\s*\}/,
-          'tab.js onNavigation no longer records the committed frame in its page store, which ancestor (>>) scriptlet filters need' ],
-        [ 'src/js/pagestore.js', /getFrameAncestorDetails\(frameId\) \{/,
-          'PageStore.getFrameAncestorDetails() is gone' ],
-        [ 'src/js/pagestore.js', /getFrameStore\(frameId\) \{\s*return this\.frames\.get\(frameId\) \|\| null;/,
-          'PageStore.getFrameStore() no longer returns the frame or null' ],
-        [ 'src/js/pagestore.js', /this\.rawURL = url;/,
-          'FrameStore no longer records rawURL for non-network frame resolution' ],
-        [ 'src/js/pagestore.js', /this\.parentId = parentId;/,
-          'FrameStore no longer records parentId for non-network frame resolution' ],
+        ...(hasFrameManager ? [
+            [ 'platform/common/vapi-contexts.js', /function onCommitted\(details\) \{[\s\S]*?addFrame\(details\);\s*for \( const listener of listeners \) \{\s*listener\('frame-committed', details\);/,
+              'the frame manager no longer records committed frames before notifying listeners' ],
+            [ 'platform/common/vapi-contexts.js', /frameDict\.set\(frameId, \{\s*frameId,\s*parentId: details\.parentFrameId \?\? -1,\s*url,/,
+              'the frame manager changed its frame URL/parent records' ],
+            [ 'platform/common/vapi-contexts.js', /export const tabDict = new Map\(\);/,
+              'the frame manager no longer exports its tab/frame dictionary' ],
+            [ 'src/js/tab.js', /case 'frame-committed': \{\s*if \( details\.frameId !== 0 \) \{ break; \}\s*const pageStore = µb\.bindTabToPageStore\(tabId, 'tabCommitted', details\);/,
+              'committed top-level frames no longer create their page store' ],
+        ] : [
+            [ 'platform/common/vapi-background.js', /onCommittedHandler\(details\) \{\s*details\.url = this\.sanitizeURL\(details\.url\);\s*this\.onNavigation\(details\);/,
+              'vAPI.Tabs.onCommittedHandler no longer forwards to onNavigation, so the frame is not in its page store when mv3-post.js injects' ],
+            [ 'src/js/tab.js', /pageStore\.setFrameURL\(details\);\s*\}/,
+              'tab.js onNavigation no longer records the committed frame in its page store, which ancestor (>>) scriptlet filters need' ],
+            [ 'src/js/pagestore.js', /getFrameStore\(frameId\) \{\s*return this\.frames\.get\(frameId\) \|\| null;/,
+              'PageStore.getFrameStore() no longer returns the frame or null' ],
+            [ 'src/js/pagestore.js', /this\.rawURL = url;/,
+              'FrameStore no longer records rawURL for non-network frame resolution' ],
+            [ 'src/js/pagestore.js', /this\.parentId = parentId;/,
+              'FrameStore no longer records parentId for non-network frame resolution' ],
+        ]),
         [ 'src/js/pagestore.js', /isTrusted\(\) \{/,
           'PageStore.isTrusted() is gone' ],
-        [ 'src/js/pagestore.js', /this\.tabHostname = tabContext\.rootHostname;/,
+        [ 'src/js/pagestore.js', hasFrameManager
+            ? /const topURL = frameManager\.getTopURL\(tabId\);\s*const topHostname = hostnameFromURI\(topURL\);[\s\S]*?this\.tabHostname = topHostname;/
+            : /this\.tabHostname = tabContext\.rootHostname;/,
           'PageStore.tabHostname no longer holds the top-level hostname topFrameRulesBailout() matches' ],
     ];
     let broken = 0;
@@ -1364,12 +1381,12 @@ for ( const [ script, label ] of [
             'reconcile platform/chromium-mv3/mv3-shims.js, mv3-post.js and tools/patch-mv3-modules.mjs with the new upstream shape');
     }
     // start.js must call contextMenu.update() and register
-    // runtime.onUpdateAvailable after initializeTabs() but before
+    // runtime.onUpdateAvailable after tab initialization but before
     // readiness resolves: the replay of buffered cold-wake events and the
     // session-state restore both hang off that exact window.
     {
         const start = readRepo('src/js/start.js');
-        const p1 = start.indexOf('await initializeTabs()');
+        const p1 = /await (?:initializeTabs|frameManager\.start)\(\)/.exec(start)?.index ?? -1;
         const p2 = start.indexOf('contextMenu.update()');
         const p3 = start.indexOf('onUpdateAvailable.addListener');
         // New upstream assigns the whole async startup to isReadyPromise;
@@ -1384,7 +1401,7 @@ for ( const [ script, label ] of [
              (asyncStart !== null && asyncStart.index > p1) ) {
             broken += 1;
             fail('worker-relay-upstream',
-                'src/js/start.js no longer runs initializeTabs() -> contextMenu.update() -> onUpdateAvailable before readiness resolves',
+                'src/js/start.js no longer initializes tabs -> contextMenu.update() -> onUpdateAvailable before readiness resolves',
                 'the cold-wake replay and the session-state restore in platform/chromium-mv3/mv3-post.js are wired to this exact sequence');
         }
     }

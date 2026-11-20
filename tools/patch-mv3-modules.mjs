@@ -172,6 +172,15 @@ if ( fs.existsSync(pkgDir) === false ) {
     process.exit(1);
 }
 
+// Older release trees keep frames in PageStore; the port detects this empty
+// module and uses their committed handler instead of the new frame manager.
+{
+    const contexts = path.join(pkgDir, 'js/vapi-contexts.js');
+    if ( fs.existsSync(contexts) === false ) {
+        fs.writeFileSync(contexts, 'export {};\n');
+    }
+}
+
 /******************************************************************************/
 
 // Resolve js/publicsuffix.js's library fallback statically.
