@@ -1,0 +1,9 @@
+{
+  "tag": "1.76.6",
+  "upstream": "bb0648c77ee67a8732d914a13c663cffc20fb583",
+  "port": "3baf08b958acd3cbc2fa88c1214f99701b9436cb",
+  "tooling": "3baf08b958acd3cbc2fa88c1214f99701b9436cb",
+  "forkBuild": 512,
+  "pinned": false,
+  "reason": "Current MV3 port"
+}
