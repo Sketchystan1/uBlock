@@ -1183,7 +1183,7 @@ section('upstream drift');
               'the frame manager changed its frame URL/parent records' ],
             [ 'platform/common/vapi-contexts.js', /export const tabDict = new Map\(\);/,
               'the frame manager no longer exports its tab/frame dictionary' ],
-            [ 'src/js/tab.js', /case 'frame-committed': \{\s*if \( details\.frameId !== 0 \) \{ break; \}\s*const pageStore = µb\.bindTabToPageStore\(tabId, 'tabCommitted', details\);/,
+            [ 'src/js/tab.js', /case 'frame-committed': \{\s*if \( details\.frameId !== 0 \) \{ break; \}\s*(?:const pageStore = )?µb\.bindTabToPageStore\(tabId, 'tabCommitted', details\);/,
               'committed top-level frames no longer create their page store' ],
         ] : [
             [ 'platform/common/vapi-background.js', /onCommittedHandler\(details\) \{\s*details\.url = this\.sanitizeURL\(details\.url\);\s*this\.onNavigation\(details\);/,
