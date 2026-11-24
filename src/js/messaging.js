@@ -346,7 +346,8 @@ const getFirewallRules = function(src, out) {
 
 const popupDataFromTabId = function(tabId, tabTitle) {
     const topURL = frameManager.getTopURL(tabId) ?? 'https://behind-the-scene/';
-    const rootHostname = hostnameFromURI(topURL);
+    const normalizedURL = µb.normalizeTabURL(topURL, tabId);
+    const rootHostname = hostnameFromURI(normalizedURL);
     const µbus = µb.userSettings;
     const µbhs = µb.hiddenSettings;
     const r = {
@@ -363,7 +364,7 @@ const popupDataFromTabId = function(tabId, tabTitle) {
         isTrustedSite: true,
         userFiltersAreEnabled: µb.userFiltersAreEnabled(),
         rawURL: topURL,
-        pageURL: µb.normalizeTabURL(tabId, topURL),
+        pageURL: normalizedURL,
         pageHostname: rootHostname,
         pageDomain: domainFromHostname(rootHostname),
         popupBlockedCount: 0,
@@ -842,6 +843,7 @@ const contextPairing = {
     password: '',
     tabId: 0,
     frameId: 0,
+    time: 0
 };
 
 const onMessage = function(request, sender, callback) {
@@ -876,21 +878,26 @@ const onMessage = function(request, sender, callback) {
     let response;
 
     switch ( request.what ) {
-    case 'elementPickerPairing':
-        if ( contextPairing.password === '' ) {
+    case 'elementPickerPairing': {
+        const now = Date.now();
+        if ( request.contentScript ) {
             contextPairing.password = self.crypto.randomUUID();
             contextPairing.tabId = sender.tabId;
             contextPairing.frameId = sender.frameId;
+            contextPairing.time = now;
             response = { password: contextPairing.password };
         } else {
-            response = { password: contextPairing.password };
-            contextPairing.password = '';
+            const succeed = (now - contextPairing.time) < 2000;
+            if ( succeed ) {
+                response = { password: contextPairing.password };
+            }
             browser.tabs.sendMessage(contextPairing.tabId,
-                { what: 'elementPickerPairing' },
+                { what: 'elementPickerPairing', succeed },
                 { frameId: contextPairing.frameId }
             );
-        };
+        }
         break;
+    }
     case 'elementPickerEprom':
         µb.epickerArgs.eprom = request;
         break;

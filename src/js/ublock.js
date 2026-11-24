@@ -209,7 +209,7 @@ import µb from './background.js';
     // https://github.com/uBlockOrigin/uBlock-issues/issues/40
     //   The element picker needs this library
     if ( zap !== true ) {
-        vAPI.tabs.executeScript(tabId, {
+        await vAPI.tabs.executeScript(tabId, {
             file: '/lib/diff/swatinem_diff.js',
             runAt: 'document_end',
         });
