@@ -425,15 +425,19 @@ let flushDurableSettingsWrites = ( ) => Promise.resolve();
             if ( request.what !== 'userSettings' ) {
                 return origHandler(request, sender, callback);
             }
-            return origHandler(request, sender, function(response) {
+            const transform = response => {
                 if (
                     response instanceof Object &&
                     µb.cloudStorageSupported !== true
                 ) {
                     response.cloudStorageEnabled = undefined;
                 }
-                callback(response);
-            });
+                return response;
+            };
+            if ( typeof callback === 'function' ) {
+                return origHandler(request, sender, response => callback(transform(response)));
+            }
+            return Promise.resolve(origHandler(request, sender)).then(transform);
         };
     }
 }

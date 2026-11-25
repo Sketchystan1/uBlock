@@ -898,7 +898,7 @@ for ( const rel of conflicts ) {
                         '            if ( answered ) { return; }',
                         '            Promise.resolve().then(fallback).then(answer, ( ) => answer());',
                         '        };',
-                        '        µb.isReadyPromise.then(fn).then(answer, degrade);',
+                        '        µb.isReadyPromise.then(( ) => answered ? undefined : fn()).then(answer, degrade);',
                         '        vAPI.defer.once(readyTimeout).then(degrade);',
                         '    };',
                         '})();',
@@ -1289,6 +1289,96 @@ for ( const rel of conflicts ) {
             ],
         },
     ];
+
+    // Upstream 88c8238bb replaced port callbacks with promise-returning handlers.
+    // Keep the callback edits for older releases, and gate the new popup handler
+    // without duplicating its command bodies or changing privileged dispatch.
+    if ( fs.readFileSync(path.join(pkgDir, 'js/vapi-background.js'), 'utf8')
+        .includes('async onDispatch(request, sender) {') ) {
+        // Raw fork messages have their own onMessage listeners and replies.
+        RUNTIME_HARDENING.find(entry => entry.rel === 'js/vapi-background.js').edits.push({
+            anchor: [
+                '    onMessage(request, sender, callback) {',
+                '        this.onDispatch(request, sender).then(response => {',
+            ],
+            replacement: [
+                '    onMessage(request, sender, callback) {',
+                '        if ( typeof request?.channel !== \'string\' ) { return; }',
+                '        this.onDispatch(request, sender).then(response => {',
+            ],
+        });
+        const messaging = RUNTIME_HARDENING.find(entry => entry.rel === 'js/messaging.js');
+        messaging.edits.splice(1, 3,
+            {
+                anchor: [
+                    'async function onMessage(request) {',
+                    '    switch ( request.what ) {',
+                    '    case \'getHiddenElementCount\':',
+                ],
+                replacement: [
+                    'async function onMessage(request) {',
+                    '    const respond = ( ) => onReadyMessage(request);',
+                    '    switch ( request.what ) {',
+                    '    case \'getPopupData\':',
+                    '        return new Promise(resolve => whenReady(resolve, respond,',
+                    '            ( ) => popupDataFromRequest(request).catch(( ) => ({}))));',
+                    '',
+                    '    case \'revertFirewallRules\':',
+                    '    case \'toggleHostnameSwitch\':',
+                    '    case \'toggleFirewallRule\':',
+                    '        return new Promise(resolve => whenReady(resolve, respond,',
+                    '            ( ) => popupDataFromTabId(request.tabId)));',
+                    '',
+                    '    case \'launchReporter\':',
+                    '    case \'saveFirewallRules\':',
+                    '    case \'toggleTrustedStatus\':',
+                    '        return new Promise(resolve => whenReady(resolve, respond));',
+                    '',
+                    '    default:',
+                    '        return respond();',
+                    '    }',
+                    '}',
+                    '',
+                    'async function onReadyMessage(request) {',
+                    '    switch ( request.what ) {',
+                    '    case \'getHiddenElementCount\':',
+                ],
+            },
+            {
+                anchor: [
+                    '    case \'launchReporter\': {',
+                    '        launchReporter(request).then(url => {',
+                    '            if ( typeof url !== \'string\' ) { return; }',
+                    '            µb.openNewTab({ url, select: true, index: -1 });',
+                    '        });',
+                    '        break;',
+                    '    }',
+                ],
+                replacement: [
+                    '    case \'launchReporter\': {',
+                    '        return launchReporter(request).then(url => {',
+                    '            if ( typeof url !== \'string\' ) { return; }',
+                    '            µb.openNewTab({ url, select: true, index: -1 });',
+                    '        });',
+                    '    }',
+                ],
+            },
+            {
+                anchor: [
+                    '    case \'getLists\':',
+                    '        await µb.isReadyPromise;',
+                    '        return getLists();',
+                ],
+                replacement: [
+                    '    case \'getLists\':',
+                    '        return new Promise(resolve => whenReady(',
+                    '            resolve, ( ) => getLists(),',
+                    '            ( ) => ({ available: {}, cache: {} })',
+                    '        ));',
+                ],
+            }
+        );
+    }
 
     for ( const { rel, probe, edits } of RUNTIME_HARDENING ) {
         const abs = path.join(pkgDir, rel);

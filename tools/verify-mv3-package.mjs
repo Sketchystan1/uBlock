@@ -1272,7 +1272,7 @@ section('upstream drift');
 // injection permanently disarmed.
 for ( const [ script, label ] of [
     [ 'test-mv3-scriptlet-injection.mjs', 'scriptlet runtime: startup, selection, exceptions, frames, firewall, logger, reload and selfie' ],
-    [ 'test-mv3-startup.mjs', 'startup runtime: durable write, once-only restart, storage failures and normal boot' ],
+    [ 'test-mv3-startup.mjs', 'startup runtime: durable restart, message readiness, failures, timeouts and settings' ],
 ] ) {
     const result = spawnSync(process.execPath, [
         path.join(repoDir, 'tools', script), pkgDir,
