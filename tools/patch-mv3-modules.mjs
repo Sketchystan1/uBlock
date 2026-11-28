@@ -282,12 +282,13 @@ if ( fs.existsSync(pkgDir) === false ) {
 // The first hostname therefore receives undefined, and later ones receive a
 // revoked secret. Move the rotation before the snapshot in the built copy.
 // Older upstream versions already have the correct order and need no patch.
+// Versions which no longer expose warSecret to scriptlets need no patch either.
 {
     const rel = 'js/scriptlet-filtering.js';
     const abs = path.join(pkgDir, rel);
     const src = fs.readFileSync(abs, 'utf8');
     const marker = 'uBO MV3 scriptlet secret before globals';
-    if ( src.includes(marker) === false && src.includes('const scriptletGlobals = {') ) {
+    if ( src.includes(marker) === false && src.includes('warSecret: this.warSecret,') ) {
         const capture = '        const scriptletGlobals = {';
         const rotate = '        this.warSecret = vAPI.warSecret.long(this.warSecret);';
         if ( src.split(capture).length !== 2 || src.split(rotate).length !== 2 ) {
@@ -595,13 +596,11 @@ for ( const rel of conflicts ) {
     // The upstream source may use either line ending (and has used CRLF);
     // build the anchor and the replacement with the file's own.
     const lines = [
-        '    strictBlockBypass: hostname => {',
         '        strictBlockBypasser.bypass(hostname);',
         '    },',
         '};',
     ];
     const replacementLines = [
-        '    strictBlockBypass: hostname => {',
         '        strictBlockBypasser.bypass(hostname);',
         '    },',
         '',
@@ -687,18 +686,8 @@ for ( const rel of conflicts ) {
     if ( src.includes(marker) ) {
         console.log(`*** patch-mv3-modules: ${rel} already requests extraHeaders on onHeadersReceived`);
     } else {
-        const eol = src.includes('\r\n') ? '\r\n' : '\n';
-        const anchor = [
-            "            vAPI.net.addListener('onHeadersReceived', onHeadersReceived, {",
-            "                urls: [ 'http://*/*', 'https://*/*' ]",
-            "            }, [ 'blocking', 'responseHeaders' ]);",
-        ].join(eol);
-        const replacement = [
-            "            vAPI.net.addListener('onHeadersReceived', onHeadersReceived, {",
-            "                urls: [ 'http://*/*', 'https://*/*' ]",
-            `            }, [ 'blocking', 'responseHeaders', /* [${marker}] */ 'extraHeaders' ]);`,
-        ].join(eol);
-        const count = src.split(anchor).length - 1;
+        const anchor = /(^[ \t]*)vAPI\.net\.addListener\('onHeadersReceived', onHeadersReceived, \{\r?\n\1 {4}urls: \[ 'http:\/\/\*\/\*', 'https:\/\/\*\/\*' \]\r?\n\1\}, \[ 'blocking', 'responseHeaders' \]\);/gm;
+        const count = [ ...src.matchAll(anchor) ].length;
         if ( count !== 1 ) {
             console.error(
                 `*** patch-mv3-modules: ${rel} contains ${count} ` +
@@ -710,7 +699,10 @@ for ( const rel of conflicts ) {
             );
             process.exit(1);
         }
-        fs.writeFileSync(abs, src.replace(anchor, () => replacement));
+        fs.writeFileSync(abs, src.replace(anchor, block => block.replace(
+            "[ 'blocking', 'responseHeaders' ]",
+            `[ 'blocking', 'responseHeaders', /* [${marker}] */ 'extraHeaders' ]`
+        )));
         console.log(
             `*** patch-mv3-modules: ${rel} requests extraHeaders on onHeadersReceived`
         );

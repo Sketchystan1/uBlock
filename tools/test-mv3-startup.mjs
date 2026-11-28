@@ -6,6 +6,101 @@ import path from 'node:path';
 import vm from 'node:vm';
 
 const pkgDir = path.resolve(process.argv[2] || 'dist/build/uBlock0.chromium-mv3');
+const networkPath = path.join(pkgDir, 'js/vapi-network.js');
+if ( fs.existsSync(networkPath) ) {
+    const shims = fs.readFileSync(path.join(pkgDir, 'js/mv3-shims.js'), 'utf8');
+    const begin = shims.indexOf('let asyncBlockingAvailable;');
+    const end = shims.indexOf('/******************************************************************************/',
+        shims.indexOf("Object.defineProperty(self.vAPI, 'Net'", begin));
+    assert.ok(begin !== -1 && end > begin, 'network suspension shim exists');
+    const withoutImports = text => text.replace(/^import .*;\r?$/gm, '');
+    const base = withoutImports(fs.readFileSync(networkPath, 'utf8'));
+    const ext = withoutImports(fs.readFileSync(path.join(pkgDir, 'js/vapi-background-ext.js'), 'utf8'));
+    const start = ext.indexOf('vAPI.net.start();');
+    assert.ok(start !== -1, 'network listener starts during module evaluation');
+    const network = () => {
+        let listener;
+        let decideInstall;
+        const reloaded = [];
+        const badges = [];
+        const vAPI = {
+            getURL: value => `chrome-extension://test${value}`,
+            setDefaultIcon: (...args) => badges.push(args),
+            tabs: { reload: tabId => reloaded.push(tabId) },
+        };
+        const context = vm.createContext({
+            URL, self: { vAPI }, vAPI,
+            console: { info() {} },
+            frameManager: { TAB_ID_NONE: -1, addFrame() {}, getTopURL: () => 'https://example.test/' },
+            chrome: {
+                management: { getSelf: () => new Promise(resolve => { decideInstall = resolve; }) },
+                permissions: { contains: async () => true },
+                runtime: { onMessage: { addListener() {} } },
+                webRequest: {
+                    ResourceType: { main_frame: 'main_frame', script: 'script' },
+                    onBeforeRequest: { addListener: fn => { listener = fn; } },
+                },
+            },
+        });
+        vm.runInContext(shims.slice(begin, end).replace(/^export \{.*\};\r?$/gm, ''), context);
+        vm.runInContext(base, context);
+        vm.runInContext(ext.slice(0, start + 'vAPI.net.start();'.length), context);
+        assert.equal(vAPI.net.suspendDepth, 1, 'patching the base and subclass suspends exactly once');
+        return {
+            net: vAPI.net, reloaded, badges,
+            request: (details = {}) => listener({ tabId: 1, type: 'script', url: 'https://example.test/file.js', ...details }),
+            install: async installType => {
+                decideInstall({ installType });
+                await new Promise(resolve => setImmediate(resolve));
+            },
+        };
+    };
+    const admin = network();
+    const early = admin.request();
+    assert.equal(typeof early?.then, 'function', 'park requests before install detection completes');
+    let settled = false;
+    early.then(() => { settled = true; });
+    await admin.install('admin');
+    assert.equal(settled, false, 'policy requests wait for filter readiness');
+    const filtered = [];
+    const otherTab = admin.request({ tabId: 2 });
+    admin.net.setSuspendableListener(details => { filtered.push(details.tabId); return { cancel: true }; });
+    admin.net.unsuspend({ all: true });
+    assert.equal((await early).cancel, true);
+    assert.equal((await otherTab).cancel, true);
+    assert.deepEqual(filtered, [ 1, 2 ], 'each tab filters its parked request exactly once');
+    assert.deepEqual(admin.reloaded, [], 'held policy requests never trigger fallback reloads');
+
+    const normal = network();
+    const optimistic = normal.request();
+    await normal.install('normal');
+    assert.equal(await optimistic, undefined, 'unsupported async blocking releases optimistic requests');
+    assert.equal(normal.net.hasUnprocessedRequest(1), true, 'released requests remain in upstream accounting');
+    assert.ok(normal.badges.some(([, text]) => text === '!'), 'degraded startup keeps its warning badge');
+    assert.equal(normal.request().cancel, true, 'non-policy installs fall back to cancellation');
+    assert.equal(normal.request({ type: 'main_frame' }), undefined, 'fallback preserves main-frame exemption');
+    normal.net.setSuspendableListener(() => { throw new Error('fallback must not filter completed requests'); });
+    normal.net.unsuspend({ all: true });
+    assert.deepEqual(normal.reloaded, [ 1 ], 'fallback reloads the affected tab once');
+
+    const disabled = network();
+    await disabled.install('admin');
+    const discarded = disabled.request();
+    disabled.net.unsuspend({ all: true, discard: true, clear: false });
+    assert.equal(await discarded, undefined, 'disabling suspension releases parked requests');
+    assert.equal(disabled.request(), undefined, 'disabled suspension does not park later requests');
+    disabled.net.setSuspendableListener(() => { throw new Error('discarded requests must not be filtered'); });
+    disabled.net.unsuspend({ all: true, discard: true });
+    assert.deepEqual(disabled.reloaded, []);
+
+    const failed = network();
+    await failed.install('admin');
+    const pending = failed.request();
+    failed.net.setSuspendableListener(() => { throw new Error('filter failed'); });
+    failed.net.unsuspend({ all: true });
+    assert.equal(await pending, undefined, 'filter errors never leave a request parked forever');
+    console.log('Network runtime checks passed: early suspension, per-tab release, fallback, opt-out and filter errors.');
+}
 const source = fs.readFileSync(path.join(pkgDir, 'js/start.js'), 'utf8');
 const match = /^([ \t]*)\/\/ https:\/\/github\.com\/uBlockOrigin\/uBlock-issues\/issues\/1547\r?\n\1if \( lastVersionInt === 0 && vAPI\.webextFlavor\.soup\.has\('chromium'\) \) \{\r?\n[\s\S]*?^\1\}/m.exec(source);
 assert.ok(match, 'packaged first-install restart guard exists');
@@ -210,7 +305,8 @@ if ( promiseMessaging ) {
         vAPI: { getURL: () => 'chrome-extension://test/' },
         ubolog() {},
     });
-    vm.runInContext(background.slice(start, end + 3), context);
+    const origin = /^const EXTENSION_ORIGIN = .*;\r?$/m.exec(background)?.[0] || '';
+    vm.runInContext(`${origin}\n${background.slice(start, end + 3)}`, context);
     const transport = context.vAPI.messaging;
     const sender = { origin: 'chrome-extension://test', url: 'chrome-extension://test/popup.html' };
     let calls = 0;

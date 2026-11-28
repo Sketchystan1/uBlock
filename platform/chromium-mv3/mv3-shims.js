@@ -1297,6 +1297,19 @@ const pendingRequests = net => {
 // meantime, double-counting a request which has already completed. Recording is
 // all that is wanted here, and it is moot once uBO is up anyway.
 const discardPendingRequests = net => {
+    // New upstream keeps the deferred entries in its per-tab queue.
+    if ( typeof net.unsuspendManyRequests === 'function' ) {
+        for ( const entries of net.unprocessedTabs.values() ) {
+            for ( const entry of entries ) {
+                if ( typeof entry.resolve !== 'function' ) { continue; }
+                entry.resolve();
+                entry.outcome = undefined;
+                delete entry.resolve;
+                self.vAPI.setDefaultIcon(null, '!');
+            }
+        }
+        return;
+    }
     const pending = pendingByNet.get(net);
     if ( pending === undefined || pending.length === 0 ) { return; }
     pendingByNet.set(net, []);
@@ -1405,6 +1418,55 @@ const patchNetClass = ctor => {
 
     const proto = ctor.prototype;
     const baseSuspendOne = netUnpatch(proto.suspendOneRequest);
+    if ( typeof proto.unsuspendManyRequests === 'function' ) {
+        const baseStart = netUnpatch(proto.start);
+        const baseUnsuspendMany = netUnpatch(proto.unsuspendManyRequests);
+        // Upstream now starts the listener in vapi-background-ext.js and only
+        // Firefox suspends it there. Close the same early window on Chromium.
+        proto.start = function(...args) {
+            this.suspend();
+            return baseStart.apply(this, args);
+        };
+        proto.suspendOneRequest = function(defer, details) {
+            if ( defer === false || asyncBlockingAvailable === false ) {
+                return baseSuspendOne.call(this, defer, details);
+            }
+            const entry = {
+                details: Object.assign({}, details),
+                resolve: undefined,
+                outcome: undefined,
+            };
+            entry.outcome = new Promise(resolve => { entry.resolve = resolve; });
+            return entry;
+        };
+        proto.unsuspendManyRequests = function(tabId, entries, discard = false) {
+            const unprocessed = [];
+            for ( const entry of entries ) {
+                if ( typeof entry.resolve !== 'function' ) {
+                    unprocessed.push(entry);
+                    continue;
+                }
+                let outcome;
+                if ( discard !== true ) {
+                    try {
+                        outcome = this.onBeforeSuspendableRequest(entry.details);
+                    } catch {
+                    }
+                }
+                entry.resolve(outcome);
+                if ( discard ) {
+                    entry.outcome = undefined;
+                    delete entry.resolve;
+                }
+            }
+            return baseUnsuspendMany.call(this, tabId, unprocessed, discard);
+        };
+        netOriginals.set(proto.start, baseStart);
+        netOriginals.set(proto.suspendOneRequest, baseSuspendOne);
+        netOriginals.set(proto.unsuspendManyRequests, baseUnsuspendMany);
+        ctor.canSuspend = ( ) => true;
+        return ctor;
+    }
     const baseUnsuspendAll = netUnpatch(proto.unsuspendAllRequests);
 
     proto.suspendOneRequest = function(details) {

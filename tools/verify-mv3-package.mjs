@@ -1290,8 +1290,11 @@ for ( const [ script, label ] of [
 // upstream shapes have to hold for that to land where it is aimed.
 {
     const background = readRepo('src/js/background.js');
-    const vapi = readRepo('platform/common/vapi-background.js');
     const ext = readRepo('platform/chromium/vapi-background-ext.js');
+    const batchSuspension = /import '\.\/vapi-network\.js'/.test(ext);
+    const vapi = readRepo(batchSuspension
+        ? 'platform/common/vapi-network.js'
+        : 'platform/common/vapi-background.js');
     const start = readRepo('src/js/start.js');
 
     // The setter has to see both assignments: the base class and the Chromium
@@ -1311,16 +1314,17 @@ for ( const [ script, label ] of [
             'the MV3 cold-start window is closed by making canSuspend() true; check platform/chromium-mv3/mv3-shims.js');
     } else if ( assigns.test(vapi) === false || assigns.test(ext) === false ) {
         fail('suspend-default',
-            'vAPI.Net is no longer assigned as `vAPI.Net = class` in vapi-background.js and/or chromium/vapi-background-ext.js',
+            'vAPI.Net is no longer assigned as `vAPI.Net = class` in the base network module and/or chromium/vapi-background-ext.js',
             'the setter in platform/chromium-mv3/mv3-shims.js patches on assignment and would never fire');
     } else if ( extImport === -1 || trafficImport === -1 || extImport > trafficImport ) {
         fail('suspend-default',
             'src/js/start.js no longer imports ./vapi-background-ext.js before ./traffic.js',
             'canSuspend() would be read before mv3-shims.js has patched it, reopening the cold-start window');
-    } else if ( /suspendOneRequest\(details\)/.test(ext) === false ||
-                /unsuspendAllRequests\(discard/.test(ext) === false ) {
+    } else if ( (batchSuspension
+        ? /suspendOneRequest\(defer, details\)/.test(ext) && /unsuspendManyRequests\(tabId, entries, discard/.test(ext)
+        : /suspendOneRequest\(details\)/.test(ext) && /unsuspendAllRequests\(discard/.test(ext)) === false ) {
         fail('suspend-default',
-            'platform/chromium/vapi-background-ext.js no longer defines suspendOneRequest()/unsuspendAllRequests()',
+            'platform/chromium/vapi-background-ext.js no longer defines the expected suspension methods',
             'mv3-shims.js captures both as the fallback used when the extension is not policy-installed');
     } else {
         pass('vAPI.Net async-suspension patch still lands where it is aimed');
